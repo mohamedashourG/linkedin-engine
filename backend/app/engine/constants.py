@@ -17,6 +17,12 @@ EXA_DISCOVERY_TIER_3_PER_RUN = 4
 # Pages per keyword search on apidirect.
 DISCOVERY_PAGES_PER_KEYWORD = 1
 
+# RULE 15-EXT: title-plus-industry queries through the cofounder's LinkedIn
+# content search (Unipile). Per cofounder per run; 4 keeps the daily mix
+# (4 topical + 4 title-industry) consistent with the audit. The pool itself
+# (14 queries, 14-day no-repeat) lives in configs/<client>/keyword_pools.json.
+DISCOVERY_TITLE_INDUSTRY_PER_RUN = 4
+
 # Exhaustion ledger lookback window (days).
 EXHAUSTION_LOOKBACK_DAYS = 90
 

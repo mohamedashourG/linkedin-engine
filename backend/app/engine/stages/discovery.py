@@ -36,12 +36,14 @@ from app.engine.constants import (
     DISCOVERY_TIER_1_PER_RUN,
     DISCOVERY_TIER_2_PER_RUN,
     DISCOVERY_TIER_3_PER_RUN,
+    DISCOVERY_TITLE_INDUSTRY_PER_RUN,
     EXA_DISCOVERY_TIER_1_PER_RUN,
     EXA_DISCOVERY_TIER_2_PER_RUN,
     EXA_DISCOVERY_TIER_3_PER_RUN,
     EXHAUSTION_LOOKBACK_DAYS,
 )
 from app.models.common import utcnow
+from app.services import client_config
 from app.services.apidirect import (
     ApiDirectError,
     ApiDirectNotConfigured,
@@ -381,6 +383,17 @@ def discover_for_operator(
     tier_2 = keywords.get("tier_2") or []
     tier_3 = keywords.get("tier_3") or []
 
+    # RULE 15-EXT — title-plus-industry pool. Source priority:
+    #   1. configs/<client>/keyword_pools.json:title_industry  (curated per-tenant)
+    #   2. operator.product_extracted.title_industry            (back-compat)
+    # Empty pool is fine — the unipile path skips the title-industry plan.
+    cfg = client_config.for_operator(operator)
+    title_industry: list[str] = (
+        cfg.keyword_pools.get("title_industry")
+        or extracted.get("title_industry")
+        or []
+    )
+
     seeds = list(
         db.discovery_seeds.find(
             {
@@ -519,6 +532,7 @@ def discover_for_operator(
                     tier_1=tier_1,
                     tier_2=tier_2,
                     tier_3=tier_3,
+                    title_industry=title_industry,
                     seeds=seeds,
                     seen_urls=seen_urls,
                     seen_authors_shipped=seen_authors_shipped,
@@ -707,11 +721,12 @@ def _run_unipile(
     tier_1: list[str],
     tier_2: list[str],
     tier_3: list[str],
+    title_industry: list[str],
     seeds: list[dict[str, Any]],
     seen_urls: set[str],
     seen_authors_shipped: set[str],
 ) -> int:
-    # RULE 15: filter through the 14-day no-repeat ledger before rotating.
+    # RULE 15: filter the topical pools through the 14-day no-repeat ledger.
     fresh_t1 = keyword_history.filter_unused(
         db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_1
     )
@@ -721,6 +736,15 @@ def _run_unipile(
     fresh_t3 = keyword_history.filter_unused(
         db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_3
     )
+    # RULE 15-EXT: same 14-day rule on a separate channel so a query that
+    # appears in BOTH pools (rare but possible, e.g. "VP Sales biotech")
+    # tracks per-channel.
+    fresh_ti = keyword_history.filter_unused(
+        db,
+        operator_id=operator_id,
+        source_channel="keyword_title_industry",
+        queries=title_industry,
+    )
     plan: list[tuple[str, str, str, str]] = []
     for kw in _rotate(fresh_t1, DISCOVERY_TIER_1_PER_RUN):
         plan.append(("kw", kw, "tier_1_kw", "A"))
@@ -728,6 +752,8 @@ def _run_unipile(
         plan.append(("kw", kw, "tier_2_kw", "B"))
     for kw in _rotate(fresh_t3, DISCOVERY_TIER_3_PER_RUN):
         plan.append(("kw", kw, "tier_3_kw", "B"))
+    for kw in _rotate(fresh_ti, DISCOVERY_TITLE_INDUSTRY_PER_RUN):
+        plan.append(("kw", kw, "title_industry_kw", "A"))
     for seed in seeds:
         seed_source = (
             "manual_seed" if seed.get("source") == "manual" else "embedded_harvest"
@@ -767,18 +793,30 @@ def _run_unipile(
             continue
 
         # Mark keyword queries used (only the kw plan items; user/seed lookups
-        # don't go through the keyword ledger).
-        if kind == "kw" and source in ("tier_1_kw", "tier_2_kw", "tier_3_kw"):
-            keyword_history.mark_used(
-                db,
-                operator_id=operator_id,
-                source_channel="keyword_topical",
-                query=payload,
-            )
+        # don't go through the keyword ledger). Topical and title-industry
+        # tracked on separate channels.
+        if kind == "kw":
+            if source in ("tier_1_kw", "tier_2_kw", "tier_3_kw"):
+                keyword_history.mark_used(
+                    db,
+                    operator_id=operator_id,
+                    source_channel="keyword_topical",
+                    query=payload,
+                )
+            elif source == "title_industry_kw":
+                keyword_history.mark_used(
+                    db,
+                    operator_id=operator_id,
+                    source_channel="keyword_title_industry",
+                    query=payload,
+                )
         # Tag content-search hits with source_channel for downstream routing.
-        post_source_channel = (
-            "keyword_topical" if source in ("tier_1_kw", "tier_2_kw", "tier_3_kw") else ""
-        )
+        if source in ("tier_1_kw", "tier_2_kw", "tier_3_kw"):
+            post_source_channel = "keyword_topical"
+        elif source == "title_industry_kw":
+            post_source_channel = "keyword_title_industry"
+        else:
+            post_source_channel = ""
 
         for post in posts:
             if not post.url or post.url in seen_urls:
