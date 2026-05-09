@@ -120,7 +120,10 @@ def _process_candidate(
 
     cofounder_url = (cofounder.get("linkedin_url") or "").rstrip("/")
     new_reply_ids: list[ObjectId] = []
-    voice = (cofounder.get("voice_profile") or {}).get("source_a_template") or ""
+    voice = cofounder.get("voice_profile") or {}
+    voice_tone = voice.get("tone_description") or ""
+    voice_examples = voice.get("examples") or []
+    cofounder_first = (cofounder.get("display_name") or "").strip().split(" ", 1)[0] or ""
 
     for c in comments:
         # Skip our own comment.
@@ -155,17 +158,26 @@ def _process_candidate(
             advance_stage_to="S3",  # received reply
         )
 
-        # Draft a suggested response.
+        # Draft a public reply-back. (DM contexts fire from the auto-CR path,
+        # not here.)
         suggested_text = ""
         suggested_type = "A"
-        if voice:
+        if voice_tone or voice_examples:
             try:
                 suggested_text, suggested_type = reply_drafter.draft_reply(
-                    voice_template=voice,
+                    reply_context="PUBLIC_REPLY_BACK",
+                    cofounder_name=cofounder.get("display_name") or "",
+                    cofounder_tone=voice_tone,
+                    cofounder_first_name=cofounder_first,
+                    cofounder_calendly_url=cofounder.get("calendly_url") or "",
+                    author_name=candidate.get("author_name"),
+                    author_title=candidate.get("author_title"),
+                    author_company=candidate.get("author_company"),
                     original_post=candidate.get("post_text") or "",
                     our_comment=candidate.get("comment_text") or "",
                     their_reply=c.text,
                     they_are_post_author=is_post_owner,
+                    prospect_name=c.author_name,
                 )
             except OpenAINotConfigured:
                 pass

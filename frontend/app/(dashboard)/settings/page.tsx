@@ -314,6 +314,7 @@ function EngineConfigCard() {
   const [hardFloor, setHardFloor] = useState("20");
   const [runTime, setRunTime] = useState("09:00");
   const [paused, setPaused] = useState(false);
+  const [recipients, setRecipients] = useState<string[]>([]);
   const [dirty, setDirty] = useState(false);
 
   // Hydrate form from server.
@@ -330,6 +331,7 @@ function EngineConfigCard() {
     setHardFloor(String(data.hard_floor));
     setRunTime(data.run_time_local);
     setPaused(data.paused);
+    setRecipients(data.slate_recipients ?? []);
     setDirty(false);
   }, [settingsQ.data]);
 
@@ -343,6 +345,7 @@ function EngineConfigCard() {
         hard_floor: Number(hardFloor) || 20,
         run_time_local: runTime,
         paused,
+        slate_recipients: recipients,
       };
       const t = Number(threshold);
       if (!isNaN(t) && settingsQ.data?.icp_rubric) {
@@ -484,6 +487,29 @@ function EngineConfigCard() {
             />
           </Field>
         </div>
+      </div>
+
+      {/* Slate recipients */}
+      <div className="rounded-xl border bg-background p-5">
+        <div className="mb-3">
+          <h3 className="text-sm font-semibold">Slate recipients</h3>
+          <p className="text-xs text-muted-foreground">
+            Who gets the morning slate email. Your account email
+            (<span className="font-mono">{settingsQ.data.operator_email}</span>) is always included; add teammates or aliases below.
+          </p>
+        </div>
+        <TagInput
+          value={recipients}
+          onChange={(v) => {
+            setRecipients(v);
+            markDirty();
+          }}
+          placeholder="add an email and press Enter"
+          maxTags={20}
+        />
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          Up to 20 additional recipients. Sent on every sealed daily run.
+        </p>
       </div>
 
       {/* Save bar */}

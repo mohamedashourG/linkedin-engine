@@ -107,7 +107,11 @@ def send_slate_email(
     subject, html = render_slate_email(
         db, operator=operator, cofounders=cofounders, slate_run_id=slate_run_id
     )
-    msg_id = send_email(to=operator["email"], subject=subject, html=html)
+    # Operator's email is always included; additional recipients come from
+    # user.slate_recipients (settings page).
+    extras = operator.get("slate_recipients") or []
+    recipients: list[str] = [operator["email"], *(extras or [])]
+    msg_id = send_email(to=recipients, subject=subject, html=html)
     db.slate_runs.update_one(
         {"_id": slate_run_id},
         {

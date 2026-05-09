@@ -46,6 +46,12 @@ class SlateRunPublic(BaseModel):
     sealed_at: datetime | None = None
     email_sent: bool
     force_abort_reason: str | None = None
+    # Live progress (populated while status='building').
+    current_stage: str | None = None
+    stage_progress: dict[str, int] | None = None
+    stage_started_at: datetime | None = None
+    stage_eta_seconds: int | None = None
+    stage_note: str | None = None
 
 
 class SlateTodayResponse(BaseModel):
@@ -84,6 +90,11 @@ def _slate_to_public(doc: dict[str, Any]) -> SlateRunPublic:
         sealed_at=doc.get("sealed_at"),
         email_sent=bool(doc.get("email_sent", False)),
         force_abort_reason=doc.get("force_abort_reason"),
+        current_stage=doc.get("current_stage"),
+        stage_progress=doc.get("stage_progress"),
+        stage_started_at=doc.get("stage_started_at"),
+        stage_eta_seconds=doc.get("stage_eta_seconds"),
+        stage_note=doc.get("stage_note"),
     )
 
 

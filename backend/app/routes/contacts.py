@@ -1,5 +1,9 @@
 """
 Manual target-contact list. CRUD on `discovery_seeds` with source="manual".
+Supports three import paths:
+  1. Single contact form (POST /)
+  2. Bulk text paste  (POST /bulk)
+  3. CSV/Excel upload (POST /upload)
 """
 from __future__ import annotations
 
@@ -7,7 +11,7 @@ from datetime import timedelta
 from typing import Annotated, Any
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Path, status
+from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile, File, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.auth.deps import CurrentUser
@@ -19,6 +23,8 @@ from app.models.contact import (
     ContactPublic,
     contact_to_public,
     parse_bulk,
+    parse_csv_bytes,
+    parse_excel_bytes,
 )
 
 router = APIRouter(prefix="/api/contacts", tags=["contacts"])
@@ -108,6 +114,76 @@ async def bulk_import(
     if to_insert:
         await db.discovery_seeds.insert_many(to_insert)
     return {"inserted": inserted, "skipped_duplicate": skipped, "parsed": len(parsed)}
+
+
+_MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+@router.post("/upload")
+async def upload_file(
+    file: Annotated[UploadFile, File(description="CSV or Excel (.xlsx) file")],
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> dict[str, Any]:
+    """Import contacts from a CSV or Excel file.
+
+    Accepts `.csv`, `.xlsx`, `.xls` files up to 5 MB.
+    Column headers are auto-detected (name/title/company/linkedin url).
+    """
+    if not file.filename:
+        raise HTTPException(400, "No file provided")
+
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+    if ext not in ("csv", "xlsx", "xls", "tsv"):
+        raise HTTPException(
+            400,
+            f"Unsupported file type '.{ext}'. Upload a .csv or .xlsx file.",
+        )
+
+    data = await file.read()
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(400, "File too large (max 5 MB)")
+
+    try:
+        if ext in ("xlsx", "xls"):
+            parsed = parse_excel_bytes(data)
+        else:
+            parsed = parse_csv_bytes(data)
+    except Exception as err:
+        raise HTTPException(400, f"Failed to parse file: {err}")
+
+    if not parsed:
+        return {"inserted": 0, "skipped_duplicate": 0, "parsed": 0, "filename": file.filename}
+
+    existing = await db.discovery_seeds.find(
+        {"operator_id": user["_id"], "source": "manual"}
+    ).to_list(length=None)
+
+    inserted = 0
+    skipped = 0
+    to_insert: list[dict[str, Any]] = []
+    for c in parsed:
+        if any(_matches(s, c) for s in existing) or any(
+            _matches(
+                {"linkedin_url": d.get("linkedin_url"), "extracted_name": d.get("extracted_name")},
+                c,
+            )
+            for d in to_insert
+        ):
+            skipped += 1
+            continue
+        to_insert.append(_seed_doc(user["_id"], c))
+        inserted += 1
+
+    if to_insert:
+        await db.discovery_seeds.insert_many(to_insert)
+
+    return {
+        "inserted": inserted,
+        "skipped_duplicate": skipped,
+        "parsed": len(parsed),
+        "filename": file.filename,
+    }
 
 
 @router.delete("/{contact_id}")

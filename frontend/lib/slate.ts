@@ -29,6 +29,11 @@ export type SlateRun = {
   sealed_at: string | null;
   email_sent: boolean;
   force_abort_reason: string | null;
+  current_stage: string | null;
+  stage_progress: { processed: number; total: number } | null;
+  stage_started_at: string | null;
+  stage_eta_seconds: number | null;
+  stage_note: string | null;
 };
 
 export type SlateCofounder = {

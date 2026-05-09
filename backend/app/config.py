@@ -41,7 +41,30 @@ class Settings(BaseSettings):
     apidirect_api_key: str = ""
     apidirect_mock: bool = False
 
+    # Discovery source toggles. Disable any source by setting to false; the
+    # discovery stage skips it entirely without erroring.
+    discovery_use_apidirect: bool = True
+    discovery_use_crustdata: bool = True
+    discovery_use_unipile: bool = True
+    discovery_use_exa: bool = True
+    # Posts older than this are dropped at verification — keeps the slate
+    # fresh and avoids wasting enrichment credits on stale content.
+    # Candidates with no published_at are kept (we don't penalize missing
+    # data). Set to 0 to disable the recency filter.
+    discovery_max_age_days: int = 14
+
+    exa_api_key: str = ""
+    exa_results_per_query: int = 100
+
     pdl_api_key: str = ""
+    # Enrichment toggles. The author-resolution stage prefers Crustdata when
+    # enrich_with_crustdata=true (3 credits/profile, returns title +
+    # employer_name + headline), falls back to PDL when enrich_with_pdl=true
+    # (~$0.20-$0.28/match, returns name only in practice), and becomes a
+    # no-op when both are false (ICP scoring relies on LLM inference from
+    # post text alone).
+    enrich_with_pdl: bool = False
+    enrich_with_crustdata: bool = True
 
     unipile_api_key: str = ""
     unipile_subdomain: str = ""
@@ -52,6 +75,12 @@ class Settings(BaseSettings):
     resend_from_email: str = "hello@example.com"
 
     calendly_webhook_base_url: str = "http://localhost:8000/api/webhooks/calendly"
+
+    crustdata_api_key: str = ""
+    crustdata_webhook_base_url: str = ""
+    crustdata_webhook_secret: str = "change-me-crustdata-hmac"
+    crustdata_default_expiration_days: int = 365
+    crustdata_inbox_lookback_hours: int = 48
 
     cookie_secure: bool = False
     cookie_samesite: Literal["lax", "strict", "none"] = "lax"

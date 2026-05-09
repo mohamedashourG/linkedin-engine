@@ -8,6 +8,7 @@ from app.config import settings
 from app.database import close_mongo_connection, connect_to_mongo
 from app.routes.analytics import router as analytics_router
 from app.routes.contacts import router as contacts_router
+from app.routes.crustdata import router as crustdata_router
 from app.routes.eod import router as eod_router
 from app.routes.onboarding import router as onboarding_router
 from app.routes.pipeline import router as pipeline_router
@@ -48,6 +49,7 @@ app.include_router(pipeline_router)
 app.include_router(webhooks_router)
 app.include_router(analytics_router)
 app.include_router(settings_router)
+app.include_router(crustdata_router)
 
 
 @app.get("/healthz")

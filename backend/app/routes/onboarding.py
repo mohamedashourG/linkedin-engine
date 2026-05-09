@@ -38,8 +38,13 @@ from app.models.onboarding import (
     ProductSaveRequest,
     ScheduleRequest,
 )
+from app.config import settings
 from app.services import icp_extractor, voice_profile
 from app.services.openai_client import OpenAINotConfigured
+
+import logging as _logging
+
+_log = _logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/onboarding", tags=["onboarding"])
 
@@ -74,12 +79,78 @@ async def _refresh_onboarding_complete(
         and has_calendly
         and has_schedule
     )
-    if complete != bool(user and user.get("onboarding_complete")):
+    was_complete = bool(user and user.get("onboarding_complete"))
+    if complete != was_complete:
         await db.users.update_one(
             {"_id": operator_id},
             {"$set": {"onboarding_complete": complete, "updated_at": utcnow()}},
         )
+        # On the false → true edge, opportunistically register one Crustdata
+        # watch per cofounder. Failure here NEVER blocks onboarding — it's an
+        # extra discovery source, not a hard requirement.
+        if complete and not was_complete:
+            await _try_register_crustdata_watches(db, operator_id, cofounders)
     return complete
+
+
+async def _try_register_crustdata_watches(
+    db: AsyncIOMotorDatabase,
+    operator_id: ObjectId,
+    cofounders: list[dict[str, Any]],
+) -> None:
+    if not settings.crustdata_api_key or not settings.crustdata_webhook_base_url:
+        _log.info(
+            "crustdata auto-register skipped: api_key=%s webhook_base=%s",
+            bool(settings.crustdata_api_key),
+            bool(settings.crustdata_webhook_base_url),
+        )
+        return
+    operator = await db.users.find_one({"_id": operator_id})
+    if not operator:
+        return
+
+    # Imported lazily so an import-time failure doesn't poison onboarding.
+    from app.routes.crustdata import RegisterWatchRequest, _spec_from_operator
+    from app.services.crustdata import (
+        CrustdataError,
+        register_keyword_watch,
+        webhook_url_for,
+    )
+
+    for cf in cofounders:
+        if cf.get("crustdata_watch_ids"):
+            continue
+        try:
+            spec = _spec_from_operator(operator, RegisterWatchRequest())
+            resp = register_keyword_watch(
+                cofounder_id=str(cf["_id"]),
+                spec=spec,
+                notification_endpoint=webhook_url_for(str(cf["_id"])),
+                simulation=False,
+            )
+            watch_id = resp.get("id") or resp.get("watch_id") or resp.get("uuid")
+            if watch_id:
+                await db.cofounders.update_one(
+                    {"_id": cf["_id"]},
+                    {
+                        "$addToSet": {"crustdata_watch_ids": str(watch_id)},
+                        "$set": {
+                            "crustdata_last_registered_at": utcnow(),
+                            "crustdata_keyword_expression": spec.keyword_expression,
+                        },
+                    },
+                )
+                _log.info(
+                    "crustdata auto-register: cofounder=%s watch_id=%s",
+                    cf["_id"],
+                    watch_id,
+                )
+        except (CrustdataError, HTTPException, Exception) as err:
+            _log.warning(
+                "crustdata auto-register failed for cofounder=%s: %s",
+                cf.get("_id"),
+                err,
+            )
 
 
 # ---------------------------------------------------------------- status

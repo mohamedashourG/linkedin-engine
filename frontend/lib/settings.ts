@@ -20,6 +20,8 @@ export type SettingsResponse = {
   hard_floor: number;
   run_time_local: string;
   paused: boolean;
+  operator_email: string;
+  slate_recipients: string[];
 };
 
 export type SettingsPatch = Partial<{
@@ -30,6 +32,7 @@ export type SettingsPatch = Partial<{
   hard_floor: number;
   run_time_local: string;
   paused: boolean;
+  slate_recipients: string[];
 }>;
 
 export const settingsApi = {

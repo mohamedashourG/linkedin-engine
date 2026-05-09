@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/shared/empty-state";
 import { SlateCard } from "@/components/slate/slate-card";
+import { RunProgress } from "@/components/slate/run-progress";
 import { slateApi } from "@/lib/slate";
 
 export default function TodayPage() {
@@ -76,6 +77,13 @@ export default function TodayPage() {
           </Button>
         </div>
       </div>
+
+      {/* Live progress while building */}
+      {data?.slate_run &&
+        data.slate_run.status === "building" &&
+        data.slate_run.current_stage && (
+          <RunProgress slate={data.slate_run} />
+        )}
 
       {/* Force-abort banner */}
       {data?.slate_run?.status === "force_aborted" && (

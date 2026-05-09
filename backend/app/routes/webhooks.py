@@ -25,6 +25,10 @@ from app.services.calendly import (
     parse_invitee,
     verify_signature,
 )
+from app.services.crustdata import (
+    normalize_inbox_post,
+    verify_webhook_token,
+)
 
 log = logging.getLogger(__name__)
 
@@ -101,3 +105,86 @@ async def calendly(
         db, operator_id=ObjectId(operator_id), booking_id=booking_id
     )
     return {"status": "ok", "booking_id": str(booking_id), "attribution": attribution}
+
+
+@router.post("/crustdata", status_code=status.HTTP_200_OK)
+async def crustdata_inbound(
+    request: Request,
+    cofounder_id: Annotated[str, Query()],
+    token: Annotated[str, Query()],
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> dict[str, Any]:
+    """Receive Crustdata `linkedin-post-with-keyword` notifications.
+
+    URL contract: `?cofounder_id=<id>&token=<hmac>`. The token is an
+    HMAC-SHA256 of the cofounder_id keyed by CRUSTDATA_WEBHOOK_SECRET; we
+    verify it before writing anything so a leaked endpoint can't be spammed.
+
+    Body: Crustdata POSTs either a single post object or a list. We normalize
+    each into a `crustdata_inbox` row keyed by (cofounder_id, post_uid) so
+    duplicate webhook deliveries are idempotent.
+    """
+    if not ObjectId.is_valid(cofounder_id):
+        raise HTTPException(400, "invalid cofounder_id")
+    if not verify_webhook_token(cofounder_id, token):
+        log.warning("crustdata webhook token mismatch for cofounder=%s", cofounder_id)
+        raise HTTPException(401, "invalid token")
+
+    cf = await db.cofounders.find_one({"_id": ObjectId(cofounder_id)})
+    if not cf:
+        raise HTTPException(404, "cofounder not found")
+
+    raw_body = await request.body()
+    try:
+        payload = json.loads(raw_body or b"null")
+    except json.JSONDecodeError:
+        raise HTTPException(400, "invalid JSON")
+
+    posts: list[dict[str, Any]]
+    if payload is None:
+        posts = []
+    elif isinstance(payload, list):
+        posts = [p for p in payload if isinstance(p, dict)]
+    elif isinstance(payload, dict):
+        posts = [payload]
+    else:
+        posts = []
+
+    inserted = 0
+    skipped = 0
+    now = utcnow()
+    for raw in posts:
+        doc = normalize_inbox_post(raw, cofounder_id=cofounder_id)
+        if not doc.get("post_uid") and not doc.get("post_url"):
+            skipped += 1
+            continue
+        doc["operator_id"] = cf["operator_id"]
+        doc["received_at"] = now
+        # Idempotent upsert — Crustdata can re-deliver. Match on (cofounder, uid)
+        # primarily; fall back to (cofounder, post_url).
+        match = (
+            {"cofounder_id": cofounder_id, "post_uid": doc["post_uid"]}
+            if doc.get("post_uid")
+            else {"cofounder_id": cofounder_id, "post_url": doc["post_url"]}
+        )
+        result = await db.crustdata_inbox.update_one(
+            match,
+            {
+                "$setOnInsert": {**doc, "created_at": now},
+                "$set": {"updated_at": now},
+            },
+            upsert=True,
+        )
+        if result.upserted_id is not None:
+            inserted += 1
+        else:
+            skipped += 1
+
+    log.info(
+        "crustdata.webhook: cofounder=%s posts=%d inserted=%d skipped=%d",
+        cofounder_id,
+        len(posts),
+        inserted,
+        skipped,
+    )
+    return {"status": "ok", "received": len(posts), "inserted": inserted, "skipped": skipped}

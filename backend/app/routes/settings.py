@@ -8,7 +8,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 
 from app.auth.deps import CurrentUser
 from app.database import get_db
@@ -57,6 +57,8 @@ class SettingsResponse(BaseModel):
     hard_floor: int
     run_time_local: str
     paused: bool
+    operator_email: EmailStr
+    slate_recipients: list[EmailStr] = Field(default_factory=list)
 
 
 class SettingsPatch(BaseModel):
@@ -69,6 +71,7 @@ class SettingsPatch(BaseModel):
         default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$"
     )
     paused: bool | None = None
+    slate_recipients: list[EmailStr] | None = Field(default=None, max_length=20)
 
 
 def _to_response(user: dict[str, Any]) -> SettingsResponse:
@@ -86,6 +89,8 @@ def _to_response(user: dict[str, Any]) -> SettingsResponse:
         hard_floor=int(user.get("hard_floor") or 20),
         run_time_local=user.get("run_time_local") or "09:00",
         paused=bool(user.get("paused", False)),
+        operator_email=user["email"],
+        slate_recipients=user.get("slate_recipients") or [],
     )
 
 
@@ -122,6 +127,16 @@ async def update_settings(
         update["run_time_local"] = payload.run_time_local
     if payload.paused is not None:
         update["paused"] = payload.paused
+    if payload.slate_recipients is not None:
+        # Dedupe + lowercase normalize.
+        seen: set[str] = set()
+        clean: list[str] = []
+        for raw in payload.slate_recipients:
+            e = str(raw).strip().lower()
+            if e and e not in seen:
+                seen.add(e)
+                clean.append(e)
+        update["slate_recipients"] = clean
 
     if len(update) == 1:
         # only updated_at changed → no-op
