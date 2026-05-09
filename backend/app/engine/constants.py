@@ -20,14 +20,21 @@ DISCOVERY_PAGES_PER_KEYWORD = 1
 # Exhaustion ledger lookback window (days).
 EXHAUSTION_LOOKBACK_DAYS = 90
 
-# Comment-type quotas (% of slate). Match spec decision #10.
-COMMENT_TYPE_QUOTAS_DEFAULT = {
-    "A": (0.35, 0.40),
-    "B": (0.22, 0.25),
-    "C": (0.14, 0.16),
-    "D": (0.09, 0.12),
-    "E": (0.07, 0.10),
-    "F": (0.00, 0.05),
+# Comment-type quotas as {floor, cap} percentages of the slate.
+#
+# Locked values from the 2026-05-05 audit (RULE 7): Type-E was the best
+# performer (31% reply), Type-A the worst (4.8%), Type-B dead (3%). Quotas
+# are now {floor, cap} not (lo, hi) — caps are MAX percentages, floors are
+# MIN percentages, so the allocator can mix the slate without violating
+# either bound. Old (lo, hi) tuples are still accepted as legacy input;
+# allocator._normalize_quota maps them to {floor=lo, cap=hi}.
+COMMENT_TYPE_QUOTAS_DEFAULT: dict[str, dict[str, int]] = {
+    "A": {"floor": 0,  "cap": 25},
+    "B": {"floor": 0,  "cap": 10},
+    "C": {"floor": 25, "cap": 100},
+    "D": {"floor": 10, "cap": 15},
+    "E": {"floor": 20, "cap": 100},
+    "F": {"floor": 5,  "cap": 10},
 }
 
 # Comment-type descriptions, embedded into the drafter prompt.

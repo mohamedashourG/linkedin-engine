@@ -42,14 +42,18 @@ class UserInDB(BaseModel):
     product_description: str | None = None
     product_extracted: dict[str, Any] | None = None
     icp_rubric: dict[str, Any] | None = None
-    comment_quotas: dict[str, list[int]] = Field(
+    # RULE 7 audit (2026-05-05): A capped 25 (was workhorse, now reduced),
+    # B capped 10 (dead, 3% reply), C floor 25 (workhorse), D 10-15, E floor
+    # 20 (best performer, 31% reply), F 5-10. Old [lo, hi] shape still
+    # accepted by allocator._normalize_quota; new shape is {floor, cap}.
+    comment_quotas: dict[str, Any] = Field(
         default_factory=lambda: {
-            "A": [35, 40],
-            "B": [22, 25],
-            "C": [14, 16],
-            "D": [9, 12],
-            "E": [7, 10],
-            "F": [0, 5],
+            "A": {"floor": 0,  "cap": 25},
+            "B": {"floor": 0,  "cap": 10},
+            "C": {"floor": 25, "cap": 100},
+            "D": {"floor": 10, "cap": 15},
+            "E": {"floor": 20, "cap": 100},
+            "F": {"floor": 5,  "cap": 10},
         }
     )
     daily_target: int = 30

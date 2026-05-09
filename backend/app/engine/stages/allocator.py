@@ -5,9 +5,12 @@ slate, and assign each one a comment type A-F respecting the operator's quotas.
 Two passes:
   1. Per-cofounder allocation — each cofounder gets up to their daily_volume_target,
      pulled in ICP-score-descending order from candidates assigned to them.
-  2. Comment-type assignment — within each cofounder's bucket, distribute types
-     A-F by their quota percentages, biasing higher-effort types (A, B) toward
-     higher-scoring posts.
+  2. Comment-type assignment (RULE 7 floor-then-fill) — within each cofounder's
+     bucket, every type gets at least its floor share, then remaining slots
+     fill the type with the most headroom up to its cap. The audit's locked
+     defaults (A cap 25, B cap 10, C floor 25, D 10-15, E floor 20, F 5-10)
+     ensure the worst performers (A, B) can't dominate while the best (E)
+     and the workhorse (C) get guaranteed presence.
 """
 from __future__ import annotations
 
@@ -45,10 +48,7 @@ def allocate(
     for c in survivors:
         by_cofounder.setdefault(c["cofounder_id"], []).append(c)
 
-    quotas = operator.get("comment_quotas") or {
-        k: list(v) for k, v in {k: list(rng) for k, rng in COMMENT_TYPE_QUOTAS_DEFAULT.items()}.items()
-    }
-    quotas_pct = {k: tuple(v) for k, v in quotas.items()}
+    quotas = operator.get("comment_quotas") or COMMENT_TYPE_QUOTAS_DEFAULT
 
     allocated_total = 0
     per_cf_summary: dict[str, dict[str, int]] = {}
@@ -59,7 +59,7 @@ def allocate(
         bucket = sorted(by_cofounder.get(cf_id, []), key=_candidate_score, reverse=True)
         chosen = bucket[:target]
 
-        type_assignments = _assign_types(len(chosen), quotas_pct)
+        type_assignments = _assign_types(len(chosen), quotas)
         for c, comment_type in zip(chosen, type_assignments):
             db.candidates.update_one(
                 {"_id": c["_id"]},
@@ -100,31 +100,95 @@ def allocate(
     return per_cf_summary
 
 
-def _assign_types(
-    n: int, quotas_pct: dict[str, tuple[float | int, float | int]]
-) -> list[str]:
-    """
-    Use the midpoint of each quota range as the target percentage. Round to
-    integer counts; pad/trim to exactly N. Order: highest-effort types first
-    (A, B, C, D, E, F) so top-scoring posts get heavier comments.
-    """
+_ORDERED_TYPES = ("A", "B", "C", "D", "E", "F")
+
+
+def _normalize_quota(value: Any) -> dict[str, float]:
+    """Coerce the user's per-type quota record into {floor, cap} as fractions
+    of 1.0.
+
+    Accepts:
+      - {"floor": pct, "cap": pct}     ← new shape (RULE 7 audit 2026-05-05)
+      - [lo, hi] / (lo, hi)            ← legacy shape; lo→floor, hi→cap
+
+    Percentages > 1 are interpreted as 0-100 (so 25 → 0.25); values ≤ 1 as
+    fractions of 1 already. Missing or malformed entries default to {0, 1}
+    (no constraint), which is the safe-rather-than-strict choice."""
+    def _pct(v: Any) -> float:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return 0.0
+        return f / 100.0 if f > 1 else f
+
+    if isinstance(value, dict):
+        return {"floor": _pct(value.get("floor", 0)), "cap": _pct(value.get("cap", 1))}
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        lo, hi = value
+        return {"floor": _pct(lo), "cap": _pct(hi)}
+    return {"floor": 0.0, "cap": 1.0}
+
+
+def _assign_types(n: int, quotas: dict[str, Any]) -> list[str]:
+    """RULE 7 floor-then-fill allocation.
+
+    Step 1: each type gets round(n * floor) slots.
+    Step 2: distribute remaining slots to types with positive headroom
+            (cap - current), greedy by descending headroom.
+    Step 3: trim if rounding overshot, by removing slack-most-from-floor
+            types one at a time.
+
+    Final padding (if quotas are degenerate and we still don't have N slots)
+    spills to the highest-cap type rather than always to type A."""
     if n <= 0:
         return []
-    ordered_types = ["A", "B", "C", "D", "E", "F"]
 
-    def midpoint(rng: tuple[float | int, float | int]) -> float:
-        lo, hi = rng
-        lo_v = float(lo) / 100.0 if float(lo) > 1 else float(lo)
-        hi_v = float(hi) / 100.0 if float(hi) > 1 else float(hi)
-        return (lo_v + hi_v) / 2.0
+    norm = {t: _normalize_quota(quotas.get(t)) for t in _ORDERED_TYPES}
+    floor_count = {t: int(round(n * norm[t]["floor"])) for t in _ORDERED_TYPES}
+    cap_count = {t: int(n * norm[t]["cap"]) for t in _ORDERED_TYPES}
 
-    target_counts = {t: round(n * midpoint(quotas_pct.get(t, (0, 0)))) for t in ordered_types}
-    total = sum(target_counts.values())
-    diff = n - total
-    if diff != 0:
-        target_counts["A"] = max(0, target_counts.get("A", 0) + diff)
+    # Floor must not exceed cap. If they cross (degenerate quota), respect cap.
+    counts = {t: min(floor_count[t], cap_count[t]) for t in _ORDERED_TYPES}
+
+    total = sum(counts.values())
+    if total < n:
+        # Fill remaining by descending headroom (cap - current); ties broken
+        # by ordered_types position (favors A first only when equal).
+        remaining = n - total
+        for _ in range(remaining):
+            headroom = {t: cap_count[t] - counts[t] for t in _ORDERED_TYPES}
+            best: str | None = None
+            best_room = 0
+            for t in _ORDERED_TYPES:
+                if headroom[t] > best_room:
+                    best = t
+                    best_room = headroom[t]
+            if best is None:
+                break  # all caps full; degenerate quotas — stop adding
+            counts[best] += 1
+    elif total > n:
+        # Trim. Pick types with the most slack ABOVE floor, never going below.
+        excess = total - n
+        for _ in range(excess):
+            slack = {t: counts[t] - floor_count[t] for t in _ORDERED_TYPES}
+            worst: str | None = None
+            worst_slack = 0
+            for t in _ORDERED_TYPES:
+                if slack[t] > worst_slack:
+                    worst = t
+                    worst_slack = slack[t]
+            if worst is None:
+                break  # everyone is at floor — stop trimming
+            counts[worst] -= 1
 
     out: list[str] = []
-    for t in ordered_types:
-        out.extend([t] * target_counts.get(t, 0))
-    return out[:n] + ["A"] * max(0, n - len(out[:n]))
+    for t in _ORDERED_TYPES:
+        out.extend([t] * counts[t])
+
+    # Defensive padding: if degenerate quotas left us short, fall back to the
+    # type with the highest cap (rather than always type A which the audit
+    # caps at 25%).
+    if len(out) < n:
+        spill = max(_ORDERED_TYPES, key=lambda t: cap_count[t])
+        out.extend([spill] * (n - len(out)))
+    return out[:n]
