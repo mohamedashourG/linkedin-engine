@@ -1,0 +1,84 @@
+services:
+  mongo:
+    image: mongo:7
+    expose:
+      - "27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    env_file:
+      - ../.env
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ../backend:/app
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    command: celery -A app.celery_app.celery_app worker --loglevel=info --concurrency=2
+    env_file:
+      - ../.env
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ../backend:/app
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    command: celery -A app.celery_app.celery_app beat --loglevel=info
+    env_file:
+      - ../.env
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ../backend:/app
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  mongo_data:
+  redis_data:
