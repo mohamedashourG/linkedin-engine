@@ -1,0 +1,6 @@
+{
+  "slug": "edge",
+  "display_name": "Edge",
+  "client_name_aliases": ["Edge", "EdgeOps", "Edge Operations", "EdgeHC"],
+  "notes": "Healthcare-delivery-side client. Sells INTO health systems, hospital groups, medical groups, FQHCs. Buyers are HR / RCM / Operations leaders, NOT pharma/biotech commercial."
+}

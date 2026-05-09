@@ -1,0 +1,93 @@
+{
+  "_comment": "Taiga ICP rubric. Independent physicians (owners + practitioners) and practice administrators. Physician titles MUST score tier-1 here — the codebase has no industry-based exclusion of physicians, so we just have to surface them as bullseye buyers.",
+  "title": {
+    "tiers": [
+      {
+        "matches": [
+          "Physician Owner",
+          "Practice Owner",
+          "Solo Practitioner",
+          "Practice Owner Physician",
+          "Owner Physician",
+          "Founder Physician",
+          "Practice Administrator",
+          "Practice Manager",
+          "Office Manager",
+          "Director Practice Operations",
+          "Director Revenue Cycle Management",
+          "RCM Director",
+          "Billing Manager",
+          "Senior Billing Manager",
+          "Owner Operator Physician"
+        ],
+        "score": 5
+      },
+      {
+        "matches": [
+          "Physician",
+          "MD",
+          "DO",
+          "Psychiatrist",
+          "Dermatologist",
+          "Cardiologist",
+          "Oncologist",
+          "Internist",
+          "Family Physician",
+          "Pediatrician",
+          "Podiatrist",
+          "Dentist",
+          "Director Clinical Operations",
+          "Senior Practice Administrator"
+        ],
+        "score": 3
+      },
+      {
+        "matches": [
+          "Nurse Practitioner",
+          "Physician Assistant",
+          "Senior Office Manager"
+        ],
+        "score": 1
+      }
+    ]
+  },
+  "industry": {
+    "tiers": [
+      {
+        "matches": [
+          "Medical Practice",
+          "Mental Health Care",
+          "Hospitals and Health Care",
+          "Health Wellness and Fitness",
+          "Health Care Services"
+        ],
+        "score": 3
+      }
+    ]
+  },
+  "geography": {
+    "tiers": [
+      {
+        "matches": ["United States", "US", "USA"],
+        "score": 2
+      }
+    ]
+  },
+  "stage": {
+    "tiers": [
+      {
+        "matches": [
+          "solo practice",
+          "small practice",
+          "private practice",
+          "DPC",
+          "concierge medicine",
+          "telehealth practice",
+          "group practice"
+        ],
+        "score": 3
+      }
+    ]
+  },
+  "threshold": 6
+}

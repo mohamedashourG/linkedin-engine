@@ -1,0 +1,66 @@
+{
+  "_comment": "Edge keyword pools. Topical = problems Edge's buyers post about. Title-industry = direct buyer-title queries (RULE 15-EXT). Vertical buckets organize the topical pool around the three lanes Edge runs: HR, RCM, Operations.",
+  "tier_1_topical": [
+    "hospital workforce shortage",
+    "RIF paradox health system",
+    "healthcare hiring freeze",
+    "RCM efficiency hospital",
+    "denied claims rate hospital",
+    "patient access denials",
+    "health system efficiency",
+    "hospital labor cost pressure",
+    "front-end RCM denials",
+    "nurse turnover rate hospital"
+  ],
+  "tier_2_topical": [
+    "health system financial pressure",
+    "hospital margin compression",
+    "FQHC operational efficiency",
+    "medical group operations",
+    "nursing workforce planning",
+    "ambulatory operations efficiency"
+  ],
+  "tier_3_topical": [
+    "hospital operations",
+    "health system management"
+  ],
+  "title_industry": [
+    "CHRO health system",
+    "VP HR hospital",
+    "VP Talent Acquisition hospital",
+    "Chief People Officer health system",
+    "VP Revenue Cycle hospital",
+    "Director RCM health system",
+    "Chief Operating Officer hospital",
+    "VP Operations health system",
+    "Chief Financial Officer hospital",
+    "VP Workforce Planning health system",
+    "Director Patient Access hospital",
+    "Director Practice Operations medical group",
+    "VP Operations FQHC",
+    "Director RCM FQHC"
+  ],
+  "vertical_buckets": {
+    "edge_hr": [
+      "hospital workforce shortage",
+      "RIF paradox health system",
+      "healthcare hiring freeze",
+      "nurse turnover rate hospital",
+      "nursing workforce planning"
+    ],
+    "edge_rcm": [
+      "RCM efficiency hospital",
+      "denied claims rate hospital",
+      "front-end RCM denials",
+      "patient access denials"
+    ],
+    "edge_operations": [
+      "health system efficiency",
+      "hospital labor cost pressure",
+      "ambulatory operations efficiency",
+      "hospital margin compression",
+      "FQHC operational efficiency",
+      "medical group operations"
+    ]
+  }
+}

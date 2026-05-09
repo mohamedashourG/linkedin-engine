@@ -1,0 +1,71 @@
+{
+  "_comment": "Taiga keyword pools. Topical lists are problems independent physicians and small-practice admins post about. Vertical buckets segment by specialty (psychiatry / dermatology / cardiology / etc.) so the drafter can pick the right angle.",
+  "tier_1_topical": [
+    "denied claims rate small practice",
+    "50% mental health denials",
+    "mental health parity",
+    "claim denial rate independent practice",
+    "private practice billing fragility",
+    "solo practitioner cash flow",
+    "specialty practice operations",
+    "DPC practice growth",
+    "concierge medicine operations",
+    "physician owner burnout"
+  ],
+  "tier_2_topical": [
+    "RCM small practice",
+    "billing service independent physician",
+    "telehealth practice scaling",
+    "practice management EHR",
+    "small practice profitability"
+  ],
+  "tier_3_topical": [
+    "private practice",
+    "physician practice"
+  ],
+  "title_industry": [
+    "Physician Owner private practice",
+    "Practice Owner medical practice",
+    "Solo Practitioner mental health",
+    "Practice Administrator dermatology",
+    "Practice Manager cardiology",
+    "Office Manager oncology",
+    "Director RCM physician group",
+    "Billing Manager private practice",
+    "Practice Owner DPC",
+    "Practice Owner concierge medicine",
+    "Psychiatrist private practice",
+    "Cardiologist private practice",
+    "Dermatologist solo practice",
+    "Internist private practice"
+  ],
+  "vertical_buckets": {
+    "taiga_psychiatry": [
+      "50% mental health denials",
+      "mental health parity",
+      "Psychiatrist private practice",
+      "Solo Practitioner mental health"
+    ],
+    "taiga_dermatology": [
+      "Dermatologist solo practice",
+      "Practice Administrator dermatology"
+    ],
+    "taiga_cardiology": [
+      "Cardiologist private practice",
+      "Practice Manager cardiology"
+    ],
+    "taiga_oncology": [
+      "Office Manager oncology",
+      "specialty practice operations"
+    ],
+    "taiga_internal_medicine": [
+      "Internist private practice",
+      "DPC practice growth",
+      "concierge medicine operations"
+    ],
+    "taiga_podiatry": [
+      "specialty practice operations",
+      "private practice billing fragility"
+    ]
+  }
+}

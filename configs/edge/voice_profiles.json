@@ -1,0 +1,16 @@
+{
+  "_comment": "Edge voice notes. Buyers are health-system operators reading LinkedIn between meetings. Lead with operational specifics, not vendor pitches.",
+  "shared_voice_notes": [
+    "Lead with the operational pattern, not the technology. Cite a specific lever (FTE count, denial rate, hire-to-fill cycle).",
+    "Treat hospitals as the customer, never as a vendor or 'staffing problem'.",
+    "When citing data, name the cohort (urban academic medical center, rural FQHC, community hospital under 200 beds, etc.) so the reader sees themselves in it."
+  ],
+  "preferred_close_patterns": ["question", "data_offer"],
+  "avoided_phrases": [
+    "staffing agency",
+    "staffing firm",
+    "outsource your hiring",
+    "magic bullet",
+    "transform your workforce"
+  ]
+}

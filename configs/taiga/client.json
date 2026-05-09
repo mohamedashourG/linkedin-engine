@@ -1,0 +1,6 @@
+{
+  "slug": "taiga",
+  "display_name": "Taiga",
+  "client_name_aliases": ["Taiga", "TaigaHealth", "Taiga Health"],
+  "notes": "Independent-physician client. Sells INTO solo / small-mid practices and hospital systems. Physicians are buyers (not clinical exclusions). Specialty routing on the drafter prompt — psychiatry, dermatology, podiatry, cardiology, oncology, internal medicine each get a different angle."
+}

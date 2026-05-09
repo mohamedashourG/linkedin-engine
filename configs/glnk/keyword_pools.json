@@ -41,5 +41,37 @@
     "Director Specialty Pharmacy pharma",
     "Head of Commercial Analytics pharma",
     "Director Medical Affairs biotech"
-  ]
+  ],
+  "vertical_buckets": {
+    "_comment": "RULE 8: retired the catch-all pharma_commercial bucket (10 comments, 0% reply on the 2026-04 audit). Five replacement buckets, each scoped tightly enough that a slate cannot collapse onto generic 'pharma commercial' content.",
+    "pharma_data": [
+      "specialty pharmacy data",
+      "GLP-1 cash pay prescriber",
+      "biotech commercial analytics",
+      "commercial data integration"
+    ],
+    "pharma_marketing": [
+      "HCP targeting commercial",
+      "HCP segmentation",
+      "MSL strategy KOL prep"
+    ],
+    "pharma_launch_readiness": [
+      "pharma launch readiness",
+      "field force sizing pharma",
+      "specialty launch sequencing",
+      "pre-launch readiness",
+      "patient access launch"
+    ],
+    "pharma_commercial_strategy": [
+      "rare disease commercial",
+      "cell therapy commercial",
+      "advanced therapeutics launch",
+      "launch ROI measurement"
+    ],
+    "pharma_AI_omnichannel": [
+      "AI omnichannel pharma",
+      "next best action pharma",
+      "omnichannel HCP engagement"
+    ]
+  }
 }

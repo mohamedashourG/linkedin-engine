@@ -1,0 +1,14 @@
+{
+  "_comment": "Taiga voice notes. Buyers are physician-owners and practice administrators reading on their phone between patients. Lead with the cash-flow / denial-rate stat, never with technology.",
+  "shared_voice_notes": [
+    "Lead with the operational stat (50% denial rate, 2% baseline vs 5-10% best-in-class) before naming any product.",
+    "Treat physicians as owner-operators, not 'targets'. Their problem is operational fragility, not 'lack of digital adoption'.",
+    "When citing data, name the specialty (psychiatry, dermatology, cardiology, etc.) so the reader sees themselves in it."
+  ],
+  "preferred_close_patterns": ["data_offer", "question"],
+  "avoided_phrases": [
+    "automate your billing",
+    "concierge billing solution",
+    "transform your practice"
+  ]
+}

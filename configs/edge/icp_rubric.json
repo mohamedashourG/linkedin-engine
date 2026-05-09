@@ -1,0 +1,88 @@
+{
+  "_comment": "Edge ICP rubric. Health-system delivery-side buyers. HR / RCM / Operations leaders at hospitals, health systems, FQHCs, medical groups. Tier-1 industry covers the buy-side (delivery), not the sell-side. Hospital-size companies are NOT excluded (they're targets here).",
+  "title": {
+    "tiers": [
+      {
+        "matches": [
+          "Chief Human Resources Officer",
+          "CHRO",
+          "VP Human Resources",
+          "VP HR",
+          "VP Talent Acquisition",
+          "VP Workforce",
+          "VP Workforce Planning",
+          "Chief People Officer",
+          "VP Revenue Cycle",
+          "VP RCM",
+          "Director Revenue Cycle Management",
+          "Director RCM",
+          "Chief Operating Officer",
+          "VP Operations",
+          "Chief Financial Officer",
+          "VP Finance"
+        ],
+        "score": 5
+      },
+      {
+        "matches": [
+          "Director Human Resources",
+          "Director Talent Acquisition",
+          "Director People",
+          "Director Operations",
+          "Director Workforce",
+          "Senior Director Operations",
+          "Senior Director RCM",
+          "Director Patient Access",
+          "Director Practice Operations"
+        ],
+        "score": 3
+      },
+      {
+        "matches": [
+          "Manager Human Resources",
+          "Senior Manager Operations",
+          "Senior Manager RCM",
+          "RCM Specialist Senior",
+          "Workforce Planning Manager"
+        ],
+        "score": 1
+      }
+    ]
+  },
+  "industry": {
+    "tiers": [
+      {
+        "matches": [
+          "Hospitals and Health Care",
+          "Hospital and Health Care",
+          "Health Systems",
+          "Hospital Network",
+          "Medical Groups",
+          "Medical Group Practice",
+          "FQHC",
+          "Federally Qualified Health Center",
+          "Community Health Centers",
+          "Health Care Services"
+        ],
+        "score": 3
+      }
+    ]
+  },
+  "geography": {
+    "tiers": [
+      {
+        "matches": ["United States", "US", "USA"],
+        "score": 2
+      }
+    ]
+  },
+  "stage": {
+    "tiers": [
+      {
+        "matches": ["health system", "hospital network", "FQHC", "physician group", "ACO"],
+        "score": 3
+      }
+    ]
+  },
+  "threshold": 6
+}

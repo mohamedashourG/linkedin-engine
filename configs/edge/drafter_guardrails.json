@@ -1,0 +1,18 @@
+{
+  "_comment": "Edge per-client drafter overlays. extra_banned_phrases blocks at validation time. anchors / cta_styles surface in the drafter prompt.",
+  "extra_banned_phrases": [
+    "staffing agency",
+    "staffing firm",
+    "your staffing problem",
+    "outsource your hiring"
+  ],
+  "extra_banned_buzzwords": [],
+  "anchors": [
+    "the RIF paradox: cutting headcount inside a unit that is already short-staffed makes the metric worse, not better",
+    "Becker's #93: workforce is the #1 financial pressure cited by health-system CFOs in the 2026 Becker's report",
+    "Edge has been mapping hire-to-fill cycle compression where 71% of vacancies in front-line clinical roles drag operations the most"
+  ],
+  "cta_styles": ["data_offer", "binary_question"],
+  "never_mention_in_cr": true,
+  "client_name_in_cr_allowed": false
+}

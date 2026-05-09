@@ -1,0 +1,25 @@
+{
+  "_comment": "Taiga per-client drafter overlays. Specialty_anchors map a specialty tag (taiga_<specialty>) to the angle the drafter should lead with. The drafter consumes this when the candidate's vertical bucket matches a key.",
+  "extra_banned_phrases": [
+    "automate your billing",
+    "your billing problem",
+    "transform your practice"
+  ],
+  "extra_banned_buzzwords": [],
+  "anchors": [
+    "the 50% mental-health denial baseline you posted is the headline stat — every brand misses that the 2% best-in-class denial rate IS achievable, just not with the EHR's built-in billing module",
+    "2% vs 5-10% denied claims is the cleanest single-number gap in the SMB practice market",
+    "operational fragility at solo / small practice means one billing error compounds for 90 days before anyone notices"
+  ],
+  "specialty_anchors": {
+    "taiga_psychiatry": "Mental-health parity is the headline. Lead with 50% denial baseline; that is the post-parity test, not the baseline.",
+    "taiga_dermatology": "Cash-pay aesthetic mix complicates RCM. Lead with the cash-pay-percent fragility, not a billing-tool pitch.",
+    "taiga_cardiology": "Cardiology is procedure-heavy and modifier-fragile. Lead with denial-rate-by-modifier, not 'denial rate'.",
+    "taiga_oncology": "Oncology is high-dollar low-volume. Lead with the $-per-claim variance and prior-auth turnaround.",
+    "taiga_internal_medicine": "Internal medicine is mostly DPC / concierge / hybrid. Lead with operational fragility, not denials.",
+    "taiga_podiatry": "Podiatry is tier-2 specialty under Medicare scrutiny. Lead with audit-readiness."
+  },
+  "cta_styles": ["data_offer", "binary_question"],
+  "never_mention_in_cr": true,
+  "client_name_in_cr_allowed": false
+}
