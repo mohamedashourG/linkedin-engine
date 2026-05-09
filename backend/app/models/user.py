@@ -56,8 +56,13 @@ class UserInDB(BaseModel):
             "F": {"floor": 5,  "cap": 10},
         }
     )
-    daily_target: int = 30
-    hard_floor: int = 20
+    # RULE 2 (locked): aspirational target 50, hard floor 30 (warn below),
+    # abort floor 25 (engine refuses to ship). Score ≤5 candidates are
+    # dropped at icp_low gate so they automatically don't count toward
+    # these.
+    daily_target: int = 50
+    hard_floor: int = 30
+    abort_floor: int = 25
     run_time_local: str = "09:00"
     calendly_webhook_signing_key: str | None = None
     onboarding_complete: bool = False

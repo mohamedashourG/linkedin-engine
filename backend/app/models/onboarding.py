@@ -27,7 +27,9 @@ class ScheduleRequest(BaseModel):
         description="HH:MM 24-hour local time, e.g. '09:00'.",
         pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
     )
-    daily_target: int = Field(default=30, ge=1, le=200)
+    # RULE 2 audit-locked default. Operators can dial down for low-volume
+    # rollouts; abort_floor still kicks in at 25 regardless.
+    daily_target: int = Field(default=50, ge=1, le=200)
 
 
 class OnboardingStatus(BaseModel):

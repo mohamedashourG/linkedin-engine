@@ -58,16 +58,45 @@ def seal_slate(
         db.candidates.find({"slate_run_id": slate_run_id, "status": "drafted"})
     )
 
-    # Layer 1 — operator-level floor
-    hard_floor = int(operator.get("hard_floor") or 20)
-    if len(drafted) < hard_floor:
+    # Layer 1 — operator-level floors (RULE 2: 50 target / 30 hard / 25 abort).
+    # < abort_floor      → force_abort (engine refuses to ship)
+    # < hard_floor       → audit warning, do NOT abort (operator-visible signal)
+    # ≥ hard_floor       → silent pass
+    abort_floor = int(operator.get("abort_floor") or 25)
+    hard_floor = int(operator.get("hard_floor") or 30)
+    if len(drafted) < abort_floor:
         _abort(
             db,
             slate_run_id,
             validations,
             reason="floor_breach",
             layer="floor",
-            details={"drafted": len(drafted), "hard_floor": hard_floor},
+            details={
+                "drafted": len(drafted),
+                "abort_floor": abort_floor,
+                "hard_floor": hard_floor,
+            },
+        )
+    if len(drafted) < hard_floor:
+        db.audit_records.insert_one(
+            {
+                "operator_id": operator_id,
+                "event_type": "floor_warn",
+                "slate_run_id": slate_run_id,
+                "details": {
+                    "drafted": len(drafted),
+                    "hard_floor": hard_floor,
+                    "abort_floor": abort_floor,
+                },
+                "severity": "warn",
+                "created_at": utcnow(),
+            }
+        )
+        log.warning(
+            "RULE 2: drafted=%d below hard_floor=%d (abort_floor=%d) — slate ships with warning",
+            len(drafted),
+            hard_floor,
+            abort_floor,
         )
     validations.append({"layer": "floor", "pass": True})
 
