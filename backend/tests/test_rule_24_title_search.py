@@ -148,6 +148,7 @@ def test_title_search_inserts_candidates_with_correct_tagging(monkeypatch):
 
     inserted = discovery._run_unipile_title_search(
         db,
+        operator={"_id": op_id},
         operator_id=op_id,
         cofounder_id=cf_id,
         slate_run_id=slate_id,
@@ -179,6 +180,7 @@ def test_title_search_marks_queries_in_ledger(monkeypatch):
 
     discovery._run_unipile_title_search(
         db,
+        operator={"_id": op_id},
         operator_id=op_id,
         cofounder_id=ObjectId(),
         slate_run_id=ObjectId(),
@@ -218,6 +220,7 @@ def test_title_search_skips_recently_used_queries(monkeypatch):
 
     discovery._run_unipile_title_search(
         db,
+        operator={"_id": op_id},
         operator_id=op_id,
         cofounder_id=ObjectId(),
         slate_run_id=ObjectId(),
@@ -237,6 +240,7 @@ def test_title_search_skips_when_pool_empty():
     db = _DB()
     inserted = discovery._run_unipile_title_search(
         db,
+        operator={"_id": ObjectId()},
         operator_id=ObjectId(),
         cofounder_id=ObjectId(),
         slate_run_id=ObjectId(),
@@ -254,6 +258,7 @@ def test_title_search_skips_when_account_id_missing():
     db = _DB()
     inserted = discovery._run_unipile_title_search(
         db,
+        operator={"_id": ObjectId()},
         operator_id=ObjectId(),
         cofounder_id=ObjectId(),
         slate_run_id=ObjectId(),
@@ -297,6 +302,7 @@ def test_title_search_skips_authors_already_shipped(monkeypatch):
 
     discovery._run_unipile_title_search(
         db,
+        operator={"_id": op_id},
         operator_id=op_id,
         cofounder_id=ObjectId(),
         slate_run_id=ObjectId(),

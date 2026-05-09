@@ -291,13 +291,15 @@ def _parse_unipile_person(raw: dict[str, Any]) -> UnipilePerson | None:
         title=raw.get("headline") or raw.get("title") or raw.get("occupation"),
         company=raw.get("company") or raw.get("company_name"),
         location=raw.get("location"),
-        network_distance=str(
+        # Unipile returns "DISTANCE_1" / "DISTANCE_2" / "DISTANCE_3" /
+        # "OUT_OF_NETWORK". Pass through verbatim so the caller can filter
+        # without ambiguity.
+        network_distance=(
             raw.get("network_distance")
             or raw.get("distance")
             or raw.get("connection_degree")
-            or ""
-        ).strip("Dd")  # tolerate "DISTANCE_2" / "2nd" — strip trailing letters
-        or None,
+            or None
+        ),
     )
 
 
@@ -306,16 +308,16 @@ def search_people(
     account_id: str,
     query: str,
     limit: int = 10,
-    geo_urns: tuple[str, ...] = (LINKEDIN_GEO_URN_US,),
-    network_distances: tuple[str, ...] = ("S",),  # "S" = 2nd-degree per LinkedIn convention
+    network_distances: tuple[str, ...] = ("DISTANCE_2",),
 ) -> list[UnipilePerson]:
-    """RULE 24 — LinkedIn people search via Unipile. Default filter is US +
-    2nd-degree, matching the audit's URL.
+    """RULE 24 — LinkedIn people search via Unipile. Sends a minimal body
+    (Unipile rejects 400 on geo_urns / network_distance request fields in
+    this tenant) and applies the 2nd-degree filter client-side using the
+    `network_distance` field that Unipile returns on each result.
 
-    Endpoint shape mirrors search_posts: POST /linkedin/search with
-    {api: 'classic', category: 'people', keywords, geo_urns, network_distance}.
-    The network_distance + geo_urns filter shape may need a tweak per Unipile
-    tenant; this function is the single chokepoint to adjust if so."""
+    Defaults to 2nd-degree only ("DISTANCE_2"). Pass an empty tuple to
+    accept any distance. Locked / private profiles (public_identifier =
+    None, "LinkedIn Member" name) are dropped by _parse_unipile_person."""
     if settings.unipile_mock or not query.strip():
         return []
     body: dict[str, Any] = {
@@ -323,10 +325,6 @@ def search_people(
         "category": "people",
         "keywords": query[:300],
     }
-    if geo_urns:
-        body["geo_urns"] = list(geo_urns)
-    if network_distances:
-        body["network_distance"] = list(network_distances)
     with _client() as client:
         resp = client.post(
             "/linkedin/search",
@@ -336,10 +334,16 @@ def search_people(
     payload = _check_resp(resp, "search_people")
     items = payload.get("items") or payload.get("results") or []
     out: list[UnipilePerson] = []
+    allowed = {d.upper() for d in network_distances} if network_distances else None
     for raw in items:
         person = _parse_unipile_person(raw)
-        if person:
-            out.append(person)
+        if not person:
+            continue
+        if allowed:
+            nd = (person.network_distance or "").upper()
+            if nd not in allowed:
+                continue
+        out.append(person)
     return out
 
 
