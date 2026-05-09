@@ -1,0 +1,12 @@
+{
+  "_comment": "Per-client overlays on the global drafter guardrails. extra_banned_phrases and extra_banned_buzzwords merge with the global lists at validate-time. anchors / cta_styles are surfaced in the drafter prompt.",
+  "extra_banned_phrases": [],
+  "extra_banned_buzzwords": [],
+  "anchors": [
+    "G LNK has been mapping prescriber-level shifts for cash-pay launches",
+    "we are seeing the dispersion is bigger than people expect"
+  ],
+  "cta_styles": ["soft_dm_offer", "data_offer", "binary_question"],
+  "never_mention_in_cr": true,
+  "client_name_in_cr_allowed": false
+}

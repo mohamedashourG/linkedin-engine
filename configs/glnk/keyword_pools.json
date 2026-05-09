@@ -1,0 +1,45 @@
+{
+  "_comment": "Topical keyword pool (RULE 15) plus title-plus-industry pool (RULE 15-EXT) for the default healthcare-buyer-side client. The runtime daily mix is 4 topical + 4 title-industry per cofounder.",
+  "tier_1_topical": [
+    "pharma launch readiness",
+    "HCP targeting commercial",
+    "field force sizing pharma",
+    "specialty pharmacy data",
+    "patient access launch",
+    "GLP-1 cash pay prescriber",
+    "MSL strategy KOL prep",
+    "rare disease commercial",
+    "specialty launch sequencing",
+    "biotech commercial analytics"
+  ],
+  "tier_2_topical": [
+    "pharma commercial operations",
+    "pre-launch readiness",
+    "commercial data integration",
+    "launch ROI measurement",
+    "HCP segmentation",
+    "cell therapy commercial",
+    "advanced therapeutics launch"
+  ],
+  "tier_3_topical": [
+    "pharma marketing",
+    "drug launch",
+    "biotech operations"
+  ],
+  "title_industry": [
+    "VP Commercial pharma",
+    "Chief Commercial Officer biotech",
+    "Head of Launch Strategy pharma",
+    "Director Commercial Operations medical devices",
+    "VP Marketing rare disease",
+    "Head of Field Medical pharma",
+    "VP Data Analytics biotech",
+    "Chief Medical Officer biotech",
+    "Launch Director pharma",
+    "Director Brand Marketing biotech",
+    "VP Patient Services pharma",
+    "Director Specialty Pharmacy pharma",
+    "Head of Commercial Analytics pharma",
+    "Director Medical Affairs biotech"
+  ]
+}

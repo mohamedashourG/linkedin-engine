@@ -1,0 +1,10 @@
+{
+  "_comment": "Per-cofounder voice hints layered onto cofounder.voice_profile (the user-supplied tone description and examples remain authoritative; this file only adds CLIENT-LEVEL voice notes such as preferred phrasing or pet peeves common across all cofounders for this client).",
+  "shared_voice_notes": [
+    "Lead with the specific number whenever the post supplies one.",
+    "Match a single sharp question to the post's opening claim — never agree-and-extend.",
+    "When citing the product, never say 'platform' or 'solution'; say 'we have been mapping X' or 'we see this exact pattern'."
+  ],
+  "preferred_close_patterns": ["question", "prescriptive"],
+  "avoided_phrases": []
+}

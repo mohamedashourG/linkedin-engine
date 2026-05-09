@@ -39,6 +39,7 @@ from app.engine.stages.gates import (
 )
 from app.engine.stages.rule_23 import Rule23ForceAbort, seal_slate
 from app.models.common import utcnow
+from app.services import client_config
 from app.services.email import EmailNotConfigured
 
 log = logging.getLogger(__name__)
@@ -484,7 +485,10 @@ def _run_gates(
 
     counts = {"non_buyer": 0, "analyst": 0, "icp_low": 0, "post_quality": 0, "passed": 0}
     product_summary = (operator.get("product_description") or "")[:1500]
-    rubric = operator.get("icp_rubric") or {}
+    # Per-user rubric overlays the client baseline (RULE 20). On axes the user
+    # left blank, the client config's tier list is used.
+    cfg = client_config.for_operator(operator)
+    rubric = client_config.merge_icp_rubric(operator.get("icp_rubric"), cfg.icp_rubric)
 
     source_status = "verified" if phase == "cheap" else "cheap_gate_passed"
     target_status = "cheap_gate_passed" if phase == "cheap" else "gate_passed"

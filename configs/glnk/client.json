@@ -1,0 +1,6 @@
+{
+  "slug": "glnk",
+  "display_name": "G LNK",
+  "client_name_aliases": ["G LNK", "GLNK", "G-LNK", "Glnk"],
+  "notes": "Default client config. Healthcare-buyer-side ICP (pharma / biotech / medtech commercial)."
+}

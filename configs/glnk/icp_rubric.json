@@ -1,0 +1,75 @@
+{
+  "_comment": "Default healthcare-buyer-side rubric. Tier-1 = bullseye buyer (commercial / launch / data leadership at pharma/biotech). Operators inheriting glnk get this baseline; their per-user icp_rubric overlays it (per-user wins on the same axis). Threshold is on the normalized 0-10 score (RULE 14).",
+  "title": {
+    "tiers": [
+      {
+        "matches": [
+          "VP Commercial",
+          "Chief Commercial Officer",
+          "VP Marketing",
+          "Head of Marketing",
+          "Launch Director",
+          "VP Launch",
+          "Head of Launch Excellence",
+          "VP Data and Analytics",
+          "Head of Commercial Analytics",
+          "VP Sales",
+          "Chief Medical Officer",
+          "VP Medical Affairs"
+        ],
+        "score": 5
+      },
+      {
+        "matches": [
+          "Director Commercial",
+          "Director Marketing",
+          "Director Launch Strategy",
+          "Director Commercial Operations",
+          "Director Medical Affairs",
+          "Director Field Medical",
+          "Senior Director"
+        ],
+        "score": 3
+      },
+      {
+        "matches": [
+          "Manager Commercial",
+          "Senior Manager",
+          "MSL",
+          "Brand Manager"
+        ],
+        "score": 1
+      }
+    ]
+  },
+  "industry": {
+    "tiers": [
+      {
+        "matches": [
+          "Pharmaceuticals",
+          "Biotechnology",
+          "Medical Devices",
+          "Life Sciences"
+        ],
+        "score": 3
+      }
+    ]
+  },
+  "geography": {
+    "tiers": [
+      {
+        "matches": ["United States", "US", "USA", "North America"],
+        "score": 2
+      }
+    ]
+  },
+  "stage": {
+    "tiers": [
+      {
+        "matches": ["pre-launch", "launch", "post-launch", "Series B", "Series C", "growth-stage"],
+        "score": 3
+      }
+    ]
+  },
+  "threshold": 6
+}

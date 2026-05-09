@@ -38,6 +38,7 @@ class UserInDB(BaseModel):
     password_hash: str
     name: str
     timezone: str
+    client_slug: str = "glnk"
     product_description: str | None = None
     product_extracted: dict[str, Any] | None = None
     icp_rubric: dict[str, Any] | None = None
