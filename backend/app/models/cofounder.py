@@ -17,6 +17,10 @@ class CofounderCreate(BaseModel):
     calendly_url: HttpUrl | None = None
     email: EmailStr
     daily_volume_target: int = Field(default=20, ge=1, le=200)
+    # RULE 13 / RULE 1: lower number = higher authority. Highest-ICP candidates
+    # are routed to the lowest-rank cofounder first. Default 100 keeps new
+    # cofounders out of the top spots until the operator promotes them.
+    authority_rank: int = Field(default=100, ge=1, le=999)
 
 
 class CofounderUpdate(BaseModel):
@@ -25,6 +29,7 @@ class CofounderUpdate(BaseModel):
     calendly_url: HttpUrl | None = None
     email: EmailStr | None = None
     daily_volume_target: int | None = Field(default=None, ge=1, le=200)
+    authority_rank: int | None = Field(default=None, ge=1, le=999)
     active: bool | None = None
     unipile_account_id: str | None = Field(default=None, max_length=200)
     connect_message_template: str | None = Field(default=None, max_length=300)
@@ -44,6 +49,7 @@ class CofounderPublic(BaseModel):
     calendly_url: str | None = None
     email: EmailStr
     daily_volume_target: int
+    authority_rank: int = 100
     voice_profile: dict[str, Any] | None = None
     unipile_account_id: str | None = None
     connect_message_template: str | None = None
@@ -59,6 +65,7 @@ def cofounder_to_public(doc: dict[str, Any]) -> CofounderPublic:
         calendly_url=doc.get("calendly_url"),
         email=doc["email"],
         daily_volume_target=doc["daily_volume_target"],
+        authority_rank=int(doc.get("authority_rank") or 100),
         voice_profile=doc.get("voice_profile"),
         unipile_account_id=doc.get("unipile_account_id"),
         connect_message_template=doc.get("connect_message_template"),
@@ -76,6 +83,7 @@ def new_cofounder_doc(operator_id, payload: CofounderCreate) -> dict[str, Any]:
         "calendly_url": str(payload.calendly_url) if payload.calendly_url else None,
         "email": payload.email,
         "daily_volume_target": payload.daily_volume_target,
+        "authority_rank": payload.authority_rank,
         "voice_profile": None,
         "unipile_account_id": None,
         "connect_message_template": None,
