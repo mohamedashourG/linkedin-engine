@@ -451,10 +451,14 @@ def _evaluate_expensive_gates(
     except Exception as err:
         return "error_icp", {"err": str(err)}
     threshold = int(rubric.get("threshold", 6))
-    merged = {**prior, "analyst": ar.model_dump(), "icp": icp.model_dump()}
-    if icp.total < threshold:
+    icp_dump = icp.model_dump()
+    # RULE 14: project the raw axis-sum onto a 0-10 score and gate on that.
+    # `threshold` (default 6) means "drop if score_0_10 < 6", i.e., drop ≤5.
+    icp_dump["score_0_10"] = icp_scoring.compute_score_0_10(icp.total, rubric)
+    merged = {**prior, "analyst": ar.model_dump(), "icp": icp_dump}
+    if icp_dump["score_0_10"] < threshold:
         return "icp_low", {
-            "reason": f"icp: {icp.total} < {threshold}",
+            "reason": f"icp: score_0_10={icp_dump['score_0_10']} < {threshold}",
             "gate_results": merged,
         }
 

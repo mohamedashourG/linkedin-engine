@@ -51,6 +51,33 @@ Rules:
 - The rationale is for audit. Keep under 20 words and name the evidence type ('explicit', 'post-explicit', 'inferred')."""
 
 
+def max_possible_total(rubric: dict[str, Any]) -> int:
+    """Sum of top-tier scores across the four axes. Used to normalize
+    `total` onto the audit's 0-10 scale (RULE 14)."""
+    out = 0
+    for axis in ("title", "industry", "geography", "stage"):
+        tiers = (rubric.get(axis) or {}).get("tiers") or []
+        if not tiers:
+            continue
+        out += max(
+            (int(t.get("score", 0) or 0) for t in tiers if isinstance(t, dict)),
+            default=0,
+        )
+    return out
+
+
+def compute_score_0_10(total: int, rubric: dict[str, Any]) -> int:
+    """RULE 14 — collapse raw axis sums onto a 0-10 score.
+
+    Linear projection: score_0_10 = round(total / max_possible * 10), clamped
+    to [0, 10]. A rubric with no tiers (or all-zero scores) maps every
+    candidate to 0."""
+    cap = max_possible_total(rubric)
+    if cap <= 0:
+        return 0
+    return max(0, min(10, round(total * 10 / cap)))
+
+
 def evaluate(
     *,
     post_text: str,

@@ -27,7 +27,12 @@ log = logging.getLogger(__name__)
 
 
 def _candidate_score(c: dict[str, Any]) -> int:
+    """RULE 14: allocator sorts on score_0_10 (the audit's normalized scale)
+    when present, falls back to raw `total` for candidates from runs that
+    pre-date RULE 14."""
     icp = (c.get("gate_results") or {}).get("icp") or {}
+    if "score_0_10" in icp:
+        return int(icp.get("score_0_10") or 0)
     return int(icp.get("total", 0) or 0)
 
 
