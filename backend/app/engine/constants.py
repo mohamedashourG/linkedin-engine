@@ -23,6 +23,13 @@ DISCOVERY_PAGES_PER_KEYWORD = 1
 # (14 queries, 14-day no-repeat) lives in configs/<client>/keyword_pools.json.
 DISCOVERY_TITLE_INDUSTRY_PER_RUN = 4
 
+# RULE 24: title-search PEOPLE channel via Unipile. Audit-locked envelope
+# is 6 queries × 10 candidates × N cofounders per day. Recent-activity walk
+# fetches up to 5 posts per person.
+DISCOVERY_TITLE_SEARCH_QUERIES_PER_RUN = 6
+DISCOVERY_TITLE_SEARCH_PEOPLE_PER_QUERY = 10
+DISCOVERY_TITLE_SEARCH_POSTS_PER_PERSON = 5
+
 # Exhaustion ledger lookback window (days).
 EXHAUSTION_LOOKBACK_DAYS = 90
 

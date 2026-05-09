@@ -70,6 +70,26 @@ class UnipilePost:
     published_at: datetime | None
 
 
+@dataclass(frozen=True)
+class UnipilePerson:
+    """A LinkedIn profile returned from a people-search call (RULE 24).
+    Distinct from UnipilePost because RULE 24 walks the person's recent
+    activity AFTER the people-search returns the roster."""
+
+    name: str
+    public_identifier: str
+    profile_url: str
+    title: str | None
+    company: str | None
+    location: str | None
+    network_distance: str | None  # "1", "2", "3" — LinkedIn's degree label
+
+
+# RULE 24 — LinkedIn's geoUrn for the United States. Matches the audit's
+# people-search URL: linkedin.com/search/results/people/?geoUrn=%5B%22103644278%22%5D
+LINKEDIN_GEO_URN_US = "103644278"
+
+
 def _api_root() -> str:
     """The base Unipile tenant URL (no /api/v1 suffix). Used as `api_url` in
     the hosted-auth-link payload so Unipile knows which tenant to bind the
@@ -235,6 +255,91 @@ def search_posts(*, account_id: str, query: str, limit: int = 20) -> list[Unipil
         post = _parse_unipile_post(raw)
         if post:
             out.append(post)
+    return out
+
+
+def _parse_unipile_person(raw: dict[str, Any]) -> UnipilePerson | None:
+    """Normalize Unipile's people-search payload. Different endpoints nest the
+    public_identifier under different keys; tolerate the variants."""
+    if not raw:
+        return None
+    name = (
+        raw.get("name")
+        or " ".join(filter(None, [raw.get("first_name"), raw.get("last_name")])).strip()
+        or None
+    )
+    public_id = (
+        raw.get("public_identifier")
+        or raw.get("public_id")
+        or raw.get("slug")
+        or ""
+    )
+    profile_url = (
+        raw.get("public_profile_url")
+        or raw.get("profile_url")
+        or raw.get("url")
+        or (f"https://www.linkedin.com/in/{public_id}" if public_id else "")
+    )
+    if not public_id and "/in/" in profile_url:
+        public_id = profile_url.split("/in/", 1)[1].split("/", 1)[0].split("?", 1)[0]
+    if not public_id:
+        return None
+    return UnipilePerson(
+        name=name or "(unknown)",
+        public_identifier=public_id,
+        profile_url=profile_url,
+        title=raw.get("headline") or raw.get("title") or raw.get("occupation"),
+        company=raw.get("company") or raw.get("company_name"),
+        location=raw.get("location"),
+        network_distance=str(
+            raw.get("network_distance")
+            or raw.get("distance")
+            or raw.get("connection_degree")
+            or ""
+        ).strip("Dd")  # tolerate "DISTANCE_2" / "2nd" — strip trailing letters
+        or None,
+    )
+
+
+def search_people(
+    *,
+    account_id: str,
+    query: str,
+    limit: int = 10,
+    geo_urns: tuple[str, ...] = (LINKEDIN_GEO_URN_US,),
+    network_distances: tuple[str, ...] = ("S",),  # "S" = 2nd-degree per LinkedIn convention
+) -> list[UnipilePerson]:
+    """RULE 24 — LinkedIn people search via Unipile. Default filter is US +
+    2nd-degree, matching the audit's URL.
+
+    Endpoint shape mirrors search_posts: POST /linkedin/search with
+    {api: 'classic', category: 'people', keywords, geo_urns, network_distance}.
+    The network_distance + geo_urns filter shape may need a tweak per Unipile
+    tenant; this function is the single chokepoint to adjust if so."""
+    if settings.unipile_mock or not query.strip():
+        return []
+    body: dict[str, Any] = {
+        "api": "classic",
+        "category": "people",
+        "keywords": query[:300],
+    }
+    if geo_urns:
+        body["geo_urns"] = list(geo_urns)
+    if network_distances:
+        body["network_distance"] = list(network_distances)
+    with _client() as client:
+        resp = client.post(
+            "/linkedin/search",
+            params={"account_id": account_id, "limit": limit},
+            json=body,
+        )
+    payload = _check_resp(resp, "search_people")
+    items = payload.get("items") or payload.get("results") or []
+    out: list[UnipilePerson] = []
+    for raw in items:
+        person = _parse_unipile_person(raw)
+        if person:
+            out.append(person)
     return out
 
 

@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     discovery_use_crustdata: bool = True
     discovery_use_unipile: bool = True
     discovery_use_exa: bool = True
+    # RULE 24 — opt-out flag for the people-search channel. Defaults on but
+    # can be flipped per-tenant via env (DISCOVERY_USE_TITLE_SEARCH=false) if
+    # account safety becomes a concern.
+    discovery_use_title_search: bool = True
     # Posts older than this are dropped at verification — keeps the slate
     # fresh and avoids wasting enrichment credits on stale content.
     # Candidates with no published_at are kept (we don't penalize missing

@@ -37,6 +37,9 @@ from app.engine.constants import (
     DISCOVERY_TIER_2_PER_RUN,
     DISCOVERY_TIER_3_PER_RUN,
     DISCOVERY_TITLE_INDUSTRY_PER_RUN,
+    DISCOVERY_TITLE_SEARCH_PEOPLE_PER_QUERY,
+    DISCOVERY_TITLE_SEARCH_POSTS_PER_PERSON,
+    DISCOVERY_TITLE_SEARCH_QUERIES_PER_RUN,
     EXA_DISCOVERY_TIER_1_PER_RUN,
     EXA_DISCOVERY_TIER_2_PER_RUN,
     EXA_DISCOVERY_TIER_3_PER_RUN,
@@ -61,8 +64,10 @@ from app.services.exa import (
 from app.services.unipile import (
     UnipileError,
     UnipileNotConfigured,
+    UnipilePerson,
     UnipilePost,
     get_user_posts,
+    search_people,
     search_posts,
 )
 
@@ -539,6 +544,28 @@ def discover_for_operator(
                 )
                 inserted += unipile_inserted
 
+        # ── SOURCE 4b: RULE 24 title-search PEOPLE channel via Unipile.
+        # Runs only when unipile is on AND the title_search flag is set AND
+        # we have a connected account_id for the cofounder.
+        title_search_inserted = 0
+        if (
+            unipile_on
+            and settings.discovery_use_title_search
+            and cofounder.get("unipile_account_id")
+            and title_industry
+        ):
+            title_search_inserted = _run_unipile_title_search(
+                db,
+                operator_id=operator_id,
+                cofounder_id=cofounder_id,
+                slate_run_id=slate_run_id,
+                account_id=cofounder["unipile_account_id"],
+                title_industry=title_industry,
+                seen_urls=seen_urls,
+                seen_authors_shipped=seen_authors_shipped,
+            )
+            inserted += title_search_inserted
+
         # ── SOURCE 5: Contact seeds (apidirect + Exa search by name) ─────
         if contacts_on:
             contacts_inserted = _run_contact_seeds(
@@ -554,13 +581,14 @@ def discover_for_operator(
             inserted += contacts_inserted
 
         log.info(
-            "discovery: cofounder=%s total=%d (apidirect=%d, exa=%d, crustdata=%d, unipile=%d, contacts=%d)",
+            "discovery: cofounder=%s total=%d (apidirect=%d, exa=%d, crustdata=%d, unipile=%d, title_search=%d, contacts=%d)",
             cofounder_id,
-            apidirect_inserted + exa_inserted + crustdata_inserted + unipile_inserted + contacts_inserted,
+            apidirect_inserted + exa_inserted + crustdata_inserted + unipile_inserted + title_search_inserted + contacts_inserted,
             apidirect_inserted,
             exa_inserted,
             crustdata_inserted,
             unipile_inserted,
+            title_search_inserted,
             contacts_inserted,
         )
 
@@ -840,6 +868,112 @@ def _run_unipile(
                 )
             )
             inserted += 1
+    return inserted
+
+
+def _run_unipile_title_search(
+    db: Database,
+    *,
+    operator_id: ObjectId,
+    cofounder_id: ObjectId,
+    slate_run_id: ObjectId,
+    account_id: str,
+    title_industry: list[str],
+    seen_urls: set[str],
+    seen_authors_shipped: set[str],
+) -> int:
+    """RULE 24 — LinkedIn PEOPLE search via Unipile, then walk each profile's
+    recent activity. US geo + 2nd-degree filter (matches the audit URL).
+
+    Volume envelope per cofounder per run:
+      - up to 6 fresh queries from the title_industry pool (14-day no-repeat
+        on its own channel)
+      - top 10 people per query
+      - up to 5 most-recent posts per person
+
+    Each post is inserted as a candidate with source='unipile_people' and
+    source_channel='title_search' so allocator/drafter can route the
+    voice (RULE 18 / RULE 25)."""
+    if not title_industry or not account_id:
+        return 0
+
+    fresh_queries = keyword_history.filter_unused(
+        db,
+        operator_id=operator_id,
+        source_channel="title_search",
+        queries=title_industry,
+    )
+    plan = _rotate(fresh_queries, DISCOVERY_TITLE_SEARCH_QUERIES_PER_RUN)
+
+    inserted = 0
+    for query in plan:
+        # Step 1 — people search (US, 2nd-degree).
+        try:
+            people = search_people(
+                account_id=account_id,
+                query=query,
+                limit=DISCOVERY_TITLE_SEARCH_PEOPLE_PER_QUERY,
+            )
+        except UnipileNotConfigured as err:
+            log.warning("discovery: title_search unipile unconfigured: %s", err)
+            return inserted
+        except UnipileError as err:
+            log.warning("discovery: title_search %r failed: %s", query, err)
+            continue
+
+        keyword_history.mark_used(
+            db,
+            operator_id=operator_id,
+            source_channel="title_search",
+            query=query,
+        )
+
+        # Step 2 — for each person, walk recent activity.
+        for person in people:
+            author_url = person.profile_url
+            if author_url and author_url in seen_authors_shipped:
+                continue
+            if author_url and _is_exhausted(db, operator_id, author_url):
+                continue
+            try:
+                posts = get_user_posts(
+                    account_id=account_id,
+                    public_identifier_or_url=person.public_identifier or author_url,
+                    limit=DISCOVERY_TITLE_SEARCH_POSTS_PER_PERSON,
+                )
+            except UnipileError as err:
+                log.warning(
+                    "discovery: title_search recent-activity for %s failed: %s",
+                    person.public_identifier,
+                    err,
+                )
+                continue
+
+            for post in posts:
+                if not post.url or post.url in seen_urls:
+                    continue
+                seen_urls.add(post.url)
+                db.candidates.insert_one(
+                    _doc_from_unipile(
+                        post,
+                        operator_id=operator_id,
+                        cofounder_id=cofounder_id,
+                        slate_run_id=slate_run_id,
+                        source="unipile_people",
+                        source_keyword=query,
+                        # 2nd-degree US-filtered title hits are tier-1 ICP density.
+                        source_classification="A",
+                        source_channel="title_search",
+                    )
+                )
+                inserted += 1
+
+    log.info(
+        "discovery: title_search cofounder=%s queries=%d inserted=%d",
+        cofounder_id,
+        len(plan),
+        inserted,
+    )
     return inserted
 
 
