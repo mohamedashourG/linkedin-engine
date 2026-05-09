@@ -31,6 +31,7 @@ from bson import ObjectId
 from pymongo.database import Database
 
 from app.config import settings
+from app.engine import keyword_history
 from app.engine.constants import (
     DISCOVERY_TIER_1_PER_RUN,
     DISCOVERY_TIER_2_PER_RUN,
@@ -137,7 +138,12 @@ def _candidate_doc(
     source: str,
     source_keyword: str,
     source_classification: str,
+    source_channel: str = "",
 ) -> dict[str, Any]:
+    """`source` stays vendor-specific (apidirect_kw / exa_kw / unipile_*) for
+    debugging. `source_channel` is the audit-aligned tag (RULE 15:
+    keyword_topical, RULE 15-EXT: keyword_title_industry, RULE 24:
+    title_search) used by allocator/drafter routing."""
     now = utcnow()
     return {
         "operator_id": operator_id,
@@ -154,6 +160,7 @@ def _candidate_doc(
         "source": source,
         "source_keyword": source_keyword,
         "source_classification": source_classification,
+        "source_channel": source_channel,
         "status": "raw",
         "gate_results": {},
         "drop_reason": None,
@@ -177,6 +184,7 @@ def _doc_from_unipile(
     source: str,
     source_keyword: str,
     source_classification: str,
+    source_channel: str = "",
 ) -> dict[str, Any]:
     return _candidate_doc(
         operator_id=operator_id,
@@ -193,6 +201,7 @@ def _doc_from_unipile(
         source=source,
         source_keyword=source_keyword,
         source_classification=source_classification,
+        source_channel=source_channel,
     )
 
 
@@ -204,6 +213,7 @@ def _doc_from_apidirect(
     slate_run_id: ObjectId,
     source_keyword: str,
     source_classification: str,
+    source_channel: str = "keyword_topical",
 ) -> dict[str, Any]:
     return _candidate_doc(
         operator_id=operator_id,
@@ -220,6 +230,7 @@ def _doc_from_apidirect(
         source="apidirect_kw",
         source_keyword=source_keyword,
         source_classification=source_classification,
+        source_channel=source_channel,
     )
 
 
@@ -231,6 +242,7 @@ def _doc_from_exa(
     slate_run_id: ObjectId,
     source_keyword: str,
     source_classification: str,
+    source_channel: str = "keyword_topical",
 ) -> dict[str, Any]:
     # Pre-derive author URL from the LinkedIn post slug so profile_resolve
     # can enrich it. /pulse/ and /feed/update/ URLs return None and stay
@@ -251,6 +263,7 @@ def _doc_from_exa(
         source="exa_kw",
         source_keyword=source_keyword,
         source_classification=source_classification,
+        source_channel=source_channel,
     )
 
 
@@ -561,11 +574,21 @@ def _run_apidirect(
     seen_authors_shipped: set[str],
 ) -> int:
     """Synchronous keyword search via apidirect. Trips its own circuit on 402;
-    we just stop calling it for the rest of the run."""
+    we just stop calling it for the rest of the run.
+
+    RULE 15: filter the tier pools through the 14-day no-repeat ledger
+    before rotating, then mark each query used after we've called the
+    vendor (idempotent — same query in the same day/run is fine)."""
+    fresh_t1 = keyword_history.filter_unused(
+        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_1
+    )
+    fresh_t2 = keyword_history.filter_unused(
+        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_2
+    )
     plan: list[tuple[str, str]] = []
-    for kw in _rotate(tier_1, DISCOVERY_TIER_1_PER_RUN):
+    for kw in _rotate(fresh_t1, DISCOVERY_TIER_1_PER_RUN):
         plan.append((kw, "A"))
-    for kw in _rotate(tier_2, DISCOVERY_TIER_2_PER_RUN):
+    for kw in _rotate(fresh_t2, DISCOVERY_TIER_2_PER_RUN):
         plan.append((kw, "B"))
 
     inserted = 0
@@ -579,6 +602,9 @@ def _run_apidirect(
             log.warning("discovery: apidirect %r failed: %s", query, err)
             continue
 
+        keyword_history.mark_used(
+            db, operator_id=operator_id, source_channel="keyword_topical", query=query
+        )
         for post in posts:
             if not post.url or post.url in seen_urls:
                 continue
@@ -615,13 +641,24 @@ def _run_exa(
     """Exa LinkedIn-scoped semantic search. One API call per keyword, up to
     ~100 results per call (configurable via EXA_RESULTS_PER_QUERY, capped at 100).
     Uses a wider keyword plan than apidirect/unipile so each run pulls enough
-    raw posts to survive downstream gates. Trips the circuit on 401/402/429."""
+    raw posts to survive downstream gates. Trips the circuit on 401/402/429.
+
+    RULE 15 14-day no-repeat ledger filters all three tier pools."""
+    fresh_t1 = keyword_history.filter_unused(
+        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_1
+    )
+    fresh_t2 = keyword_history.filter_unused(
+        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_2
+    )
+    fresh_t3 = keyword_history.filter_unused(
+        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_3
+    )
     plan: list[tuple[str, str]] = []
-    for kw in _rotate(tier_1, EXA_DISCOVERY_TIER_1_PER_RUN):
+    for kw in _rotate(fresh_t1, EXA_DISCOVERY_TIER_1_PER_RUN):
         plan.append((kw, "A"))
-    for kw in _rotate(tier_2, EXA_DISCOVERY_TIER_2_PER_RUN):
+    for kw in _rotate(fresh_t2, EXA_DISCOVERY_TIER_2_PER_RUN):
         plan.append((kw, "B"))
-    for kw in _rotate(tier_3, EXA_DISCOVERY_TIER_3_PER_RUN):
+    for kw in _rotate(fresh_t3, EXA_DISCOVERY_TIER_3_PER_RUN):
         plan.append((kw, "B"))
 
     inserted = 0
@@ -637,6 +674,9 @@ def _run_exa(
             log.warning("discovery: exa %r failed: %s", query, err)
             continue
 
+        keyword_history.mark_used(
+            db, operator_id=operator_id, source_channel="keyword_topical", query=query
+        )
         for post in posts:
             if not post.url or post.url in seen_urls:
                 continue
@@ -671,12 +711,22 @@ def _run_unipile(
     seen_urls: set[str],
     seen_authors_shipped: set[str],
 ) -> int:
+    # RULE 15: filter through the 14-day no-repeat ledger before rotating.
+    fresh_t1 = keyword_history.filter_unused(
+        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_1
+    )
+    fresh_t2 = keyword_history.filter_unused(
+        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_2
+    )
+    fresh_t3 = keyword_history.filter_unused(
+        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_3
+    )
     plan: list[tuple[str, str, str, str]] = []
-    for kw in _rotate(tier_1, DISCOVERY_TIER_1_PER_RUN):
+    for kw in _rotate(fresh_t1, DISCOVERY_TIER_1_PER_RUN):
         plan.append(("kw", kw, "tier_1_kw", "A"))
-    for kw in _rotate(tier_2, DISCOVERY_TIER_2_PER_RUN):
+    for kw in _rotate(fresh_t2, DISCOVERY_TIER_2_PER_RUN):
         plan.append(("kw", kw, "tier_2_kw", "B"))
-    for kw in _rotate(tier_3, DISCOVERY_TIER_3_PER_RUN):
+    for kw in _rotate(fresh_t3, DISCOVERY_TIER_3_PER_RUN):
         plan.append(("kw", kw, "tier_3_kw", "B"))
     for seed in seeds:
         seed_source = (
@@ -716,6 +766,20 @@ def _run_unipile(
             log.warning("discovery: unipile %s failed for %r: %s", kind, payload, err)
             continue
 
+        # Mark keyword queries used (only the kw plan items; user/seed lookups
+        # don't go through the keyword ledger).
+        if kind == "kw" and source in ("tier_1_kw", "tier_2_kw", "tier_3_kw"):
+            keyword_history.mark_used(
+                db,
+                operator_id=operator_id,
+                source_channel="keyword_topical",
+                query=payload,
+            )
+        # Tag content-search hits with source_channel for downstream routing.
+        post_source_channel = (
+            "keyword_topical" if source in ("tier_1_kw", "tier_2_kw", "tier_3_kw") else ""
+        )
+
         for post in posts:
             if not post.url or post.url in seen_urls:
                 continue
@@ -734,6 +798,7 @@ def _run_unipile(
                     source=source,
                     source_keyword=payload if kind == "kw" else "",
                     source_classification=classification,
+                    source_channel=post_source_channel,
                 )
             )
             inserted += 1
