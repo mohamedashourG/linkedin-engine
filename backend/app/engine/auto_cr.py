@@ -110,7 +110,7 @@ Hi Bruce, really enjoyed your evidence-negotiations framing. Commented on your p
 4. Claim a sliver of relevance ("we have been mapping X at our product" / "the angle that has changed for us is Y" / "we see this exact pattern with Z").
 5. End with soft connect ask: "would love to stay in touch", "would love to connect", "would be great to swap notes". NEVER "let's hop on a call".
 6. Sign with first name only ({sender_first}).
-7. NO em-dashes, NO en-dashes, NO ellipses ("..." or "…"), NO buzzwords.
+7. NO dashes anywhere (RULE 5): em-dash (—), en-dash (–), or double-hyphen (--). NO ellipses ("..." or "…"). NO buzzwords.
 8. Output the CR note text only in the `note` field.
 """
 

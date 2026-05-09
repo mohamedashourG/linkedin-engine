@@ -23,9 +23,10 @@ from app.config import settings
 from app.engine.constants import (
     COFOUNDER_TARGET_FLOOR_RATIO,
     COMMENT_MIN_CHARS,
-    EM_DASH,
+    DASH_TOKENS,
     RULE_23_FORCE_ABORT_REASONS,
 )
+from app.engine.stages.validator import has_any_dash
 from app.models.common import utcnow
 
 log = logging.getLogger(__name__)
@@ -92,17 +93,27 @@ def seal_slate(
             )
     validations.append({"layer": "cofounder_floor", "pass": True})
 
-    # Layer 3 — comment_text invariants
+    # Layer 3 — comment_text invariants (RULE 5 + min length).
     for c in drafted:
         text = c.get("comment_text") or ""
-        if len(text) < COMMENT_MIN_CHARS or EM_DASH in text:
+        if len(text) < COMMENT_MIN_CHARS:
             _abort(
                 db,
                 slate_run_id,
                 validations,
                 reason="comment_invalid",
                 layer="comment_invariants",
-                details={"candidate_id": str(c["_id"])},
+                details={"candidate_id": str(c["_id"]), "issue": "below_min_chars", "chars": len(text)},
+            )
+        has_dash, dash = has_any_dash(text)
+        if has_dash:
+            _abort(
+                db,
+                slate_run_id,
+                validations,
+                reason="comment_invalid",
+                layer="comment_invariants",
+                details={"candidate_id": str(c["_id"]), "issue": "dash", "token": dash},
             )
     validations.append({"layer": "comment_invariants", "pass": True})
 

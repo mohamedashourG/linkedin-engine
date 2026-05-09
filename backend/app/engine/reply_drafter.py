@@ -117,7 +117,7 @@ If a 20 minute call works, here's my calendar: {cofounder_calendly_url}
 # RULES
 
 1. Match the {reply_context} template structurally.
-2. No em-dashes in public reply-backs (em-dashes tolerated in DMs but avoid).
+2. No dashes anywhere (RULE 5): em-dash (—), en-dash (–), and double-hyphen (--) are all banned in public replies AND DMs.
 3. No "..." ellipses anywhere.
 4. Calendly URL goes on its own line in DMs, never inline mid-sentence.
 5. Sign DMs with first name only ("{cofounder_first_name}").

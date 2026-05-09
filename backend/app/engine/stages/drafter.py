@@ -110,7 +110,7 @@ MSL strategy lives or dies on whether the scientific insight ever changes a bran
 3. **Specificity required.** At least one sentence must contain a specific number, percentage, dollar figure, named cohort size, named role count, or named pattern. Generic statements fail.
 4. **Type-specific close.** The final sentence must follow the close pattern for Type {comment_type}:
 {type_close_pattern_for_this_comment}
-5. **No banned characters.** Never use em-dashes, en-dashes, or ellipses. Use commas, periods, or "and" instead.
+5. **No dashes (RULE 5).** Never use em-dashes (—), en-dashes (–), or double-hyphens (--). Never use ellipses ("..." or "…"). Use commas, periods, or "and" instead.
 6. **No buzzwords.** Never use "leverage", "synergy", "value-add", "best-in-class", "game-changer", "north star", "unlock value", "10x", "world-class", "rockstar".
 7. **First name only in DMs/CR notes.** Comments need no signature.
 8. **Sound like {cofounder_name}, not LinkedIn.** Match the cadence of the voice examples above.

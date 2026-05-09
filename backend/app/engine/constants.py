@@ -62,7 +62,16 @@ COMMENT_TYPE_DESCRIPTIONS = {
 # Validator constants.
 COMMENT_MIN_CHARS = 60
 COMMENT_MAX_CHARS = 1200
-EM_DASH = "—"
+
+# RULE 5 — dash family banned everywhere (comments, DMs, CR notes, anywhere
+# the engine emits text). Keep this list as the SINGLE source of truth so
+# validator.has_any_dash() and rule_23 stay in lockstep.
+DASH_TOKENS = (
+    "—",   # em-dash
+    "–",   # en-dash
+    "--",  # double hyphen (em-dash stand-in)
+)
+EM_DASH = DASH_TOKENS[0]  # back-compat alias for any external readers
 
 # RULE 23 force-abort allowlist (4 reasons exactly per spec).
 RULE_23_FORCE_ABORT_REASONS = (
@@ -106,11 +115,13 @@ BANNED_OPENERS = [
 ]
 
 # Banned characters / sequences — validator rejects on any match.
+# Dash family pulled from DASH_TOKENS (RULE 5) so there's only one list to keep
+# in sync. Ellipses stay because they signal trailing thought, which doesn't
+# fit the locked voice (separate from RULE 5).
 BANNED_TOKENS = [
-    "—",       # em-dash (Alex's voice rule)
-    "–",       # en-dash (same reason)
+    *DASH_TOKENS,
     "…",       # horizontal ellipsis character
-    "...",     # three-dot ellipsis (signals trailing thought, not used in winning comments)
+    "...",     # three-dot ellipsis
 ]
 
 # Buzzwords — validator rejects on any match (case-insensitive substring).

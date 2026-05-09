@@ -12,6 +12,7 @@ from app.engine.constants import (
     BANNED_TOKENS,
     COMMENT_MAX_CHARS,
     COMMENT_MIN_CHARS,
+    DASH_TOKENS,
     DM_HOT_BANNED_LETS,
     DM_HOT_REQUIRED_LOWERCASE_LETS,
     DM_STAGE_6_REQUIRED_PHRASES,
@@ -29,8 +30,9 @@ _DM_MAX_CHARS = 1500
 _REPLY_BACK_SENTENCE_RANGE = (2, 5)
 _SENTENCE_SPLIT = re.compile(r"[.!?]+(?=\s|$)")
 _COMPILED_SPECIFICITY = [re.compile(p) for p in REQUIRED_SPECIFICITY_PATTERNS]
-# Ellipsis only banned in DMs (em-dashes are tolerated per spec).
-_DM_BANNED_TOKENS = ("…", "...")
+# RULE 5: dashes banned everywhere. DMs used to tolerate em-dashes; that
+# exemption is gone. Ellipses are also banned in DMs (separate banlist).
+_DM_BANNED_TOKENS = (*DASH_TOKENS, "…", "...")
 _CALENDLY_RE = re.compile(r"https?://(?:www\.)?calendly\.com/[\w\-/.?=&]+", re.I)
 
 
@@ -53,6 +55,19 @@ def has_banned_opener(text: str) -> tuple[bool, str | None]:
     for banned in BANNED_OPENERS:
         if head.startswith(banned.lower()):
             return True, banned
+    return False, None
+
+
+def has_any_dash(text: str) -> tuple[bool, str | None]:
+    """RULE 5 single-source predicate. Em (—), en (–), double-hyphen (--).
+
+    The double-hyphen check intentionally matches anywhere — including
+    inside URLs and slugs, since these are LinkedIn comments / DMs / CR
+    notes, not code. If a generated message contains `--` it's almost
+    always the LLM substituting for a dash."""
+    for token in DASH_TOKENS:
+        if token in text:
+            return True, token
     return False, None
 
 
@@ -80,7 +95,8 @@ def has_calendly_url(text: str) -> bool:
 
 
 def has_dm_banned_token(text: str) -> tuple[bool, str | None]:
-    """DMs allow em-dashes but not ellipsis."""
+    """RULE 5: dashes banned in DMs (changed from prior em-dash exemption).
+    Plus ellipses, same as comments."""
     for token in _DM_BANNED_TOKENS:
         if token in text:
             return True, token
