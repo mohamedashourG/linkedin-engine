@@ -66,7 +66,19 @@ class Settings(BaseSettings):
     # Contact-seed Unipile direct path: posts pulled per contact via
     # `unipile.get_user_posts`. These are written with status="gate_passed"
     # and bypass the entire verification + 4-gate funnel.
-    discovery_contact_unipile_posts_per_user: int = 5
+    discovery_contact_unipile_posts_per_user: int = 20
+    # Drop posts older than this from contact-direct fetches. The bypass
+    # path skips verification's recency gate, so this enforces freshness
+    # locally. 90d ≈ 3 months. Set 0 to disable. Posts with no parseable
+    # date are KEPT (not penalized for missing data).
+    discovery_contact_unipile_max_age_days: int = 90
+    # When True, each contact-direct post is run through the post_quality
+    # gate (cheap LLM, ~$0.0005/call) to drop recruiting ads, event
+    # announcements, vague platitudes, and other low-signal content even
+    # though the rest of the gate funnel is bypassed. The synthetic
+    # `gate_results.post_quality` then carries the real verdict instead of
+    # the synthetic "operator_curated_contact" placeholder.
+    discovery_contact_unipile_run_post_quality: bool = True
     # When product_extracted.target_geographies (or ICP geography tiers) is
     # non-empty, drop verified candidates whose post + author text does not
     # mention any geography term (substring match, case-insensitive).

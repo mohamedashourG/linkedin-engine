@@ -33,6 +33,7 @@ from pymongo.database import Database
 
 from app.config import settings
 from app.engine import keyword_history
+from app.engine.stages.gates import post_quality
 from app.engine.constants import (
     DISCOVERY_TIER_1_PER_RUN,
     DISCOVERY_TIER_2_PER_RUN,
@@ -1294,7 +1295,19 @@ def _run_contact_seeds_unipile(
         return 0
 
     inserted = 0
+    too_old_dropped = 0
+    quality_dropped = 0
     posts_per_contact = max(1, int(settings.discovery_contact_unipile_posts_per_user))
+
+    # Recency cutoff for the bypass path. Verification's max_age filter is
+    # skipped here, so enforce freshness locally. 0 disables.
+    max_age_days = int(settings.discovery_contact_unipile_max_age_days or 0)
+    cutoff = utcnow() - timedelta(days=max_age_days) if max_age_days > 0 else None
+
+    # Whether to run the post_quality LLM gate inline. Drops engagement-bait,
+    # event announcements, recruiting ads, vague platitudes — content that
+    # would survive ICP scoring but produce a weak comment.
+    run_quality_gate = bool(settings.discovery_contact_unipile_run_post_quality)
 
     for seed in seeds:
         linkedin_url = (seed.get("linkedin_url") or "").strip()
@@ -1332,6 +1345,42 @@ def _run_contact_seeds_unipile(
             if not post.url:
                 continue
 
+            # Recency: drop posts older than the cutoff. Posts with no
+            # parseable date are KEPT (Unipile occasionally omits dates;
+            # don't penalize missing data).
+            if cutoff is not None and post.published_at is not None:
+                published = post.published_at
+                if hasattr(published, "tzinfo") and published.tzinfo is None:
+                    from datetime import timezone as _tz
+                    published = published.replace(tzinfo=_tz.utc)
+                if published < cutoff:
+                    too_old_dropped += 1
+                    continue
+
+            # Post-quality gate (cheap LLM): drops recruiting ads, event
+            # announcements, vague platitudes, engagement bait. Skips when
+            # post text is empty (LLM has nothing to score). Captures the
+            # real `qualifying_signal` so it lands in gate_results below.
+            quality_verdict = None
+            if run_quality_gate and (post.text or "").strip():
+                try:
+                    quality_verdict = post_quality.evaluate(post_text=post.text or "")
+                except Exception as err:
+                    log.warning(
+                        "discovery: contact_seeds_unipile post_quality failed for %r: %s — keeping post",
+                        post.url,
+                        err,
+                    )
+                    quality_verdict = None
+                if quality_verdict and quality_verdict.drop:
+                    quality_dropped += 1
+                    log.info(
+                        "discovery: contact_seeds_unipile drop %r — post_quality: %s",
+                        post.url,
+                        quality_verdict.reason,
+                    )
+                    continue
+
             doc = _candidate_doc(
                 operator_id=operator_id,
                 cofounder_id=cofounder_id,
@@ -1352,32 +1401,46 @@ def _run_contact_seeds_unipile(
                 source_classification="A",
                 source_channel="contact_direct",
             )
-            # Skip the entire funnel: verification + cheap_gates +
-            # profile_resolve + expensive_gates. The allocator reads
+            # Skip the rest of the funnel: verification + non_buyer +
+            # profile_resolve + analyst + ICP scoring. The allocator reads
             # status="gate_passed" so we land right on its doorstep.
             doc["status"] = "gate_passed"
             doc["bypass_gates"] = True
+            # Carry the REAL post_quality verdict if we ran it; fall back to
+            # the synthetic placeholder when the gate was off / errored.
+            if quality_verdict is not None:
+                pq_payload = {
+                    **quality_verdict.model_dump(),
+                    "synthetic": False,
+                }
+            else:
+                pq_payload = {
+                    "drop": False,
+                    "reason": "operator_curated_contact",
+                    "qualifying_signal": "operator_curated_contact",
+                    "synthetic": True,
+                }
             doc["gate_results"] = {
                 # Synthetic top-tier ICP score so the allocator's
                 # score-desc sort floats contacts above any keyword
                 # survivors competing for the same cofounder bucket.
                 "icp": {"score_0_10": 10, "total": 100, "synthetic": True},
                 "non_buyer": {"verdict": "buyer", "synthetic": True},
-                "post_quality": {
-                    "verdict": "pass",
-                    "qualifying_signal": "operator_curated_contact",
-                    "synthetic": True,
-                },
+                "post_quality": pq_payload,
                 "analyst": {"verdict": "not_analyst", "synthetic": True},
             }
             db.candidates.insert_one(doc)
             inserted += 1
 
     log.info(
-        "discovery: contact_seeds_unipile cofounder=%s contacts=%d inserted=%d (gates bypassed)",
+        "discovery: contact_seeds_unipile cofounder=%s contacts=%d inserted=%d too_old_dropped=%d quality_dropped=%d (most gates bypassed, post_quality=%s, max_age=%dd)",
         cofounder_id,
         len(seeds),
         inserted,
+        too_old_dropped,
+        quality_dropped,
+        "on" if run_quality_gate else "off",
+        max_age_days,
     )
     return inserted
 
