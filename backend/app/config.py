@@ -69,6 +69,16 @@ class Settings(BaseSettings):
     # can be flipped per-tenant via env (DISCOVERY_USE_TITLE_SEARCH=false) if
     # account safety becomes a concern.
     discovery_use_title_search: bool = True
+    # When Crustdata is on and the inbox drain inserts 0 rows, POST the
+    # simulation watch once so api.crustdata.com responds and (per their API)
+    # can immediately POST a sample payload to the cofounder webhook.
+    discovery_crustdata_simulation_ping_on_empty_inbox: bool = True
+    # Crustdata screener: synchronous POST /screener/linkedin_posts/keyword_search/
+    # (posts in the HTTP response). Runs when discovery_use_crustdata is true.
+    discovery_use_crustdata_screener: bool = True
+    discovery_crustdata_screener_max_keyword_calls: int = 5
+    discovery_crustdata_screener_limit_per_keyword: int = 8
+    discovery_crustdata_screener_date_posted: str = "past-month"
     # Unipile keyword post search filters (POST /linkedin/search, classic).
     # All server-side; trim noise BEFORE we burn LLM gate cost on it.
     #   sort_by       "relevance" | "date" (newest first)
@@ -164,6 +174,12 @@ class Settings(BaseSettings):
     crustdata_webhook_secret: str = "change-me-crustdata-hmac"
     crustdata_default_expiration_days: int = 365
     crustdata_inbox_lookback_hours: int = 48
+    # Watcher registration: Crustdata rejects long OR-chains (boolean op cap) and
+    # free-form ICP industry labels; see app.routes.crustdata._spec_from_operator.
+    crustdata_watch_max_boolean_operators: int = 5
+    crustdata_watch_default_headcount_buckets: list[str] = Field(
+        default_factory=lambda: ["201-500", "501-1,000", "1,001-5,000"]
+    )
     # Log full Crustdata webhook JSON at INFO (large). Auto-enabled when APP_ENV=dev;
     # set true in prod only while debugging; false suppresses even in dev.
     crustdata_log_full_webhook_payload: bool = False

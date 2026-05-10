@@ -5,8 +5,16 @@ Crustdata's Watcher API is webhook-driven: you register a watch describing the
 filter universe (keyword expression + author title + author company + author
 location + industry + post intent + headcount + lead filters) and Crustdata
 POSTs matching posts to a notification_endpoint as they happen ("at least 1
-hour" cadence per their docs; the simulation endpoint fires the same payload
-instantly so we can integration-test).
+hour" cadence per their docs).
+
+**Simulation watches** (`POST /watcher/simulation/watches`) use the same core
+fields as production (`event_type_slug`, `event_filters`, `account_filters`,
+`lead_filters`, `notification_endpoint`, `frequency`, `expiration_date`,
+`max_notifications_per_execution`) and deliver an example notification to the
+endpoint immediately. Per Crustdata, `max_notifications_per_execution` must be a
+positive multiple of 50. Production watches may additionally send
+`approximate_notification_time`; simulation requests omit it to match their API
+examples.
 
 Event mapping → engine ICP rubric:
     KEYWORD          ← cofounder.tier_1 + tier_2 keywords (boolean expression)
@@ -32,17 +40,37 @@ import hashlib
 import json
 import hmac
 import logging
+import re
 import threading
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
-from urllib.parse import urlencode, urljoin
+from urllib.parse import parse_qs, urlencode, urlparse, urljoin
 
 import httpx
 
 from app.config import settings
 
 log = logging.getLogger(__name__)
+
+# Redact HMAC token in webhook URLs before logging.
+_TOKEN_IN_URL_RE = re.compile(r"([?&])token=[^&]*", re.IGNORECASE)
+
+
+def redact_notification_url(url: str | None) -> str:
+    if not url:
+        return ""
+    return _TOKEN_IN_URL_RE.sub(r"\1token=***", str(url))
+
+
+def _redact_payload_for_log(payload: dict[str, Any]) -> dict[str, Any]:
+    """Shallow copy for logging — masks ``notification_endpoint`` token."""
+    out = dict(payload)
+    ne = out.get("notification_endpoint")
+    if isinstance(ne, str):
+        out["notification_endpoint"] = redact_notification_url(ne)
+    return out
+
 
 _BASE_URL = "https://api.crustdata.com"
 _TIMEOUT = 60.0
@@ -221,6 +249,10 @@ def webhook_url_for(cofounder_id: str) -> str:
 def _check_circuit() -> None:
     with _circuit_lock:
         if _circuit_open:
+            log.warning(
+                "crustdata: watcher API call blocked — circuit open "
+                "(prior 401/402/429); restart worker after fixing credentials."
+            )
             raise CrustdataQuotaExhausted(
                 "Crustdata circuit is open (prior 401/402/429). Restart worker "
                 "after fixing credentials/credit."
@@ -230,6 +262,8 @@ def _check_circuit() -> None:
 def _trip_circuit() -> None:
     global _circuit_open
     with _circuit_lock:
+        if not _circuit_open:
+            log.warning("crustdata: watcher circuit tripped — further watcher calls blocked until worker restart")
         _circuit_open = True
 
 
@@ -240,10 +274,22 @@ def _client() -> httpx.Client:
         base_url=_BASE_URL,
         headers={
             "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
             "Authorization": f"Token {settings.crustdata_api_key}",
         },
         timeout=_TIMEOUT,
     )
+
+
+def _validate_max_notifications_per_execution(n: int) -> int:
+    """Crustdata simulation API: must be > 0 and a multiple of 50."""
+    if n <= 0 or n % 50 != 0:
+        raise CrustdataError(
+            "max_notifications_per_execution must be > 0 and a multiple of 50 "
+            f"(Crustdata /watcher/simulation/watches); got {n}"
+        )
+    return n
 
 
 def _post(
@@ -256,10 +302,15 @@ def _post(
     logs full request JSON and full response body to Docker/backend logs."""
     if log_label:
         log.info(
-            "%s.request path=%s body=%s",
+            "%s.request method=POST base=%s path=%s body=%s",
             log_label,
+            _BASE_URL,
             path,
-            json.dumps(payload, ensure_ascii=False, default=str),
+            json.dumps(
+                _redact_payload_for_log(payload),
+                ensure_ascii=False,
+                default=str,
+            ),
         )
     _check_circuit()
     with _client() as client:
@@ -270,19 +321,33 @@ def _post(
                 log.warning("%s.transport_error err=%s", log_label, err)
             raise CrustdataError(f"crustdata transport error: {err}") from err
     if log_label:
+        preview = resp.text
+        if len(preview) > 4000:
+            preview = preview[:4000] + "…[truncated]"
         log.info(
             "%s.http_response status=%s body=%s",
             log_label,
             resp.status_code,
-            resp.text,
+            preview,
         )
     if resp.status_code in (401, 402):
         _trip_circuit()
+        log.warning(
+            "crustdata._post path=%s status=%s (circuit open) body_prefix=%r",
+            path,
+            resp.status_code,
+            resp.text[:300],
+        )
         raise CrustdataQuotaExhausted(
             f"crustdata {resp.status_code}: {resp.text[:300]}"
         )
     if resp.status_code == 429:
         _trip_circuit()
+        log.warning(
+            "crustdata._post path=%s 429 body_prefix=%r",
+            path,
+            resp.text[:300],
+        )
         raise CrustdataError(f"crustdata 429 rate-limited: {resp.text[:300]}")
     if resp.status_code >= 400:
         raise CrustdataError(f"crustdata {resp.status_code}: {resp.text[:300]}")
@@ -292,6 +357,42 @@ def _post(
         return resp.json()
     except ValueError:
         return {"raw": resp.text}
+
+
+def register_simulation_watch(
+    *,
+    event_type_slug: str,
+    event_filters: list[dict[str, Any]],
+    account_filters: list[dict[str, Any]] | None = None,
+    lead_filters: list[dict[str, Any]] | None = None,
+    notification_endpoint: str,
+    frequency: int = 1,
+    expiration_date: date | None = None,
+    max_notifications_per_execution: int = 50,
+    log_label: str | None = "crustdata.simulation_watch",
+) -> dict[str, Any]:
+    """POST `/watcher/simulation/watches` — instant sample notification to the URL.
+
+    Use for integration tests or any event slug (e.g.
+    ``job-posting-with-keyword-and-location``). Payload matches Crustdata's
+    documented shape; omits ``approximate_notification_time`` (production-only).
+    """
+    if expiration_date is None:
+        expiration_date = date.today() + timedelta(
+            days=settings.crustdata_default_expiration_days
+        )
+    max_n = _validate_max_notifications_per_execution(max_notifications_per_execution)
+    payload: dict[str, Any] = {
+        "event_type_slug": event_type_slug,
+        "event_filters": event_filters,
+        "account_filters": list(account_filters or []),
+        "lead_filters": list(lead_filters or []),
+        "notification_endpoint": notification_endpoint,
+        "frequency": frequency,
+        "expiration_date": expiration_date.isoformat(),
+        "max_notifications_per_execution": max_n,
+    }
+    return _post(_SIMULATION_PATH, payload, log_label=log_label)
 
 
 def register_keyword_watch(
@@ -307,16 +408,37 @@ def register_keyword_watch(
 ) -> dict[str, Any]:
     """Create a Crustdata watch on the keyword-post event.
 
-    Returns the raw Crustdata response. The simulation flag swaps to
-    `/watcher/simulation/watches` which fires the notification immediately —
-    use it to integration-test the webhook receiver without waiting an hour
-    for a real watch to fire.
+    Returns the raw Crustdata response. ``simulation=True`` uses
+    `/watcher/simulation/watches` (instant sample POST to ``notification_endpoint``)
+    with the documented simulation payload. Production uses `/watcher/watches`
+    and includes ``approximate_notification_time``.
     """
     if notification_endpoint is None:
         notification_endpoint = webhook_url_for(cofounder_id)
     if expiration_date is None:
         expiration_date = date.today() + timedelta(
             days=settings.crustdata_default_expiration_days
+        )
+
+    log.info(
+        "crustdata.register: cofounder=%s simulation=%s path=%s notification_endpoint=%s",
+        cofounder_id,
+        simulation,
+        _SIMULATION_PATH if simulation else _PRODUCTION_PATH,
+        redact_notification_url(notification_endpoint),
+    )
+
+    if simulation:
+        return register_simulation_watch(
+            event_type_slug=_KEYWORD_EVENT_SLUG,
+            event_filters=spec.to_event_filters(),
+            account_filters=spec.to_account_filters(),
+            lead_filters=spec.to_lead_filters(),
+            notification_endpoint=notification_endpoint,
+            frequency=frequency,
+            expiration_date=expiration_date,
+            max_notifications_per_execution=max_notifications_per_execution,
+            log_label=f"crustdata.watch[{cofounder_id}]",
         )
 
     payload: dict[str, Any] = {
@@ -330,15 +452,8 @@ def register_keyword_watch(
         "approximate_notification_time": approximate_notification_time,
         "max_notifications_per_execution": max_notifications_per_execution,
     }
-    path = _SIMULATION_PATH if simulation else _PRODUCTION_PATH
-    log.info(
-        "crustdata.register: cofounder=%s simulation=%s path=%s",
-        cofounder_id,
-        simulation,
-        path,
-    )
     return _post(
-        path,
+        _PRODUCTION_PATH,
         payload,
         log_label=f"crustdata.watch[{cofounder_id}]",
     )
@@ -346,13 +461,24 @@ def register_keyword_watch(
 
 def list_watches() -> list[dict[str, Any]]:
     _check_circuit()
+    log.info(
+        "crustdata.list_watches.request method=GET base=%s path=%s",
+        _BASE_URL,
+        _PRODUCTION_PATH,
+    )
     with _client() as client:
         try:
             resp = client.get(_PRODUCTION_PATH)
         except httpx.RequestError as err:
+            log.warning("crustdata.list_watches.transport_error err=%s", err)
             raise CrustdataError(f"crustdata transport error: {err}") from err
     if resp.status_code in (401, 402):
         _trip_circuit()
+        log.warning(
+            "crustdata.list_watches.response status=%s body_prefix=%r",
+            resp.status_code,
+            resp.text[:400],
+        )
         raise CrustdataQuotaExhausted(
             f"crustdata {resp.status_code}: {resp.text[:300]}"
         )
@@ -360,31 +486,175 @@ def list_watches() -> list[dict[str, Any]]:
     # no watches exist for this account. Treat that as "no watches" rather
     # than as an error.
     if resp.status_code == 404:
+        log.info(
+            "crustdata.list_watches.response status=404 (treating as empty list)"
+        )
         return []
     if resp.status_code >= 400:
+        log.warning(
+            "crustdata.list_watches.response status=%s body_prefix=%r",
+            resp.status_code,
+            resp.text[:500],
+        )
         raise CrustdataError(f"crustdata {resp.status_code}: {resp.text[:300]}")
     body = resp.json() if resp.content else []
     if isinstance(body, dict):
-        return body.get("watches") or body.get("results") or []
-    return body or []
+        watches = body.get("watches") or body.get("results") or []
+    else:
+        watches = body or []
+    log.info(
+        "crustdata.list_watches.response status=%s watch_count=%d",
+        resp.status_code,
+        len(watches),
+    )
+    return watches
+
+
+def _first_query_value(qs: dict[str, list[str]], key: str) -> str | None:
+    vals = qs.get(key)
+    if not vals:
+        return None
+    v = vals[0]
+    return v if v is not None else None
+
+
+def notification_endpoint_matches_cofounder(
+    endpoint: str | None, cofounder_id: str
+) -> bool:
+    """True when URL query ``cofounder_id`` and ``token`` match ``webhook_url_for``."""
+    if not endpoint or not str(endpoint).strip():
+        return False
+    try:
+        expected_url = webhook_url_for(cofounder_id)
+    except CrustdataNotConfigured:
+        return False
+    ep_q = parse_qs(urlparse(str(endpoint).strip()).query, keep_blank_values=True)
+    ex_q = parse_qs(urlparse(expected_url).query, keep_blank_values=True)
+    if _first_query_value(ep_q, "cofounder_id") != cofounder_id:
+        return False
+    return _first_query_value(ep_q, "token") == _first_query_value(ex_q, "token")
+
+
+def _watch_notification_endpoint(watch: dict[str, Any]) -> str | None:
+    ep = watch.get("notification_endpoint")
+    if isinstance(ep, str) and ep.strip():
+        return ep.strip()
+    n = watch.get("notification")
+    if isinstance(n, dict):
+        inner = n.get("endpoint") or n.get("url")
+        if isinstance(inner, str) and inner.strip():
+            return inner.strip()
+    return None
+
+
+def _extract_watch_id(watch: dict[str, Any]) -> str | None:
+    for key in ("id", "watch_id", "uuid"):
+        v = watch.get(key)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+def _keyword_expression_from_watch(watch: dict[str, Any]) -> str | None:
+    kwe = watch.get("keyword_expression")
+    if isinstance(kwe, str) and kwe.strip():
+        return kwe.strip()
+    ev = watch.get("event_filters")
+    if isinstance(ev, list):
+        for f in ev:
+            if not isinstance(f, dict):
+                continue
+            if f.get("filter_type") == "KEYWORD":
+                val = f.get("value")
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+    return None
+
+
+def find_reconciled_production_watch(cofounder_id: str) -> dict[str, Any] | None:
+    """Remote production watch whose notification URL matches ``webhook_url_for``.
+
+    Returns ``{"watch_id": str, "keyword_expression": str | None}``, or None.
+    """
+    log.info(
+        "crustdata.reconcile.start cofounder=%s (GET list_watches then match endpoint)",
+        cofounder_id,
+    )
+    remote = list_watches()
+    log.info(
+        "crustdata.reconcile.list_result cofounder=%s remote_watch_count=%d",
+        cofounder_id,
+        len(remote),
+    )
+    matches: list[dict[str, Any]] = []
+    for w in remote:
+        ep = _watch_notification_endpoint(w)
+        if not notification_endpoint_matches_cofounder(ep, cofounder_id):
+            continue
+        wid = _extract_watch_id(w)
+        if wid:
+            kwx = _keyword_expression_from_watch(w)
+            matches.append({"watch_id": wid, "keyword_expression": kwx})
+    if not matches:
+        log.info(
+            "crustdata.reconcile.done cofounder=%s matched=no (will POST new watch if caller registers)",
+            cofounder_id,
+        )
+        return None
+    if len(matches) > 1:
+        log.warning(
+            "crustdata reconcile: cofounder=%s matched %d watches, using watch_id=%s",
+            cofounder_id,
+            len(matches),
+            matches[0]["watch_id"],
+        )
+    log.info(
+        "crustdata.reconcile.done cofounder=%s matched=yes watch_id=%s",
+        cofounder_id,
+        matches[0]["watch_id"],
+    )
+    return matches[0]
 
 
 def delete_watch(watch_id: str | int) -> bool:
+    path = f"{_PRODUCTION_PATH}/{watch_id}"
+    log.info(
+        "crustdata.delete_watch.request method=DELETE base=%s path=%s",
+        _BASE_URL,
+        path,
+    )
     _check_circuit()
     with _client() as client:
         try:
-            resp = client.delete(f"{_PRODUCTION_PATH}/{watch_id}")
+            resp = client.delete(path)
         except httpx.RequestError as err:
+            log.warning("crustdata.delete_watch.transport_error err=%s", err)
             raise CrustdataError(f"crustdata transport error: {err}") from err
     if resp.status_code in (401, 402):
         _trip_circuit()
+        log.warning(
+            "crustdata.delete_watch.response watch_id=%s status=%s",
+            watch_id,
+            resp.status_code,
+        )
         raise CrustdataQuotaExhausted(
             f"crustdata {resp.status_code}: {resp.text[:300]}"
         )
     if resp.status_code == 404:
+        log.info(
+            "crustdata.delete_watch.response watch_id=%s status=404 (already gone)",
+            watch_id,
+        )
         return False
     if resp.status_code >= 400:
+        log.warning(
+            "crustdata.delete_watch.response watch_id=%s status=%s body_prefix=%r",
+            watch_id,
+            resp.status_code,
+            resp.text[:300],
+        )
         raise CrustdataError(f"crustdata {resp.status_code}: {resp.text[:300]}")
+    log.info("crustdata.delete_watch.response watch_id=%s status=%s ok", watch_id, resp.status_code)
     return True
 
 
@@ -405,6 +675,14 @@ def _screener_headers() -> dict[str, str]:
 
 def _screener_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     _check_circuit()
+    kw = (payload.get("keyword") or "")[:80]
+    log.info(
+        "crustdata.screener.request method=POST base=%s path=%s keyword_prefix=%r limit=%s",
+        _BASE_URL,
+        path,
+        kw,
+        payload.get("limit"),
+    )
     with httpx.Client(
         base_url=_BASE_URL,
         headers=_screener_headers(),
@@ -413,30 +691,65 @@ def _screener_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
             resp = client.post(path, json=payload)
         except httpx.RequestError as err:
+            log.warning("crustdata.screener.transport_error path=%s err=%s", path, err)
             raise CrustdataError(f"crustdata screener transport error: {err}") from err
     if resp.status_code in (401, 402):
         _trip_circuit()
+        log.warning(
+            "crustdata.screener.response POST path=%s status=%s (quota/auth)",
+            path,
+            resp.status_code,
+        )
         raise CrustdataQuotaExhausted(
             f"crustdata screener {resp.status_code}: {resp.text[:300]}"
         )
     if resp.status_code == 429:
         _trip_circuit()
+        log.warning("crustdata.screener.response POST path=%s status=429", path)
         raise CrustdataError(f"crustdata screener 429: {resp.text[:300]}")
     if resp.status_code == 404:
+        log.info("crustdata.screener.response POST path=%s status=404 empty", path)
         return {}
     if resp.status_code >= 400:
+        log.warning(
+            "crustdata.screener.response path=%s status=%s body_prefix=%r",
+            path,
+            resp.status_code,
+            resp.text[:400],
+        )
         raise CrustdataError(f"crustdata screener {resp.status_code}: {resp.text[:400]}")
     if not resp.content:
+        log.info("crustdata.screener.response path=%s status=%s empty_body", path, resp.status_code)
         return {}
     try:
         body = resp.json()
     except ValueError:
+        log.warning("crustdata.screener.response path=%s non_json", path)
         return {}
-    return body if isinstance(body, dict) else {}
+    # Crustdata sometimes returns a top-level JSON array of posts (not wrapped).
+    if isinstance(body, list):
+        body = {"posts": body}
+    if not isinstance(body, dict):
+        return {}
+    n_posts = len(_screener_extract_posts(body))
+    log.info(
+        "crustdata.screener.response path=%s status=%s posts_extracted=%d",
+        path,
+        resp.status_code,
+        n_posts,
+    )
+    return body
 
 
 def _screener_get(path: str, params: dict[str, Any]) -> dict[str, Any]:
     _check_circuit()
+    url_hint = (params.get("person_linkedin_url") or "")[:100]
+    log.info(
+        "crustdata.screener.request method=GET base=%s path=%s person_url_prefix=%r",
+        _BASE_URL,
+        path,
+        url_hint,
+    )
     with httpx.Client(
         base_url=_BASE_URL,
         headers=_screener_headers(),
@@ -445,26 +758,53 @@ def _screener_get(path: str, params: dict[str, Any]) -> dict[str, Any]:
         try:
             resp = client.get(path, params=params)
         except httpx.RequestError as err:
+            log.warning("crustdata.screener.transport_error path=%s err=%s", path, err)
             raise CrustdataError(f"crustdata screener transport error: {err}") from err
     if resp.status_code in (401, 402):
         _trip_circuit()
+        log.warning(
+            "crustdata.screener.response GET path=%s status=%s (quota/auth)",
+            path,
+            resp.status_code,
+        )
         raise CrustdataQuotaExhausted(
             f"crustdata screener {resp.status_code}: {resp.text[:300]}"
         )
     if resp.status_code == 429:
         _trip_circuit()
+        log.warning("crustdata.screener.response GET path=%s status=429", path)
         raise CrustdataError(f"crustdata screener 429: {resp.text[:300]}")
     if resp.status_code == 404:
+        log.info("crustdata.screener.response GET path=%s status=404 empty", path)
         return {}
     if resp.status_code >= 400:
+        log.warning(
+            "crustdata.screener.response path=%s status=%s body_prefix=%r",
+            path,
+            resp.status_code,
+            resp.text[:400],
+        )
         raise CrustdataError(f"crustdata screener {resp.status_code}: {resp.text[:400]}")
     if not resp.content:
+        log.info("crustdata.screener.response path=%s status=%s empty_body", path, resp.status_code)
         return {}
     try:
         body = resp.json()
     except ValueError:
+        log.warning("crustdata.screener.response path=%s non_json", path)
         return {}
-    return body if isinstance(body, dict) else {}
+    if isinstance(body, list):
+        body = {"posts": body}
+    if not isinstance(body, dict):
+        return {}
+    n_posts = len(_screener_extract_posts(body))
+    log.info(
+        "crustdata.screener.response path=%s status=%s posts_extracted=%d",
+        path,
+        resp.status_code,
+        n_posts,
+    )
+    return body
 
 
 def _screener_extract_posts(payload: Any) -> list[dict[str, Any]]:
@@ -594,17 +934,34 @@ def screener_posts_for_members(
 
 
 def build_keyword_expression(
-    tier_1: list[str], tier_2: list[str] | None = None
+    tier_1: list[str],
+    tier_2: list[str] | None = None,
+    *,
+    max_boolean_operators: int | None = None,
 ) -> str:
     """Compose Crustdata's boolean keyword grammar from operator keyword tiers.
 
     Crustdata supports AND/OR/NOT (uppercase), parentheses, and quoted phrases.
     We OR all tier_1 + tier_2 keywords; phrases with spaces are quoted.
     Multi-word phrases are quoted; everything else passed bare.
+
+    ``max_boolean_operators`` caps how many boolean operators appear in the
+    expression. For an OR-only chain, ``n`` terms use ``n - 1`` OR operators;
+    e.g. ``max_boolean_operators=5`` allows at most 6 terms. ``None`` means no cap.
     """
     pieces: list[str] = []
     seen: set[str] = set()
+    max_terms: int | None = None
+    if max_boolean_operators is not None:
+        max_terms = max(1, max_boolean_operators + 1)
     for kw in (tier_1 or []) + (tier_2 or []):
+        if max_terms is not None and len(pieces) >= max_terms:
+            log.info(
+                "crustdata: keyword OR-chain capped at %d terms (watcher max_boolean_operators=%d)",
+                max_terms,
+                max_boolean_operators,
+            )
+            break
         kw = (kw or "").strip()
         if not kw or kw.lower() in seen:
             continue

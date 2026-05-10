@@ -110,6 +110,7 @@ async def _try_register_crustdata_watches(
     from app.routes.crustdata import RegisterWatchRequest, _spec_from_operator
     from app.services.crustdata import (
         CrustdataError,
+        find_reconciled_production_watch,
         register_keyword_watch,
         webhook_url_for,
     )
@@ -118,7 +119,36 @@ async def _try_register_crustdata_watches(
         if cf.get("crustdata_watch_ids"):
             continue
         try:
+            _log.info(
+                "crustdata onboarding: reconcile lookup cofounder=%s (list_watches + match)",
+                cf["_id"],
+            )
+            reconciled = find_reconciled_production_watch(str(cf["_id"]))
+            if reconciled:
+                spec = _spec_from_operator(operator, RegisterWatchRequest())
+                watch_id = reconciled["watch_id"]
+                kw_stored = reconciled.get("keyword_expression") or spec.keyword_expression
+                await db.cofounders.update_one(
+                    {"_id": cf["_id"]},
+                    {
+                        "$addToSet": {"crustdata_watch_ids": str(watch_id)},
+                        "$set": {
+                            "crustdata_last_registered_at": utcnow(),
+                            "crustdata_keyword_expression": kw_stored,
+                        },
+                    },
+                )
+                _log.info(
+                    "crustdata onboarding reconcile: cofounder=%s watch_id=%s",
+                    cf["_id"],
+                    watch_id,
+                )
+                continue
             spec = _spec_from_operator(operator, RegisterWatchRequest())
+            _log.info(
+                "crustdata onboarding: POST register_keyword_watch cofounder=%s",
+                cf["_id"],
+            )
             resp = register_keyword_watch(
                 cofounder_id=str(cf["_id"]),
                 spec=spec,

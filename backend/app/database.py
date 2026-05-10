@@ -36,6 +36,8 @@ async def _ensure_indexes() -> None:
     await db.cofounders.create_index([("operator_id", 1), ("active", 1)])
     await db.candidates.create_index([("operator_id", 1), ("status", 1)])
     await db.candidates.create_index([("operator_id", 1), ("shipped_at", -1)])
+    # Pipeline + slate/today load candidates by run; without this Mongo scans the full collection.
+    await db.candidates.create_index([("slate_run_id", 1), ("status", 1)])
     await db.leads.create_index([("operator_id", 1), ("linkedin_url", 1)], unique=True)
     await db.exhaustion_ledger.create_index(
         [("operator_id", 1), ("linkedin_url", 1)], unique=True

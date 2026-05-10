@@ -1,10 +1,12 @@
 """
 Discovery stage: 5-source priority pipeline.
 
-  1. Crustdata inbox drain — first layer: pre-filtered posts pushed by
-     Crustdata's `linkedin-post-with-keyword` watch (keyword + author_title
-     + industry + post_intent + headcount, evaluated upstream). Zero API
-     calls during drain; rows arrive via webhook between runs.
+  1. Crustdata — (a) inbox drain of webhook-written Mongo rows; (b) optional
+     realtime ``POST /screener/linkedin_posts/keyword_search/`` for immediate
+     posts in the HTTP response when ``DISCOVERY_USE_CRUSTDATA_SCREENER`` is on;
+     (c) when the combined Crustdata yield is still 0 and simulation ping is on,
+     ``POST /watcher/simulation/watches`` may fire once per cofounder on the
+     first discovery pass of a slate.
   2. apidirect synchronous keyword search — fast + cheap keyword LinkedIn
      post search. Skipped when not configured, in mock mode, or circuit-broken
      (402 quota).
@@ -28,7 +30,7 @@ from __future__ import annotations
 import logging
 import random
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -78,6 +80,13 @@ from app.services.unipile import (
     get_user_posts,
     search_people,
     search_posts_pages,
+)
+from app.services.crustdata import (
+    CrustdataError,
+    CrustdataNotConfigured,
+    CrustdataQuotaExhausted,
+    author_profile_url_from_screener_post,
+    screener_keyword_search_posts,
 )
 
 log = logging.getLogger(__name__)
@@ -407,6 +416,70 @@ def _doc_from_inbox(
     )
 
 
+def _screener_post_published_at(raw: dict[str, Any]) -> Any:
+    """Normalize Crustdata screener ``date_posted`` (usually ``YYYY-MM-DD``)."""
+    val = raw.get("date_posted")
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            return val.replace(tzinfo=timezone.utc)
+        return val.astimezone(timezone.utc)
+    s = str(val).strip()[:10]
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        try:
+            y, m, d = int(s[0:4]), int(s[5:7]), int(s[8:10])
+            return datetime(y, m, d, tzinfo=timezone.utc)
+        except ValueError:
+            return val
+    return val
+
+
+def _doc_from_crustdata_screener(
+    raw: dict[str, Any],
+    *,
+    operator_id: ObjectId,
+    cofounder_id: ObjectId,
+    slate_run_id: ObjectId,
+    source_keyword: str,
+    source_classification: str,
+) -> dict[str, Any]:
+    post_url = (raw.get("share_url") or "").strip()
+    post_id = raw.get("uid") or raw.get("backend_urn")
+    if isinstance(post_id, str):
+        post_id = post_id.strip() or None
+    author_name = raw.get("actor_name")
+    author_title = None
+    author_company = None
+    pd = raw.get("person_details")
+    if isinstance(pd, dict):
+        emps = pd.get("current_employers") or []
+        if emps and isinstance(emps[0], dict):
+            author_company = emps[0].get("employer_name")
+            author_title = emps[0].get("employee_title")
+        if not author_title:
+            author_title = pd.get("person_title")
+    author_linkedin_url = author_profile_url_from_screener_post(raw)
+    post_text = (raw.get("text") or "")[:20000]
+    return _candidate_doc(
+        operator_id=operator_id,
+        cofounder_id=cofounder_id,
+        slate_run_id=slate_run_id,
+        post_url=post_url,
+        post_id=str(post_id) if post_id is not None else None,
+        author_name=author_name if isinstance(author_name, str) else None,
+        author_title=author_title if isinstance(author_title, str) else None,
+        author_company=author_company if isinstance(author_company, str) else None,
+        author_linkedin_url=author_linkedin_url,
+        post_text=post_text,
+        post_published_at=_screener_post_published_at(raw),
+        source="crustdata_screener",
+        source_keyword=source_keyword,
+        source_classification=source_classification,
+        source_channel="keyword_topical",
+    )
+
+
 def _drain_crustdata_inbox(
     db: Database,
     *,
@@ -485,6 +558,169 @@ def _drain_crustdata_inbox(
     return inserted
 
 
+def _run_crustdata_screener(
+    db: Database,
+    *,
+    operator: dict[str, Any],
+    operator_id: ObjectId,
+    cofounder_id: ObjectId,
+    slate_run_id: ObjectId,
+    tier_1: list[str],
+    tier_2: list[str],
+    seen_urls: set[str],
+    seen_authors_shipped: set[str],
+) -> int:
+    """Crustdata realtime keyword screener — posts returned in the HTTP body."""
+    if not settings.discovery_use_crustdata_screener:
+        return 0
+    if not settings.crustdata_api_key:
+        return 0
+    fresh_t1 = keyword_history.filter_unused(
+        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_1
+    )
+    fresh_t2 = keyword_history.filter_unused(
+        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_2
+    )
+    plan: list[tuple[str, str]] = []
+    for kw in _rotate(fresh_t1, DISCOVERY_TIER_1_PER_RUN):
+        plan.append((kw, "A"))
+    for kw in _rotate(fresh_t2, DISCOVERY_TIER_2_PER_RUN):
+        plan.append((kw, "B"))
+    max_calls = max(0, int(settings.discovery_crustdata_screener_max_keyword_calls))
+    plan = plan[:max_calls]
+    if not plan:
+        log.info(
+            "discovery: crustdata_screener skipped cofounder=%s (empty keyword plan)",
+            cofounder_id,
+        )
+        return 0
+    limit_kw = max(1, min(int(settings.discovery_crustdata_screener_limit_per_keyword), 50))
+    date_posted = settings.discovery_crustdata_screener_date_posted.strip() or "past-month"
+    inserted = 0
+    for query, classification in plan:
+        vendor_kw = _compose_discovery_query(query, operator)[:400].strip()
+        if not vendor_kw:
+            continue
+        try:
+            posts = screener_keyword_search_posts(
+                keyword=vendor_kw,
+                limit=limit_kw,
+                date_posted=date_posted,
+            )
+        except CrustdataNotConfigured:
+            log.info(
+                "discovery: crustdata_screener halted cofounder=%s (not configured)",
+                cofounder_id,
+            )
+            return inserted
+        except CrustdataQuotaExhausted as err:
+            log.warning("discovery: crustdata_screener halted mid-run: %s", err)
+            return inserted
+        except CrustdataError as err:
+            log.warning(
+                "discovery: crustdata_screener keyword=%r failed: %s",
+                query[:80],
+                err,
+            )
+            continue
+        keyword_history.mark_used(
+            db, operator_id=operator_id, source_channel="keyword_topical", query=query
+        )
+        for raw in posts:
+            post_url = (raw.get("share_url") or "").strip()
+            if not post_url or post_url in seen_urls:
+                continue
+            author_url = author_profile_url_from_screener_post(raw) or ""
+            if author_url and author_url in seen_authors_shipped:
+                continue
+            if _is_exhausted(db, operator_id, author_url or post_url):
+                continue
+            seen_urls.add(post_url)
+            db.candidates.insert_one(
+                _doc_from_crustdata_screener(
+                    raw,
+                    operator_id=operator_id,
+                    cofounder_id=cofounder_id,
+                    slate_run_id=slate_run_id,
+                    source_keyword=query,
+                    source_classification=classification,
+                )
+            )
+            inserted += 1
+    log.info(
+        "discovery: crustdata_screener cofounder=%s inserted=%d keyword_calls=%d",
+        cofounder_id,
+        inserted,
+        len(plan),
+    )
+    return inserted
+
+
+def _maybe_crustdata_simulation_ping_after_empty_inbox(
+    operator: dict[str, Any],
+    cofounder_id: ObjectId,
+) -> None:
+    """When inbox drain produced nothing, optionally hit Crustdata simulation
+    so this stage still performs one outbound HTTP round-trip and their service
+    can POST a sample notification to our webhook (same shape as production)."""
+    if not settings.discovery_crustdata_simulation_ping_on_empty_inbox:
+        return
+    if not settings.crustdata_api_key:
+        log.info(
+            "crustdata.discovery simulation_ping skipped cofounder=%s (no CRUSTDATA_API_KEY)",
+            cofounder_id,
+        )
+        return
+    try:
+        from fastapi import HTTPException
+
+        from app.routes.crustdata import RegisterWatchRequest, _spec_from_operator
+        from app.services.crustdata import (
+            CrustdataError,
+            CrustdataNotConfigured,
+            CrustdataQuotaExhausted,
+            register_keyword_watch,
+            webhook_url_for,
+        )
+
+        spec = _spec_from_operator(operator, RegisterWatchRequest())
+        endpoint = webhook_url_for(str(cofounder_id))
+    except HTTPException as e:
+        log.info(
+            "crustdata.discovery simulation_ping skipped cofounder=%s (no watch spec): %s",
+            cofounder_id,
+            e.detail,
+        )
+        return
+    except Exception as e:
+        log.warning(
+            "crustdata.discovery simulation_ping skipped cofounder=%s (spec error): %s",
+            cofounder_id,
+            e,
+        )
+        return
+    try:
+        log.info(
+            "crustdata.discovery simulation_ping cofounder=%s (empty inbox; POST %s)",
+            cofounder_id,
+            "simulation/watches",
+        )
+        register_keyword_watch(
+            cofounder_id=str(cofounder_id),
+            spec=spec,
+            notification_endpoint=endpoint,
+            simulation=True,
+        )
+    except CrustdataNotConfigured as e:
+        log.info("crustdata.discovery simulation_ping skipped cofounder=%s: %s", cofounder_id, e)
+    except (CrustdataQuotaExhausted, CrustdataError) as e:
+        log.warning(
+            "crustdata.discovery simulation_ping failed cofounder=%s: %s",
+            cofounder_id,
+            e,
+        )
+
+
 def _apidirect_enabled() -> bool:
     """Apidirect runs only when explicitly configured AND not in mock mode AND
     the operator hasn't disabled it via DISCOVERY_USE_APIDIRECT. Mock mode
@@ -506,8 +742,13 @@ def discover_for_operator(
     operator: dict[str, Any],
     cofounders: list[dict[str, Any]],
     slate_run_id: ObjectId,
+    crustdata_simulation_ping: bool = True,
 ) -> int:
-    """Insert raw candidates per cofounder via Unipile."""
+    """Insert raw candidates per cofounder via Unipile.
+
+    ``crustdata_simulation_ping`` is false on top-up discovery rounds so we do
+    not POST Crustdata simulation watches repeatedly in one slate run.
+    """
     operator_id: ObjectId = operator["_id"]
     extracted = operator.get("product_extracted") or {}
     keywords = (extracted.get("suggested_keywords") or {}) if extracted else {}
@@ -613,7 +854,7 @@ def discover_for_operator(
     log.info(
         "discovery: source order = %s%s%s%s%s",
         "contacts_unipile → " if contacts_on else "",
-        "crustdata_inbox → " if crustdata_on else "(crustdata off) → ",
+        "crustdata (inbox+screener) → " if crustdata_on else "(crustdata off) → ",
         "apidirect → " if apidirect_on else "(apidirect off) → ",
         "exa → " if exa_on else "(exa off) → ",
         "unipile" if unipile_on else "(unipile off)",
@@ -639,9 +880,9 @@ def discover_for_operator(
         unipile_inserted = 0
         contacts_inserted = 0
 
-        # ── SOURCE 1: Crustdata inbox (zero-cost; pre-filtered upstream) ───
+        # ── SOURCE 1: Crustdata inbox + optional realtime screener ───────────
         if crustdata_on:
-            crustdata_inserted = _drain_crustdata_inbox(
+            inbox_n = _drain_crustdata_inbox(
                 db,
                 operator_id=operator_id,
                 cofounder_id=cofounder_id,
@@ -649,7 +890,29 @@ def discover_for_operator(
                 seen_urls=seen_urls,
                 seen_authors_shipped=seen_authors_shipped,
             )
+            screener_n = _run_crustdata_screener(
+                db,
+                operator=operator,
+                operator_id=operator_id,
+                cofounder_id=cofounder_id,
+                slate_run_id=slate_run_id,
+                tier_1=tier_1,
+                tier_2=tier_2,
+                seen_urls=seen_urls,
+                seen_authors_shipped=seen_authors_shipped,
+            )
+            crustdata_inserted = inbox_n + screener_n
             inserted += crustdata_inserted
+            if crustdata_inserted == 0 and crustdata_simulation_ping:
+                _maybe_crustdata_simulation_ping_after_empty_inbox(operator, cofounder_id)
+        if crustdata_on:
+            log.info(
+                "crustdata.discovery: cofounder=%s total=%d (inbox=%d screener=%d)",
+                cofounder_id,
+                crustdata_inserted,
+                inbox_n,
+                screener_n,
+            )
 
         # ── SOURCE 2: apidirect synchronous keyword search ─────────────────
         if apidirect_on:

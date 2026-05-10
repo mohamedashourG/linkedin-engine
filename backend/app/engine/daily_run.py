@@ -165,7 +165,11 @@ def run_for_operator(db: Database, operator_id: ObjectId) -> dict[str, Any]:
             t = utcnow()
             _set_stage(db, slate_run_id, round_label, started_at=t, note="searching LinkedIn")
             discovered = discovery.discover_for_operator(
-                db, operator=operator, cofounders=round_cofounders, slate_run_id=slate_run_id
+                db,
+                operator=operator,
+                cofounders=round_cofounders,
+                slate_run_id=slate_run_id,
+                crustdata_simulation_ping=(round_num == 0),
             )
             log.info("│  [%-13s] %d candidates  (%.1fs)", round_label, discovered, (utcnow() - t).total_seconds())
             _audit(db, operator_id, slate_run_id, "stage_complete", round_label, {"count": discovered})

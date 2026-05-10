@@ -181,6 +181,7 @@ def enrich_profiles(linkedin_urls: list[str]) -> dict[str, EnrichedProfile]:
     """
     if not linkedin_urls:
         return {}
+    log.info("crustdata.enrich.start profile_count=%d", len(linkedin_urls))
     _check_circuit()
     out: dict[str, EnrichedProfile] = {}
 
@@ -216,23 +217,42 @@ def _process_batch(
     if not batch:
         return
     joined = ",".join(quote(u, safe=":/?&=") for u in batch)
+    log.info(
+        "crustdata.enrich.request method=GET base=%s path=%s batch_size=%d depth=%d",
+        _BASE_URL,
+        _ENRICH_PATH,
+        len(batch),
+        depth,
+    )
     try:
         resp = client.get(f"{_ENRICH_PATH}?linkedin_profile_url={joined}")
     except httpx.RequestError as err:
-        log.warning("crustdata enrich transport error: %s", err)
+        log.warning("crustdata.enrich transport error: %s", err)
         return
 
     if resp.status_code in (401, 402):
         _trip_circuit()
+        log.warning(
+            "crustdata.enrich.response status=%s batch_size=%d depth=%d",
+            resp.status_code,
+            len(batch),
+            depth,
+        )
         raise CrustdataEnrichQuotaExhausted(
             f"crustdata enrich {resp.status_code}: {resp.text[:300]}"
         )
     if resp.status_code == 429:
         _trip_circuit()
+        log.warning("crustdata.enrich.response status=429 batch_size=%d", len(batch))
         raise CrustdataEnrichError(
             f"crustdata enrich 429 rate-limited: {resp.text[:300]}"
         )
     if resp.status_code == 404:
+        log.info(
+            "crustdata.enrich.response status=404 no_match batch_size=%d depth=%d",
+            len(batch),
+            depth,
+        )
         # No matches in this batch (not a quota issue, just no data). Skip.
         return
     if resp.status_code == 400:
@@ -265,6 +285,14 @@ def _process_batch(
         payload = [payload]
     elif not isinstance(payload, list):
         return
+
+    log.info(
+        "crustdata.enrich.response status=%s batch_size=%d depth=%d json_rows=%d",
+        resp.status_code,
+        len(batch),
+        depth,
+        len(payload),
+    )
 
     def _slug(url: str) -> str:
         if "/in/" not in url:

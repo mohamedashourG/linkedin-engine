@@ -127,6 +127,12 @@ async def crustdata_inbound(
     """
     if not ObjectId.is_valid(cofounder_id):
         raise HTTPException(400, "invalid cofounder_id")
+    cl = request.headers.get("content-length", "?")
+    log.info(
+        "crustdata.webhook inbound POST /api/webhooks/crustdata cofounder=%s content_length=%s",
+        cofounder_id,
+        cl,
+    )
     if not verify_webhook_token(cofounder_id, token):
         log.warning("crustdata webhook token mismatch for cofounder=%s", cofounder_id)
         raise HTTPException(401, "invalid token")

@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 from typing import Annotated, Any
+from urllib.parse import urlencode
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException
@@ -30,7 +31,9 @@ from app.services.crustdata import (
     CrustdataWatchSpec,
     build_keyword_expression,
     delete_watch as cd_delete_watch,
+    find_reconciled_production_watch,
     list_watches as cd_list_watches,
+    redact_notification_url,
     register_keyword_watch,
     webhook_token_for,
     webhook_url_for,
@@ -43,7 +46,12 @@ router = APIRouter(prefix="/api/crustdata", tags=["crustdata"])
 
 class RegisterWatchRequest(BaseModel):
     """Optional overrides — when omitted we derive everything from the operator
-    config + cofounder."""
+    config + cofounder.
+
+    **Industries:** ICP rubric industry strings are *not* sent by default (Crustdata
+    rejects most free-form labels). Pass ``industries`` with Crustdata-valid
+    values, or ``[]`` to omit explicitly.
+    """
 
     keyword_expression: str | None = None
     actor_types: list[str] | None = None
@@ -94,12 +102,19 @@ def _spec_from_operator(
     if title_axis:
         tier_1_titles = (title_axis[0] or {}).get("matches") or []
 
-    industries_full = _matches("industry")
     geos_full = _matches("geography")
     geo_first = override.author_location or (geos_full[0] if geos_full else None)
 
+    if override.industries is not None:
+        industries_val = override.industries if override.industries else None
+    else:
+        # Crustdata INDUSTRY filter expects their taxonomy; ICP rubric strings are usually 400.
+        industries_val = None
+
     keyword_expr = override.keyword_expression or build_keyword_expression(
-        keywords.get("tier_1") or [], keywords.get("tier_2") or []
+        keywords.get("tier_1") or [],
+        keywords.get("tier_2") or [],
+        max_boolean_operators=settings.crustdata_watch_max_boolean_operators,
     )
     if not keyword_expr:
         raise HTTPException(
@@ -114,21 +129,36 @@ def _spec_from_operator(
         or ""
     )[:600] or None
 
+    past_company = override.past_company
+    past_title = override.past_title
+    company_hq_country = override.company_hq_country
+    headcount_buckets = (
+        list(override.headcount_buckets) if override.headcount_buckets else None
+    )
+    has_lead = bool(past_company or past_title)
+    has_account = bool(headcount_buckets or company_hq_country)
+    if not has_lead and not has_account:
+        headcount_buckets = list(settings.crustdata_watch_default_headcount_buckets)
+        log.info(
+            "crustdata watcher: applying default COMPANY_HEADCOUNT (event requires "
+            "account or lead filters)"
+        )
+
     return CrustdataWatchSpec(
         keyword_expression=keyword_expr,
         actor_types=override.actor_types or ["person"],
         author_titles=override.author_titles or (tier_1_titles or None),
         author_company_urls=override.author_company_urls or None,
         author_location=geo_first,
-        industries=override.industries or (industries_full or None),
+        industries=industries_val,
         post_intent=override.post_intent or product_desc,
         post_categories=override.post_categories,
         fetch_reactors=override.fetch_reactors,
         detailed_reactor_data=override.detailed_reactor_data,
-        headcount_buckets=override.headcount_buckets or None,
-        company_hq_country=override.company_hq_country,
-        past_company=override.past_company,
-        past_title=override.past_title,
+        headcount_buckets=headcount_buckets,
+        company_hq_country=company_hq_country,
+        past_company=past_company,
+        past_title=past_title,
     )
 
 
@@ -164,6 +194,12 @@ async def register(
     cofounder. The webhook URL is derived per-cofounder with an HMAC token so
     the receiver can verify origin."""
     operator_id: ObjectId = current_user["_id"]
+    log.info(
+        "crustdata.route.register start cofounder=%s simulation=%s operator=%s",
+        cofounder_id,
+        body.simulation,
+        operator_id,
+    )
     cf = await _load_cofounder(db, operator_id=operator_id, cofounder_id=cofounder_id)
     spec = _spec_from_operator(current_user, body)
 
@@ -178,15 +214,75 @@ async def register(
         except CrustdataNotConfigured as err:
             if not body.simulation:
                 raise HTTPException(503, str(err))
-            # Simulation mode + no public URL: Crustdata still needs *some*
-            # endpoint to call. Use a placeholder that loops back to the
-            # local backend container hostname (dev convenience).
+            # Simulation still needs a URL Crustdata can POST to — use the same
+            # public base as production (`CRUSTDATA_WEBHOOK_BASE_URL` / .env).
+            base = (settings.crustdata_webhook_base_url or "").rstrip("/")
+            if not base:
+                raise HTTPException(
+                    503,
+                    "Simulation requires CRUSTDATA_WEBHOOK_BASE_URL or "
+                    "notification_endpoint_override. "
+                    f"({err})",
+                ) from err
+            try:
+                tok = webhook_token_for(cofounder_id)
+            except CrustdataNotConfigured as e2:
+                raise HTTPException(503, str(e2)) from e2
             notification_endpoint = (
-                f"http://host.docker.internal:8000/api/webhooks/crustdata"
-                f"?cofounder_id={cofounder_id}&token={webhook_token_for(cofounder_id)}"
+                f"{base}/api/webhooks/crustdata"
+                f"?{urlencode({'cofounder_id': cofounder_id, 'token': tok})}"
             )
 
+    log.info(
+        "crustdata.route.register notification_endpoint=%s (simulation=%s)",
+        redact_notification_url(notification_endpoint or ""),
+        body.simulation,
+    )
+
     try:
+        if not body.simulation:
+            reconciled = find_reconciled_production_watch(cofounder_id)
+            if reconciled:
+                watch_id = reconciled["watch_id"]
+                kw_stored = reconciled.get("keyword_expression") or spec.keyword_expression
+                log.info(
+                    "crustdata.route.register result=reconciled cofounder=%s watch_id=%s "
+                    "(matched via GET /watcher/watches; skipped POST /watcher/watches)",
+                    cofounder_id,
+                    watch_id,
+                )
+                await db.cofounders.update_one(
+                    {"_id": cf["_id"]},
+                    {
+                        "$addToSet": {"crustdata_watch_ids": str(watch_id)},
+                        "$set": {
+                            "crustdata_last_registered_at": utcnow(),
+                            "crustdata_keyword_expression": kw_stored,
+                        },
+                    },
+                )
+                return {
+                    "ok": True,
+                    "reconciled": True,
+                    "watch_id": watch_id,
+                    "simulation": False,
+                    "notification_endpoint": notification_endpoint,
+                    "spec": {
+                        "keyword_expression": spec.keyword_expression,
+                        "actor_types": spec.actor_types,
+                        "author_titles": spec.author_titles,
+                        "industries": spec.industries,
+                        "author_location": spec.author_location,
+                        "post_intent_set": bool(spec.post_intent),
+                    },
+                    "raw": reconciled,
+                }
+        log.info(
+            "crustdata.route.register calling Crustdata API register_keyword_watch "
+            "cofounder=%s simulation=%s",
+            cofounder_id,
+            body.simulation,
+        )
         resp = register_keyword_watch(
             cofounder_id=cofounder_id,
             spec=spec,
@@ -198,6 +294,12 @@ async def register(
         raise _coerce_crustdata(err)
 
     watch_id = resp.get("id") or resp.get("watch_id") or resp.get("uuid")
+    log.info(
+        "crustdata.route.register done cofounder=%s simulation=%s watch_id=%s",
+        cofounder_id,
+        body.simulation,
+        watch_id,
+    )
     if watch_id and not body.simulation:
         await db.cofounders.update_one(
             {"_id": cf["_id"]},
@@ -231,6 +333,7 @@ async def list_all(current_user: CurrentUser) -> dict[str, Any]:
     """List every watch registered against the configured Crustdata account.
     Crustdata's list endpoint is account-wide, not per-cofounder."""
     _ = current_user  # require auth, no operator filter (account-wide)
+    log.info("crustdata.route.list_watches GET /api/crustdata/watches (proxies Crustdata GET /watcher/watches)")
     try:
         watches = cd_list_watches()
     except CrustdataError as err:
@@ -245,6 +348,11 @@ async def delete_one(
     db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
 ) -> dict[str, Any]:
     operator_id: ObjectId = current_user["_id"]
+    log.info(
+        "crustdata.route.delete_watch watch_id=%s operator=%s (Crustdata DELETE /watcher/watches/{id})",
+        watch_id,
+        operator_id,
+    )
     try:
         deleted = cd_delete_watch(watch_id)
     except CrustdataError as err:
