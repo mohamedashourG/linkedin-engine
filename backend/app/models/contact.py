@@ -16,6 +16,9 @@ class ContactCreate(BaseModel):
     title: str | None = Field(default=None, max_length=200)
     company: str | None = Field(default=None, max_length=200)
     linkedin_url: HttpUrl | None = None
+    # Optional group label. If set on creation/import, every parsed contact
+    # lands in this group. Empty/None = ungrouped.
+    group: str | None = Field(default=None, max_length=120)
 
 
 class ContactBulkRequest(BaseModel):
@@ -28,6 +31,8 @@ class ContactBulkRequest(BaseModel):
             "LinkedIn URL."
         ),
     )
+    # When set, every parsed contact in this batch is assigned to the group.
+    group: str | None = Field(default=None, max_length=120)
 
 
 class ContactPublic(BaseModel):
@@ -38,6 +43,7 @@ class ContactPublic(BaseModel):
     title: str | None = None
     company: str | None = None
     linkedin_url: str | None = None
+    group: str | None = None
     status: str
     created_at: datetime
 
@@ -49,6 +55,7 @@ def contact_to_public(doc: dict[str, Any]) -> ContactPublic:
         title=doc.get("extracted_title"),
         company=doc.get("extracted_company"),
         linkedin_url=doc.get("linkedin_url"),
+        group=doc.get("group") or None,
         status=doc.get("status") or "pending",
         created_at=doc["created_at"],
     )

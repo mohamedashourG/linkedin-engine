@@ -495,12 +495,40 @@ def discover_for_operator(
     )
 
     # Manual contact seeds — searched via Unipile direct (gates bypassed).
+    # When the operator has set `active_contact_group`, restrict the walk
+    # to that group only. Recognised values:
+    #   None / empty       → walk every contact regardless of group
+    #   "__ungrouped__"    → walk ONLY contacts with no group label
+    #   "<any other str>"  → walk ONLY contacts in that named group
     contact_seeds = [s for s in seeds if s.get("source") == "manual"]
+    active_group = (operator.get("active_contact_group") or "").strip() or None
+    if active_group == "__ungrouped__":
+        before = len(contact_seeds)
+        contact_seeds = [s for s in contact_seeds if not (s.get("group") or None)]
+        log.info(
+            "discovery: active_contact_group=__ungrouped__ filtered %d → %d seeds",
+            before,
+            len(contact_seeds),
+        )
+    elif active_group:
+        before = len(contact_seeds)
+        contact_seeds = [s for s in contact_seeds if (s.get("group") or None) == active_group]
+        log.info(
+            "discovery: active_contact_group=%r filtered %d → %d seeds",
+            active_group,
+            before,
+            len(contact_seeds),
+        )
     contacts_on = bool(contact_seeds)
     log.info(
-        "discovery: %d contact seeds loaded for operator=%s",
+        "discovery: %d contact seeds loaded for operator=%s%s",
         len(contact_seeds),
         operator_id,
+        (
+            " (all groups)"
+            if not active_group
+            else f" (group={active_group!r})"
+        ),
     )
 
     # CONTACTS-ONLY MODE: when the operator has curated a contact list, run
