@@ -1,20 +1,24 @@
 """
 Discovery stage: 5-source priority pipeline.
 
-  1. Crustdata — (a) inbox drain of webhook-written Mongo rows; (b) optional
-     realtime ``POST /screener/linkedin_posts/keyword_search/`` for immediate
-     posts in the HTTP response when ``DISCOVERY_USE_CRUSTDATA_SCREENER`` is on;
-     (c) when the combined Crustdata yield is still 0 and simulation ping is on,
-     ``POST /watcher/simulation/watches`` may fire once per cofounder on the
-     first discovery pass of a slate.
-  2. apidirect synchronous keyword search — fast + cheap keyword LinkedIn
-     post search. Skipped when not configured, in mock mode, or circuit-broken
-     (402 quota).
-  3. Exa semantic LinkedIn search — high-volume neural search, ~50 posts/call.
-  4. Unipile LinkedIn post keyword search — `search_posts_pages` (classic API,
-     omit cursor on first page then paginate; optional past_day → past_week →
-     past_month). RULE 24 title-search runs here when enabled. Profile post
-     fetch is contact-only via `_run_contact_seeds_unipile`.
+  1. **Unipile** keyword post search (PRIMARY) — `search_posts_pages` against
+     the classic LinkedIn search API, then per-author enrichment via the free
+     ``GET /users/{slug}`` endpoint (cached cross-run in
+     ``unipile_author_cache``), then dual-path rubric qualification against
+     the operator's own ICP fields. Path A passes on the enriched author
+     rubric (title 5 + industry 3 + geo 2); Path B passes on post text
+     keyword-tier hits (tier_1=3, tier_2=2, tier_3=1, capped at 12). Geo is
+     required on both paths when the operator has ``target_geographies``
+     set. Inline-enriched candidates skip ``profile_resolve`` so Crustdata
+     / PDL credits aren't spent on data we already have. Reference:
+     ``unipile_hybrid_sweep.py``.
+  2. Crustdata — (a) inbox drain of webhook-written Mongo rows; (b) optional
+     realtime ``POST /screener/linkedin_posts/keyword_search/``; (c) optional
+     simulation ping on empty yield.
+  3. apidirect synchronous keyword search — fast + cheap keyword LinkedIn
+     post search. Skipped when not configured, in mock mode, or
+     circuit-broken (402 quota).
+  4. Exa semantic LinkedIn search — high-volume neural search, ~50 posts/call.
   5. Contact seeds — imported contacts (CSV/Excel/manual) searched via
      apidirect + Exa by name/title/company. Tagged source="contact_seed".
 
@@ -78,6 +82,7 @@ from app.services.unipile import (
     UnipilePerson,
     UnipilePost,
     get_user_posts,
+    resolve_location_ids_from_text,
     search_people,
     search_posts_pages,
 )
@@ -99,14 +104,17 @@ _SENIORITY_HINT_RE = re.compile(
 
 
 def _operator_geo_terms(operator: dict[str, Any]) -> list[str]:
-    """Geography phrases from onboarding / ICP for query bias + post filter."""
+    """Geography phrases from onboarding / ICP for query bias + post filter.
+
+    Preserves human casing (e.g. ``San Francisco``) for Unipile PARAMETERS
+    lookup; dedupes case-insensitively."""
     ext = operator.get("product_extracted") or {}
     raw = ext.get("target_geographies") or []
     out: list[str] = []
     for x in raw:
         s = str(x).strip()
         if len(s) >= 2:
-            out.append(s.lower())
+            out.append(s)
     rub = operator.get("icp_rubric") or {}
     geo = rub.get("geography") or {}
     for tier in geo.get("tiers") or []:
@@ -115,12 +123,13 @@ def _operator_geo_terms(operator: dict[str, Any]) -> list[str]:
         for m in tier.get("matches") or []:
             s = str(m).strip()
             if len(s) >= 2:
-                out.append(s.lower())
+                out.append(s)
     seen: set[str] = set()
     uniq: list[str] = []
     for s in out:
-        if s not in seen:
-            seen.add(s)
+        key = s.casefold()
+        if key not in seen:
+            seen.add(key)
             uniq.append(s)
     return uniq[:15]
 
@@ -138,6 +147,58 @@ def _seniority_hints_from_titles(operator: dict[str, Any]) -> str:
     if not hints:
         return ""
     return " ".join(sorted(hints, key=len, reverse=True))[:160]
+
+
+def _unipile_post_location_ids_for_operator(
+    account_id: str,
+    operator: dict[str, Any],
+) -> list[str]:
+    """LinkedIn geo id strings for classic post search ``body.location``.
+
+    Order: ``DISCOVERY_UNIPILE_POST_LOCATION_IDS`` (comma-separated) if set;
+    else when ``DISCOVERY_UNIPILE_POST_RESOLVE_LOCATION`` is true, resolve the
+    first matching ICP geography via ``GET /linkedin/search/parameters``."""
+    raw = (settings.discovery_unipile_post_location_ids or "").strip()
+    if raw:
+        ids = [x.strip() for x in raw.split(",") if x.strip()][:10]
+        if ids:
+            log.info(
+                "discovery: unipile post search using configured location_ids=%s",
+                ids,
+            )
+        return ids
+    if not settings.discovery_unipile_post_resolve_location:
+        return []
+    if settings.unipile_mock or not (account_id or "").strip():
+        return []
+    for term in _operator_geo_terms(operator)[:8]:
+        if not term.strip():
+            continue
+        try:
+            ids = resolve_location_ids_from_text(
+                account_id=account_id,
+                location_text=term,
+            )
+        except (UnipileError, UnipileNotConfigured) as err:
+            log.info(
+                "discovery: unipile location PARAMETERS failed term=%r: %s",
+                term[:60],
+                err,
+            )
+            continue
+        if ids:
+            log.info(
+                "discovery: unipile post search location_ids from PARAMETERS "
+                "term=%r -> %s",
+                term[:80],
+                ids,
+            )
+            return ids
+    log.info(
+        "discovery: unipile post search no location_ids "
+        "(no DISCOVERY_UNIPILE_POST_LOCATION_IDS and no PARAMETERS match)"
+    )
+    return []
 
 
 def _compose_discovery_query(base_kw: str, operator: dict[str, Any]) -> str:
@@ -275,16 +336,30 @@ def _doc_from_unipile(
     source_keyword: str,
     source_classification: str,
     source_channel: str = "",
+    enriched_profile: dict[str, Any] | None = None,
+    inline_rubric: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return _candidate_doc(
+    """Build a candidate doc from a Unipile search post.
+
+    When ``enriched_profile`` is supplied (output of ``_get_cached_author_profile``),
+    its headline / company / location override what the search payload returned —
+    those fields are much more reliable from the `/users/{slug}` endpoint than
+    from the search snippet. ``inline_rubric`` carries the author/post scores
+    that qualified the candidate so downstream stages (and the UI) can show
+    the reasoning.
+
+    When ``enriched_profile`` is set we also stamp ``enriched_inline=True``
+    so ``profile_resolve`` can skip the candidate (saves Crustdata credits)."""
+    ep = enriched_profile or {}
+    doc = _candidate_doc(
         operator_id=operator_id,
         cofounder_id=cofounder_id,
         slate_run_id=slate_run_id,
         post_url=post.url,
         post_id=post.id,
-        author_name=post.author_name,
-        author_title=post.author_title,
-        author_company=post.author_company,
+        author_name=ep.get("name") or post.author_name,
+        author_title=ep.get("headline") or post.author_title,
+        author_company=ep.get("company") or post.author_company,
         author_linkedin_url=post.author_profile_url,
         post_text=post.text,
         post_published_at=post.published_at,
@@ -293,6 +368,223 @@ def _doc_from_unipile(
         source_classification=source_classification,
         source_channel=source_channel,
     )
+    if enriched_profile:
+        doc["enriched_inline"] = True
+        loc = ep.get("location") or ""
+        if loc:
+            doc["author_location"] = loc
+    if inline_rubric:
+        doc["unipile_rubric"] = inline_rubric
+    return doc
+
+
+# ----------------------------------------------------------------------
+# Inline Unipile author enrichment + per-operator rubric scoring.
+#
+# Ported from the reference `unipile_hybrid_sweep.py` / `client2` scripts.
+# Both scripts found that scoring posts INLINE during discovery — using the
+# author's enriched profile (free `/users/{slug}` call) + the operator's own
+# ICP fields — dramatically reduced junk that reached the LLM gates.
+#
+# Two scoring vectors:
+#   - Author: title pts (5 if any operator.target_title appears in headline)
+#             + industry pts (3 if any operator.target_industry appears)
+#             + geo pts     (2 if any operator.target_geography appears)
+#   - Post:   keyword-tier hits — tier_1 = 3 pts, tier_2 = 2 pts,
+#             tier_3 = 1 pt, capped at 12
+#
+# Dual-path qualification: either author rubric ≥ THRESHOLD_A, or post
+# relevance ≥ THRESHOLD_B. Geo always required when the operator has
+# target_geographies set (otherwise skip the geo check so engines without a
+# defined geography still produce candidates).
+# ----------------------------------------------------------------------
+
+# Short geo tokens (e.g., "us", "uk") are word-boundary matched to avoid the
+# "Indianapolis" / "Boston, MA" style false positives that substring matching
+# would otherwise hit ("in" appearing inside "Indianapolis").
+_RUBRIC_SHORT_TOKEN_MAX = 4
+
+
+def _rubric_substring_match(haystack: str, needle: str) -> bool:
+    """Case-insensitive match. Word-boundary protected for short needles
+    (≤ 4 chars) to avoid e.g. "us" inside "Houston" matching."""
+    if not haystack or not needle:
+        return False
+    if len(needle) <= _RUBRIC_SHORT_TOKEN_MAX:
+        return bool(re.search(r"\b" + re.escape(needle) + r"\b", haystack))
+    return needle in haystack
+
+
+def _score_unipile_author_against_operator(
+    profile: dict[str, Any], operator: dict[str, Any]
+) -> dict[str, int]:
+    """Score an enriched author profile against the operator's ICP fields.
+
+    Returns a dict with `title`, `industry`, `geo`, and `total`. Missing
+    operator fields collapse to a zero in that axis (so e.g. operators with
+    no `target_titles` configured will see title=0 for every author — but
+    Path B can still qualify them via post relevance)."""
+    ext = operator.get("product_extracted") or {}
+    titles = [t.lower() for t in (ext.get("target_titles") or []) if isinstance(t, str) and t]
+    industries = [i.lower() for i in (ext.get("target_industries") or []) if isinstance(i, str) and i]
+    geos = [g.lower() for g in (ext.get("target_geographies") or []) if isinstance(g, str) and g]
+
+    headline = (profile.get("headline") or "").lower()
+    location = (profile.get("location") or "").lower()
+    company = (profile.get("company") or "").lower()
+    blob = (headline + " | " + company).strip(" |")
+
+    title_pts = 5 if any(_rubric_substring_match(headline, t) for t in titles) else 0
+    industry_pts = 3 if any(_rubric_substring_match(blob, i) for i in industries) else 0
+    geo_pts = 2 if any(_rubric_substring_match(location, g) for g in geos) else 0
+
+    return {
+        "title": title_pts,
+        "industry": industry_pts,
+        "geo": geo_pts,
+        "total": title_pts + industry_pts + geo_pts,
+    }
+
+
+def _score_unipile_post_against_operator(
+    post_text: str, operator: dict[str, Any]
+) -> tuple[int, list[str]]:
+    """Score a post body against the operator's tier_1/tier_2/tier_3
+    keyword pool. Returns (score, matched_keywords). Score is capped at 12
+    so a single keyword-stuffed post doesn't dominate the ranking."""
+    text = (post_text or "").lower()
+    if not text:
+        return 0, []
+    ext = operator.get("product_extracted") or {}
+    kws = ext.get("suggested_keywords") or {}
+    t1 = [k.lower() for k in (kws.get("tier_1") or []) if isinstance(k, str) and k]
+    t2 = [k.lower() for k in (kws.get("tier_2") or []) if isinstance(k, str) and k]
+    t3 = [k.lower() for k in (kws.get("tier_3") or []) if isinstance(k, str) and k]
+
+    score = 0
+    matched: list[str] = []
+    for k in t1:
+        if k in text:
+            score += 3
+            matched.append(k)
+    for k in t2:
+        if k in text:
+            score += 2
+            matched.append(k)
+    for k in t3:
+        if k in text:
+            score += 1
+            matched.append(k)
+    return min(score, 12), matched
+
+
+def _qualifies_inline_rubric(
+    *,
+    author_score: dict[str, int],
+    post_relevance: int,
+    operator: dict[str, Any],
+) -> tuple[bool, list[str]]:
+    """Dual-path qualification with conditional geo gate.
+
+    Path A: ``author_score.total >= path_a_threshold`` (default 6 — e.g.
+        title 5 + geo 2 = 7, OR title 5 + industry 3 = 8, OR industry 3 +
+        geo 2 = 5 → falls one short, won't pass alone).
+    Path B: ``post_relevance >= path_b_threshold`` (default 3 — one
+        tier-1 hit, or two tier-2 hits).
+
+    Geo is required IFF the operator has ``target_geographies`` configured.
+    Operators that left geography blank don't filter on location (we'd be
+    second-guessing them otherwise)."""
+    ext = operator.get("product_extracted") or {}
+    has_geo_target = bool(ext.get("target_geographies"))
+    require_geo = settings.discovery_unipile_inline_require_geo and has_geo_target
+    if require_geo and author_score.get("geo", 0) < 1:
+        return False, []
+
+    paths: list[str] = []
+    if author_score.get("total", 0) >= settings.discovery_unipile_inline_path_a_threshold:
+        paths.append("A_author")
+    if post_relevance >= settings.discovery_unipile_inline_path_b_threshold:
+        paths.append("B_post")
+    return bool(paths), paths
+
+
+def _get_cached_unipile_author_profile(
+    db: Database,
+    *,
+    operator_id: ObjectId,
+    provider_id: str,
+    account_id: str,
+    ttl_days: int,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Return ``(profile, was_fetched)`` for the given provider_id, using
+    ``unipile_author_cache`` keyed by ``(operator_id, provider_id)``.
+
+    `was_fetched` is True when this call hit Unipile's `/users/{slug}` —
+    callers use it to track API-call budget per discovery pass.
+
+    Cache TTL is a soft TTL (we check ``fetched_at`` against the cutoff in
+    the query rather than relying on a Mongo TTL index, so refreshes happen
+    on first miss rather than on a background sweep)."""
+    from app.services.unipile import (
+        resolve_profile as unipile_resolve_profile,
+        UnipileError,
+        UnipileNotConfigured,
+    )
+
+    if not provider_id:
+        return None, False
+    now = utcnow()
+    cutoff = now - timedelta(days=max(1, ttl_days))
+    cached = db.unipile_author_cache.find_one(
+        {
+            "operator_id": operator_id,
+            "provider_id": provider_id,
+            "fetched_at": {"$gte": cutoff},
+        }
+    )
+    if cached:
+        return cached, False
+
+    try:
+        raw = unipile_resolve_profile(
+            account_id=account_id, public_identifier_or_url=provider_id
+        )
+    except (UnipileError, UnipileNotConfigured) as err:
+        log.debug(
+            "unipile: profile fetch failed for provider_id=%s: %s",
+            provider_id[:40], err,
+        )
+        return None, True  # API was attempted, just failed
+    if not raw:
+        return None, True
+
+    work = raw.get("work_experience") or []
+    first_job = work[0] if isinstance(work, list) and work else {}
+    name = (
+        raw.get("name")
+        or " ".join(
+            filter(None, [raw.get("first_name"), raw.get("last_name")])
+        ).strip()
+        or None
+    )
+    doc = {
+        "operator_id": operator_id,
+        "provider_id": provider_id,
+        "public_identifier": raw.get("public_identifier") or "",
+        "name": name or "",
+        "headline": raw.get("headline") or "",
+        "location": raw.get("location") or "",
+        "company": (first_job.get("company") or first_job.get("company_name") or ""),
+        "title": (first_job.get("title") or first_job.get("role") or ""),
+        "fetched_at": now,
+    }
+    db.unipile_author_cache.update_one(
+        {"operator_id": operator_id, "provider_id": provider_id},
+        {"$set": doc},
+        upsert=True,
+    )
+    return doc, True
 
 
 def _apidirect_optional_details(post_url: str) -> LinkedInPostDetails | None:
@@ -854,10 +1146,10 @@ def discover_for_operator(
     log.info(
         "discovery: source order = %s%s%s%s%s",
         "contacts_unipile → " if contacts_on else "",
+        "unipile (PRIMARY) → " if unipile_on else "(unipile off) → ",
         "crustdata (inbox+screener) → " if crustdata_on else "(crustdata off) → ",
         "apidirect → " if apidirect_on else "(apidirect off) → ",
-        "exa → " if exa_on else "(exa off) → ",
-        "unipile" if unipile_on else "(unipile off)",
+        "exa" if exa_on else "(exa off)",
     )
 
     # Recency window for Exa's startPublishedDate — passes our recency filter
@@ -880,7 +1172,52 @@ def discover_for_operator(
         unipile_inserted = 0
         contacts_inserted = 0
 
-        # ── SOURCE 1: Crustdata inbox + optional realtime screener ───────────
+        # ── SOURCE 1 (PRIMARY): Unipile keyword + seed-author search ──────
+        # Promoted to first position — Unipile gives the best per-candidate
+        # signal (free `/users/{slug}` profile enrichment + dual-path rubric
+        # qualify inside `_run_unipile`) so it should run before the more
+        # expensive / less-signal-rich keyword sources downstream.
+        if unipile_on:
+            account_id = cofounder.get("unipile_account_id")
+            if not account_id:
+                log.warning(
+                    "discovery: cofounder %s has no unipile_account_id — "
+                    "skipping Unipile (primary source); falling back to "
+                    "crustdata/apidirect/exa for this cofounder",
+                    cofounder_id,
+                )
+                db.audit_records.insert_one(
+                    {
+                        "operator_id": operator_id,
+                        "event_type": "stage_error",
+                        "stage": "discovery",
+                        "details": {
+                            "cofounder_id": str(cofounder_id),
+                            "reason": "no_unipile_account",
+                        },
+                        "severity": "warn",
+                        "created_at": utcnow(),
+                    }
+                )
+            else:
+                unipile_inserted = _run_unipile(
+                    db,
+                    operator=operator,
+                    operator_id=operator_id,
+                    cofounder_id=cofounder_id,
+                    slate_run_id=slate_run_id,
+                    account_id=account_id,
+                    tier_1=tier_1,
+                    tier_2=tier_2,
+                    tier_3=tier_3,
+                    title_industry=title_industry,
+                    seeds=seeds,
+                    seen_urls=seen_urls,
+                    seen_authors_shipped=seen_authors_shipped,
+                )
+                inserted += unipile_inserted
+
+        # ── SOURCE 2: Crustdata inbox + optional realtime screener ───────────
         if crustdata_on:
             inbox_n = _drain_crustdata_inbox(
                 db,
@@ -914,7 +1251,7 @@ def discover_for_operator(
                 screener_n,
             )
 
-        # ── SOURCE 2: apidirect synchronous keyword search ─────────────────
+        # ── SOURCE 3: apidirect synchronous keyword search ─────────────────
         if apidirect_on:
             apidirect_inserted = _run_apidirect(
                 db,
@@ -929,7 +1266,7 @@ def discover_for_operator(
             )
             inserted += apidirect_inserted
 
-        # ── SOURCE 3: Exa LinkedIn-scoped search (high numResults per call) ──
+        # ── SOURCE 4: Exa LinkedIn-scoped search (high numResults per call) ──
         if exa_on:
             exa_inserted = _run_exa(
                 db,
@@ -945,50 +1282,6 @@ def discover_for_operator(
                 start_published_date=exa_after,
             )
             inserted += exa_inserted
-
-        # ── SOURCE 4: Unipile keyword + seed-author search ─────────────────
-        if unipile_on:
-            account_id = cofounder.get("unipile_account_id")
-            if not account_id:
-                log.warning(
-                    "discovery: cofounder %s has no unipile_account_id — "
-                    "skipping Unipile (apidirect=%d, crustdata=%d already in)",
-                    cofounder_id,
-                    apidirect_inserted,
-                    crustdata_inserted,
-                )
-                db.audit_records.insert_one(
-                    {
-                        "operator_id": operator_id,
-                        "event_type": "stage_error",
-                        "stage": "discovery",
-                        "details": {
-                            "cofounder_id": str(cofounder_id),
-                            "reason": "no_unipile_account",
-                            "apidirect_inserted": apidirect_inserted,
-                            "crustdata_inserted": crustdata_inserted,
-                        },
-                        "severity": "warn",
-                        "created_at": utcnow(),
-                    }
-                )
-            else:
-                unipile_inserted = _run_unipile(
-                    db,
-                    operator=operator,
-                    operator_id=operator_id,
-                    cofounder_id=cofounder_id,
-                    slate_run_id=slate_run_id,
-                    account_id=account_id,
-                    tier_1=tier_1,
-                    tier_2=tier_2,
-                    tier_3=tier_3,
-                    title_industry=title_industry,
-                    seeds=seeds,
-                    seen_urls=seen_urls,
-                    seen_authors_shipped=seen_authors_shipped,
-                )
-                inserted += unipile_inserted
 
         # ── SOURCE 4b: RULE 24 title-search PEOPLE channel via Unipile.
         # Runs only when unipile is on AND the title_search flag is set AND
@@ -1293,7 +1586,14 @@ def _run_unipile(
         )
         return 0
 
+    post_location_ids = _unipile_post_location_ids_for_operator(account_id, operator)
     inserted = 0
+    # Cap on `/users/{slug}` profile fetches per cofounder run — protects
+    # the LinkedIn account from a quota spike on a high-yield keyword pass.
+    fetch_budget_remaining = settings.discovery_unipile_max_profile_fetches_per_run
+    cache_ttl = settings.discovery_unipile_author_cache_ttl_days
+    use_inline_rubric = settings.discovery_unipile_inline_rubric_enabled
+    rubric_drops = {"no_profile": 0, "geo": 0, "rubric": 0}
     for kind, payload, source, classification in plan:
         assert kind == "kw"
         try:
@@ -1316,6 +1616,7 @@ def _run_unipile(
                     else None
                 ),
                 author_keywords=settings.discovery_unipile_post_author_filter or None,
+                location_ids=post_location_ids or None,
             )
         except UnipileNotConfigured as err:
             log.warning("discovery: unipile unconfigured, halting: %s", err)
@@ -1349,11 +1650,91 @@ def _run_unipile(
         for post in posts:
             if not post.url or post.url in seen_urls:
                 continue
+            if settings.discovery_unipile_skip_company_posts and post.author_is_company:
+                continue
             author_url = post.author_profile_url or ""
             if author_url and author_url in seen_authors_shipped:
                 continue
             if _is_exhausted(db, operator_id, author_url or post.url):
                 continue
+
+            enriched_profile: dict[str, Any] | None = None
+            inline_rubric: dict[str, Any] | None = None
+
+            if use_inline_rubric:
+                # Step 1: enrich author via cached /users/{slug} (free Unipile
+                # endpoint). Cache hits don't count against the per-run fetch
+                # budget; misses do.
+                provider_id = post.author_provider_id or ""
+                if provider_id:
+                    cached_or_fresh, was_fetched = _get_cached_unipile_author_profile(
+                        db,
+                        operator_id=operator_id,
+                        provider_id=provider_id,
+                        account_id=account_id,
+                        ttl_days=cache_ttl,
+                    )
+                    if was_fetched:
+                        fetch_budget_remaining -= 1
+                    enriched_profile = cached_or_fresh
+                # Step 2: score author + post against the operator's ICP fields.
+                author_score = _score_unipile_author_against_operator(
+                    enriched_profile or {}, operator
+                )
+                post_score, post_matches = _score_unipile_post_against_operator(
+                    post.text or "", operator
+                )
+                # Step 3: dual-path qualify (geo gate is conditional on the
+                # operator having target_geographies set — see _qualifies_inline_rubric).
+                ok, paths = _qualifies_inline_rubric(
+                    author_score=author_score,
+                    post_relevance=post_score,
+                    operator=operator,
+                )
+                inline_rubric = {
+                    "author": author_score,
+                    "post_relevance": post_score,
+                    "post_matches": post_matches[:8],
+                    "paths": paths,
+                }
+                if not ok:
+                    # Track WHY we dropped so the summary line is actionable.
+                    if (
+                        settings.discovery_unipile_inline_require_geo
+                        and (operator.get("product_extracted") or {}).get("target_geographies")
+                        and author_score.get("geo", 0) < 1
+                    ):
+                        rubric_drops["geo"] += 1
+                        reason = "geo_not_in_author_location"
+                    elif not enriched_profile and provider_id:
+                        # Had a provider_id but enrichment failed/budget
+                        # exhausted → can't verify geo → drop.
+                        rubric_drops["no_profile"] = rubric_drops.get("no_profile", 0) + 1
+                        reason = "no_profile (fetch failed or budget exhausted)"
+                    else:
+                        rubric_drops["rubric"] += 1
+                        reason = (
+                            f"rubric T={author_score['title']} I={author_score['industry']} "
+                            f"G={author_score['geo']} post={post_score} → no path"
+                        )
+                    log.info(
+                        "│  [DROP/unipile] %s  ←  %s",
+                        (post.url or "<no-url>")[:90],
+                        reason,
+                    )
+                    continue
+                if fetch_budget_remaining <= 0 and use_inline_rubric:
+                    log.info(
+                        "│  [unipile]     profile-fetch budget exhausted "
+                        "(%d/run); remaining posts use search-payload data only",
+                        settings.discovery_unipile_max_profile_fetches_per_run,
+                    )
+                    # Don't stop the loop — just stop enriching. Subsequent
+                    # posts will fall through to the search-payload path
+                    # below (author score will be 0 for title/industry, geo
+                    # may still match if search included location info).
+                    use_inline_rubric = False
+
             seen_urls.add(post.url)
             db.candidates.insert_one(
                 _doc_from_unipile(
@@ -1365,9 +1746,19 @@ def _run_unipile(
                     source_keyword=payload,
                     source_classification=classification,
                     source_channel=post_source_channel,
+                    enriched_profile=enriched_profile,
+                    inline_rubric=inline_rubric,
                 )
             )
             inserted += 1
+
+    if settings.discovery_unipile_inline_rubric_enabled:
+        log.info(
+            "│  [unipile-rubric] dropped: geo=%d no_profile=%d rubric=%d",
+            rubric_drops.get("geo", 0),
+            rubric_drops.get("no_profile", 0),
+            rubric_drops.get("rubric", 0),
+        )
     return inserted
 
 
@@ -1453,6 +1844,8 @@ def _run_unipile_title_search(
 
             for post in posts:
                 if not post.url or post.url in seen_urls:
+                    continue
+                if settings.discovery_unipile_skip_company_posts and post.author_is_company:
                     continue
                 seen_urls.add(post.url)
                 db.candidates.insert_one(

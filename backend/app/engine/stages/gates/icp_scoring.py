@@ -48,6 +48,7 @@ Evidence priority (use the strongest available, don't double-count):
 Rules:
 - A given axis matches at most ONE tier — the highest you can justify with the available evidence.
 - If no evidence at all on an axis, score=0 and matched_terms=[].
+- **Short title acronyms** (about 4 characters or fewer: CFO, CRO, COO, CIO, CHRO, CEO, etc.): credit a title-tier term only when it appears as a **whole word/token** in the headline or post (word boundaries), not as a substring inside an unrelated word (e.g. do not treat "cro" inside "across" as CRO).
 - The rationale is for audit. Keep under 20 words and name the evidence type ('explicit', 'post-explicit', 'inferred')."""
 
 

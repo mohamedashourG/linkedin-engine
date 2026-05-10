@@ -65,7 +65,11 @@ def resolve_profiles(db: Database, slate_run_id: ObjectId) -> dict[str, int]:
         )
     elif not crust_done:
         skipped = db.candidates.count_documents(
-            {"slate_run_id": slate_run_id, "status": "cheap_gate_passed"}
+            {
+                "slate_run_id": slate_run_id,
+                "status": "cheap_gate_passed",
+                "enriched_inline": {"$ne": True},
+            }
         )
         counts["skipped_unconfigured"] = skipped
         log.info(
@@ -79,9 +83,18 @@ def resolve_profiles(db: Database, slate_run_id: ObjectId) -> dict[str, int]:
 def _resolve_via_crustdata(
     db: Database, slate_run_id: ObjectId, counts: dict[str, int]
 ) -> None:
-    """Batched Crustdata person enrichment."""
+    """Batched Crustdata person enrichment.
+
+    Candidates already enriched inline by Unipile's free `/users/{slug}`
+    endpoint (``enriched_inline=True``) are skipped — re-running them
+    through Crustdata would burn ~3 credits/match for fields we already
+    have (title, company, headline)."""
     cursor = db.candidates.find(
-        {"slate_run_id": slate_run_id, "status": "cheap_gate_passed"},
+        {
+            "slate_run_id": slate_run_id,
+            "status": "cheap_gate_passed",
+            "enriched_inline": {"$ne": True},
+        },
         {"author_linkedin_url": 1},
     )
     by_url: dict[str, list[ObjectId]] = {}
@@ -193,9 +206,17 @@ def _resolve_via_pdl(
     *,
     prefer_existing_titles: bool,
 ) -> None:
-    """PDL enrich per candidate (cached by LinkedIn URL in pdl.enrich_by_linkedin_url)."""
+    """PDL enrich per candidate (cached by LinkedIn URL in pdl.enrich_by_linkedin_url).
+
+    Skips Unipile-inline-enriched candidates (``enriched_inline=True``) — PDL
+    would charge per match for data we already pulled for free from Unipile's
+    /users/{slug} endpoint."""
     cursor = db.candidates.find(
-        {"slate_run_id": slate_run_id, "status": "cheap_gate_passed"},
+        {
+            "slate_run_id": slate_run_id,
+            "status": "cheap_gate_passed",
+            "enriched_inline": {"$ne": True},
+        },
     )
     for c in cursor:
         author_url = c.get("author_linkedin_url")

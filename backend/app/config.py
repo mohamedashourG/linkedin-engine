@@ -96,6 +96,40 @@ class Settings(BaseSettings):
     # Cursor-pagination depth for each date window. Each page is one POST;
     # clamped 1-10. With default empty date_window, up to 3 windows × max_pages.
     discovery_unipile_post_max_pages: int = 3
+    # LinkedIn location geo IDs for classic POST /linkedin/search (category=posts).
+    # Comma-separated digit strings (e.g. "103644278" for US). When empty and
+    # discovery_unipile_post_resolve_location is true, discovery resolves the first
+    # ICP geography string via GET /linkedin/search/parameters?type=LOCATION.
+    discovery_unipile_post_location_ids: str = ""
+    discovery_unipile_post_resolve_location: bool = True
+    # When true (default), drop LinkedIn company-authored posts from Unipile
+    # keyword and title-search activity paths (person buyers only).
+    discovery_unipile_skip_company_posts: bool = True
+    # Inline author enrichment + per-operator rubric inside _run_unipile.
+    # Reference: unipile_hybrid_sweep.py (hybrid_sweep + Client 2 scripts).
+    # When enabled, every post returned by Unipile keyword search is:
+    #   1. Author-enriched via free /users/{slug} call (cached cross-run)
+    #   2. Scored: title (5) + industry (3) + geo (2) against operator ICP
+    #   3. Post text scored against operator's tier 1/2/3 keyword pool
+    #   4. Qualified dual-path; non-qualifiers dropped before insert
+    discovery_unipile_inline_rubric_enabled: bool = True
+    # Path A: enriched author rubric ≥ this passes (default 6 — needs at
+    # least title + geo, or industry + geo + something).
+    discovery_unipile_inline_path_a_threshold: int = 6
+    # Path B: post-text keyword relevance ≥ this passes (default 3 —
+    # one tier_1 hit, or two tier_2 hits).
+    discovery_unipile_inline_path_b_threshold: int = 3
+    # Require an author-location geo hit on every qualifying candidate
+    # (when the operator has target_geographies set). Disables only the
+    # geo gate; the rubric thresholds still apply.
+    discovery_unipile_inline_require_geo: bool = True
+    # Cap on /users/{slug} profile fetches per cofounder per run (cache
+    # hits don't count). Protects the LinkedIn account from per-keyword
+    # spike. Reference scripts use 80; we default to 100 to keep ICPs with
+    # bigger keyword pools fully covered.
+    discovery_unipile_max_profile_fetches_per_run: int = 100
+    # Days a cached profile is reused before refetching.
+    discovery_unipile_author_cache_ttl_days: int = 14
     # 14-day no-repeat ledger for keywords (RULE 15) is too aggressive for
     # tenants with small keyword pools (~10-20 kws): they exhaust after one
     # run and sit idle for two weeks. 3 days lets a small pool cycle weekly

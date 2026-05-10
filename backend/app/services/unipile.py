@@ -69,6 +69,12 @@ class UnipilePost:
     author_company: str | None
     author_profile_url: str | None
     published_at: datetime | None
+    author_is_company: bool = False
+    # Provider URN (e.g. ``ACoAA...``). Used as the path component for
+    # ``GET /users/{provider_id}`` when we need to enrich the author's
+    # headline / location / company beyond what the search payload returns.
+    # None when the search response omitted the author id entirely.
+    author_provider_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -182,6 +188,23 @@ def list_accounts() -> list[UnipileAccount]:
 
 # ---------------------------------------------------------------- post search / fetch
 
+
+def _infer_author_is_company(author: dict[str, Any], profile_url: str | None) -> bool:
+    """True when the post actor is a LinkedIn company, not a person.
+
+    Mirrors common Unipile/LinkedIn shapes (`is_company`, `type`, `/company/` URLs)
+    so keyword sweeps can drop brand pages like a lightweight hybrid pipeline."""
+    if author.get("is_company") is True:
+        return True
+    t = str(author.get("type") or author.get("profile_type") or "").upper()
+    if "COMPANY" in t and "PERSON" not in t:
+        return True
+    url = (profile_url or "").lower()
+    if "/company/" in url:
+        return True
+    return False
+
+
 def _parse_unipile_post(raw: dict[str, Any]) -> UnipilePost | None:
     """
     Unipile's LinkedIn post payload nests the author under different keys
@@ -212,6 +235,11 @@ def _parse_unipile_post(raw: dict[str, Any]) -> UnipilePost | None:
     )
     if not url and not raw.get("id"):
         return None
+    prof_url = (
+        author.get("public_profile_url")
+        or author.get("profile_url")
+        or author.get("url")
+    )
     return UnipilePost(
         id=str(raw.get("id") or raw.get("social_id") or raw.get("urn") or ""),
         url=url or "",
@@ -221,9 +249,7 @@ def _parse_unipile_post(raw: dict[str, Any]) -> UnipilePost | None:
         or None,
         author_title=author.get("headline") or author.get("title") or author.get("occupation"),
         author_company=author.get("company") or author.get("company_name"),
-        author_profile_url=author.get("public_profile_url")
-        or author.get("profile_url")
-        or author.get("url"),
+        author_profile_url=str(prof_url).strip() if prof_url else None,
         # Unipile returns `date` as a relative string like "2d" / "3h" — not
         # ISO-parseable. The actual ISO timestamp lives in `parsed_datetime`.
         # Try the ISO fields first; fall back to `date` only for older
@@ -233,6 +259,11 @@ def _parse_unipile_post(raw: dict[str, Any]) -> UnipilePost | None:
             or raw.get("created_at")
             or raw.get("published_at")
             or raw.get("date")
+        ),
+        author_is_company=_infer_author_is_company(author, str(prof_url) if prof_url else None),
+        author_provider_id=(
+            str(author.get("id") or author.get("provider_id") or author.get("urn") or "").strip()
+            or None
         ),
     )
 
@@ -248,6 +279,7 @@ def _post_search_body(
     date_posted: str | None = None,
     content_type: str | list[str] | None = None,
     author_keywords: str | None = None,
+    location_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Shared body builder for the two POST search variants (kw + url).
     `query` is None for the URL-paste variant which has no keywords field."""
@@ -269,6 +301,10 @@ def _post_search_body(
             body["content_type"] = list(content_type)
     if author_keywords and author_keywords.strip():
         body["author"] = {"keywords": author_keywords.strip()[:200]}
+    if location_ids:
+        loc = [str(x).strip() for x in location_ids if str(x).strip()]
+        if loc:
+            body["location"] = loc[:10]
     return body
 
 
@@ -309,6 +345,7 @@ def search_posts(
     date_posted: str | None = None,
     content_type: str | list[str] | None = None,
     author_keywords: str | None = None,
+    location_ids: list[str] | None = None,
 ) -> list[UnipilePost]:
     """LinkedIn keyword post search via Unipile (single page).
 
@@ -323,6 +360,7 @@ def search_posts(
       content_type    e.g. "documents", or ["images", "videos"]
       author_keywords boolean string against the author's headline,
                       e.g. "CEO OR VP OR Founder"
+      location_ids    optional LinkedIn geo id strings (same as people search)
 
     For multi-page walks use `search_posts_pages` instead.
     """
@@ -334,6 +372,7 @@ def search_posts(
         date_posted=date_posted,
         content_type=content_type,
         author_keywords=author_keywords,
+        location_ids=location_ids,
     )
     posts, _next_cursor = _search_posts_call(
         body, account_id=account_id, limit=limit, cursor=None
@@ -351,6 +390,7 @@ def search_posts_pages(
     date_posted: str | None = None,
     content_type: str | list[str] | None = "documents",
     author_keywords: str | None = None,
+    location_ids: list[str] | None = None,
 ) -> list[UnipilePost]:
     """Cursor-walking POST /linkedin/search (classic, category=posts).
 
@@ -362,7 +402,10 @@ def search_posts_pages(
     dedupe by URL/id. When ``date_posted`` is set, only that window is used.
 
     ``max_pages`` applies per date window (each window is clamped to [1, 10]
-    pages)."""
+    pages).
+
+    ``location_ids`` are passed as ``body["location"]`` (up to 10 ids) when set.
+    """
     if settings.unipile_mock or not query.strip():
         return []
     cap = max(1, min(int(max_pages), 10))
@@ -383,6 +426,7 @@ def search_posts_pages(
             date_posted=window,
             content_type=content_type,
             author_keywords=author_keywords,
+            location_ids=location_ids,
         )
         cursor: str | None = None
         for _ in range(cap):
@@ -488,6 +532,149 @@ def search_parameter_ids(
             continue
         out.append(UnipileSearchParameter(id=rid, title=title, type=raw.get("type")))
     return out
+
+
+def _normalize_location_phrase(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _location_query_variants(location_text: str) -> list[str]:
+    """Short keyword strings to try against GET /linkedin/search/parameters.
+
+    LinkedIn/Unipile match better on city or region fragments than on a full
+    postal-style string alone; we still try the full string first."""
+    base = _normalize_location_phrase(location_text)[:200]
+    if len(base) < 2:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(fragment: str) -> None:
+        frag = _normalize_location_phrase(fragment)[:200]
+        if len(frag) < 2:
+            return
+        key = frag.casefold()
+        if key not in seen:
+            seen.add(key)
+            out.append(frag)
+
+    add(base)
+    parts = [p.strip() for p in base.split(",") if p.strip()]
+    for p in parts:
+        add(p)
+    if len(parts) >= 2:
+        add(", ".join(parts[:2]))
+    if len(parts) >= 3:
+        add(", ".join(parts[:3]))
+    word_src = re.sub(r"[^\w\s-]", " ", base)
+    words = [w for w in word_src.split() if len(w) >= 2]
+    if len(words) >= 2:
+        add(" ".join(words[: min(5, len(words))]))
+    if len(words) >= 3:
+        add(" ".join(words[:3]))
+    return out[:8]
+
+
+def _score_location_title_match(wanted: str, title: str) -> float:
+    """How well a PARAMETERS row title matches the user's geography phrase.
+
+    Prefers exact / prefix / LinkedIn-style expansions (e.g. city vs metro)
+    and penalizes unrelated places that merely contain the same substring
+    (e.g. South San Francisco when the ICP asked for San Francisco)."""
+    w = _normalize_location_phrase(wanted).casefold()
+    t = _normalize_location_phrase(title).casefold()
+    if not w or not t:
+        return 0.0
+    if w == t:
+        return 100.0
+    if t.startswith(w + ",") or t.startswith(w + " ") or t.startswith(w + "("):
+        return 95.0
+    if t.startswith(w):
+        return 94.0
+    escaped = re.escape(w)
+    m = re.search(rf"(?<!\w){escaped}\b", t)
+    if not m:
+        if w in t:
+            return 45.0
+        wt = {x for x in re.split(r"\W+", w) if len(x) >= 3}
+        tt = {x for x in re.split(r"\W+", t) if len(x) >= 3}
+        if not wt:
+            return 0.0
+        inter = len(wt & tt)
+        return 25.0 * (inter / len(wt))
+
+    if m.start() == 0:
+        return 90.0
+    before = t[: m.start()].rstrip()
+    if not before:
+        return 90.0
+    if before[-1] in ",(":
+        return 88.0
+    tail = re.search(r"([\w'-]+)$", before)
+    if tail:
+        tw = tail.group(1).casefold()
+        if tw not in w.split() and tw in ("greater", "upper", "lower", "metro"):
+            return 78.0
+        if tw not in w.split():
+            return 35.0
+    return 72.0
+
+
+def resolve_location_ids_from_text(
+    *,
+    account_id: str,
+    location_text: str,
+    max_api_calls: int = 5,
+    limit_per_query: int = 20,
+    max_ids: int = 3,
+    min_score: float = 40.0,
+) -> list[str]:
+    """Resolve free-text geography (e.g. ``San Francisco`` or ``London, UK``)
+    to LinkedIn geo id strings via ``search_parameter_ids`` (type=LOCATION).
+
+    Tries several query variants, merges results, and picks the best title
+    matches so arbitrary ICP strings map to sensible geo filters."""
+    if settings.unipile_mock or not (account_id or "").strip():
+        return []
+    phrase = _normalize_location_phrase(location_text)
+    if len(phrase) < 2:
+        return []
+    variants = _location_query_variants(phrase)
+    if not variants:
+        return []
+    by_id: dict[str, UnipileSearchParameter] = {}
+    calls = 0
+    for kw in variants:
+        if calls >= max_api_calls:
+            break
+        rows = search_parameter_ids(
+            account_id=account_id,
+            type="LOCATION",
+            keywords=kw,
+            limit=limit_per_query,
+        )
+        calls += 1
+        for r in rows:
+            if r.id not in by_id:
+                by_id[r.id] = r
+        if len(by_id) >= 24:
+            break
+    if not by_id:
+        return []
+    scored: list[tuple[float, UnipileSearchParameter]] = []
+    for row in by_id.values():
+        s = _score_location_title_match(phrase, row.title)
+        scored.append((s, row))
+    scored.sort(key=lambda x: (-x[0], x[1].title.casefold()))
+    ids: list[str] = []
+    for score, row in scored:
+        if score < min_score:
+            break
+        if row.id not in ids:
+            ids.append(row.id)
+        if len(ids) >= max_ids:
+            break
+    return ids[:10]
 
 
 def _parse_unipile_person(raw: dict[str, Any]) -> UnipilePerson | None:
