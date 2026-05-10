@@ -43,10 +43,41 @@ export type SlateCofounder = {
   daily_volume_target: number;
 };
 
+export type PipelinePostRef = {
+  id: string;
+  post_url: string;
+  author_name: string | null;
+  post_preview: string;
+  status: string;
+  drop_reason: string | null;
+};
+
+export type PipelineStepBreakdown = {
+  passed: PipelinePostRef[];
+  failed: PipelinePostRef[];
+  pending: PipelinePostRef[];
+  passed_total: number;
+  failed_total: number;
+  pending_total: number;
+  truncated: boolean;
+};
+
+export type PipelineBreakdown = {
+  discovery: PipelineStepBreakdown;
+  verification: PipelineStepBreakdown;
+  profile_resolve: PipelineStepBreakdown;
+  gates: PipelineStepBreakdown;
+  allocator: PipelineStepBreakdown;
+  drafter: PipelineStepBreakdown;
+  rule_23: PipelineStepBreakdown;
+  email_delivery: PipelineStepBreakdown;
+};
+
 export type SlateTodayResponse = {
   slate_run: SlateRun | null;
   candidates: Candidate[];
   cofounders: SlateCofounder[];
+  pipeline: PipelineBreakdown | null;
 };
 
 export const slateApi = {

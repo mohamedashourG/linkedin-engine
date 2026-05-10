@@ -17,6 +17,7 @@ without burning real Unipile calls during dev.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -236,27 +237,59 @@ def _parse_unipile_post(raw: dict[str, Any]) -> UnipilePost | None:
     )
 
 
-def search_posts(*, account_id: str, query: str, limit: int = 20) -> list[UnipilePost]:
-    """
-    LinkedIn keyword post search via Unipile. Uses the connected cofounder's
-    LinkedIn account (account_id) to run the search.
+_VALID_DATE_POSTED = {"past_day", "past_week", "past_month"}
+_VALID_SORT_BY = {"date", "relevance"}
 
-    Endpoint shape from Unipile docs: POST /linkedin/search with
-    {api: 'classic', category: 'posts', keywords: ...}.
-    """
-    if settings.unipile_mock or not query.strip():
-        return []
-    body = {
-        "api": "classic",
-        "category": "posts",
-        "keywords": query[:300],
-    }
+
+def _post_search_body(
+    *,
+    query: str | None = None,
+    sort_by: str | None = "date",
+    date_posted: str | None = None,
+    content_type: str | list[str] | None = None,
+    author_keywords: str | None = None,
+) -> dict[str, Any]:
+    """Shared body builder for the two POST search variants (kw + url).
+    `query` is None for the URL-paste variant which has no keywords field."""
+    body: dict[str, Any] = {"api": "classic", "category": "posts"}
+    if query is not None:
+        body["keywords"] = query[:300]
+    if sort_by:
+        sb = sort_by.lower()
+        if sb in _VALID_SORT_BY:
+            body["sort_by"] = sb
+    if date_posted:
+        dp = date_posted.lower()
+        if dp in _VALID_DATE_POSTED:
+            body["date_posted"] = dp
+    if content_type:
+        if isinstance(content_type, str):
+            body["content_type"] = content_type
+        else:
+            body["content_type"] = list(content_type)
+    if author_keywords and author_keywords.strip():
+        body["author"] = {"keywords": author_keywords.strip()[:200]}
+    return body
+
+
+def _search_posts_call(
+    body: dict[str, Any],
+    *,
+    account_id: str,
+    limit: int,
+    cursor: str | None = None,
+) -> tuple[list[UnipilePost], str | None]:
+    """One POST /linkedin/search call. Returns parsed posts and the next
+    cursor (None when the result set is exhausted).
+
+    **First page:** omit ``cursor`` — sending e.g. ``cursor=1`` triggers
+    Unipile ``invalid_cursor``. **Later pages:** pass the opaque ``cursor``
+    string from the previous JSON response."""
+    params: dict[str, Any] = {"account_id": account_id, "limit": limit}
+    if cursor is not None and str(cursor).strip():
+        params["cursor"] = cursor
     with _client() as client:
-        resp = client.post(
-            "/linkedin/search",
-            params={"account_id": account_id, "limit": limit},
-            json=body,
-        )
+        resp = client.post("/linkedin/search", params=params, json=body)
     payload = _check_resp(resp, "search_posts")
     items = payload.get("items") or payload.get("results") or []
     out: list[UnipilePost] = []
@@ -264,6 +297,196 @@ def search_posts(*, account_id: str, query: str, limit: int = 20) -> list[Unipil
         post = _parse_unipile_post(raw)
         if post:
             out.append(post)
+    return out, payload.get("cursor")
+
+
+def search_posts(
+    *,
+    account_id: str,
+    query: str,
+    limit: int = 50,
+    sort_by: str | None = "relevance",
+    date_posted: str | None = None,
+    content_type: str | list[str] | None = None,
+    author_keywords: str | None = None,
+) -> list[UnipilePost]:
+    """LinkedIn keyword post search via Unipile (single page).
+
+    POST /linkedin/search with {api: 'classic', category: 'posts', ...}.
+    Sales Navigator does NOT have a parallel posts-by-keyword path — its
+    strength is people/account targeting. Per Unipile's docs only the
+    classic API exposes the post-specific filters below.
+
+    Filters (all optional, all server-side):
+      sort_by         "date" (newest first) | "relevance" | None
+      date_posted     "past_day" | "past_week" | "past_month" | None
+      content_type    e.g. "documents", or ["images", "videos"]
+      author_keywords boolean string against the author's headline,
+                      e.g. "CEO OR VP OR Founder"
+
+    For multi-page walks use `search_posts_pages` instead.
+    """
+    if settings.unipile_mock or not query.strip():
+        return []
+    body = _post_search_body(
+        query=query,
+        sort_by=sort_by,
+        date_posted=date_posted,
+        content_type=content_type,
+        author_keywords=author_keywords,
+    )
+    posts, _next_cursor = _search_posts_call(
+        body, account_id=account_id, limit=limit, cursor=None
+    )
+    return posts
+
+
+def search_posts_pages(
+    *,
+    account_id: str,
+    query: str,
+    max_pages: int = 3,
+    per_page: int = 50,
+    sort_by: str | None = "relevance",
+    date_posted: str | None = None,
+    content_type: str | list[str] | None = "documents",
+    author_keywords: str | None = None,
+) -> list[UnipilePost]:
+    """Cursor-walking POST /linkedin/search (classic, category=posts).
+
+    First request per date window omits ``cursor``; follow-up pages use the
+    ``cursor`` value returned in the previous response body.
+
+    When ``date_posted`` is None or empty, runs three passes in order:
+    **past_day** → **past_week** → **past_month**, merging results with
+    dedupe by URL/id. When ``date_posted`` is set, only that window is used.
+
+    ``max_pages`` applies per date window (each window is clamped to [1, 10]
+    pages)."""
+    if settings.unipile_mock or not query.strip():
+        return []
+    cap = max(1, min(int(max_pages), 10))
+    per_page = max(1, min(int(per_page), 50))
+
+    if date_posted and str(date_posted).strip():
+        windows = [date_posted.strip()]
+    else:
+        windows = ["past_day", "past_week", "past_month"]
+
+    seen: set[str] = set()
+    merged: list[UnipilePost] = []
+
+    for window in windows:
+        body = _post_search_body(
+            query=query,
+            sort_by=sort_by,
+            date_posted=window,
+            content_type=content_type,
+            author_keywords=author_keywords,
+        )
+        cursor: str | None = None
+        for _ in range(cap):
+            page, next_cursor = _search_posts_call(
+                body, account_id=account_id, limit=per_page, cursor=cursor
+            )
+            if not page:
+                break
+            for post in page:
+                key = post.url or post.id
+                if key and key not in seen:
+                    seen.add(key)
+                    merged.append(post)
+            if not next_cursor:
+                break
+            cursor = str(next_cursor)
+    return merged
+
+
+def search_posts_by_url(
+    *,
+    account_id: str,
+    search_url: str,
+    max_pages: int = 3,
+    per_page: int = 20,
+) -> list[UnipilePost]:
+    """URL-paste mode — replay a saved LinkedIn search by passing the full
+    URL Unipile parses out the filters server-side, so this is the easiest
+    way to wire up an exact search you've already crafted in the LinkedIn
+    UI (Classic, Sales Nav, or Recruiter posts/people/companies — the URL
+    determines the api+category).
+
+    POST /linkedin/search with {"url": ...}. Walks cursors up to
+    `max_pages` pages, deduped."""
+    if settings.unipile_mock or not search_url.strip():
+        return []
+    cap = max(1, min(int(max_pages), 10))
+    body = {"url": search_url.strip()}
+    seen: set[str] = set()
+    merged: list[UnipilePost] = []
+    cursor: str | None = None
+    for _ in range(cap):
+        page, next_c = _search_posts_call(
+            body, account_id=account_id, limit=per_page, cursor=cursor
+        )
+        if not page:
+            break
+        for post in page:
+            key = post.url or post.id
+            if key and key not in seen:
+                seen.add(key)
+                merged.append(post)
+        if not next_c:
+            break
+        cursor = str(next_c)
+    return merged
+
+
+@dataclass(frozen=True)
+class UnipileSearchParameter:
+    """One row from /linkedin/search/parameters — an id you can pass back
+    into a search body's id-typed filters (location, industry, skill,
+    company, etc.)."""
+    id: str
+    title: str
+    type: str | None = None
+
+
+def search_parameter_ids(
+    *,
+    account_id: str,
+    type: str,
+    keywords: str,
+    limit: int = 20,
+) -> list[UnipileSearchParameter]:
+    """Resolve a free-text query into Unipile/LinkedIn parameter ids.
+
+    GET /linkedin/search/parameters?type=...&keywords=...&account_id=...
+
+    `type` examples: LOCATION, INDUSTRY, COMPANY, SCHOOL, FUNCTION,
+    SENIORITY, SKILL, LANGUAGE, TITLE. See Unipile's "Get LinkedIn Search
+    Parameters API" for the full enum.
+
+    Use the returned `id` values in the corresponding search body field
+    (e.g., `location: ["102448103"]` for Los Angeles)."""
+    if settings.unipile_mock or not keywords.strip() or not type.strip():
+        return []
+    params = {
+        "account_id": account_id,
+        "type": type.strip().upper(),
+        "keywords": keywords.strip()[:200],
+        "limit": max(1, min(int(limit), 100)),
+    }
+    with _client() as client:
+        resp = client.get("/linkedin/search/parameters", params=params)
+    payload = _check_resp(resp, "search_parameter_ids")
+    items = payload.get("items") or []
+    out: list[UnipileSearchParameter] = []
+    for raw in items:
+        rid = str(raw.get("id") or "").strip()
+        title = str(raw.get("title") or raw.get("text") or "").strip()
+        if not rid or not title:
+            continue
+        out.append(UnipileSearchParameter(id=rid, title=title, type=raw.get("type")))
     return out
 
 
@@ -446,6 +669,73 @@ def get_user_posts(
         if post:
             out.append(post)
     return out
+
+
+_POST_URL_ACTIVITY_RE = re.compile(r"activity[:\-](\d{15,25})")
+_POST_URL_UGC_RE = re.compile(r"ugcPost[:\-](\d{15,25})")
+_POST_URL_SHARE_RE = re.compile(r"share[:\-](\d{15,25})")
+
+
+def extract_post_id_from_url(post_url_or_id: str) -> str | None:
+    """Convert a LinkedIn post URL into the `post_id` Unipile expects.
+
+    Per the Unipile API contract:
+      • activity URLs → numeric id (e.g. `7332661864792854528`)
+      • ugcPost URLs  → `urn:li:ugcPost:<id>`
+      • share URLs    → `urn:li:share:<id>`
+
+    If `post_url_or_id` is already in one of these forms (numeric id, or
+    `urn:li:...`), it's returned unchanged. Returns None if no id can be
+    parsed."""
+    if not post_url_or_id:
+        return None
+    s = post_url_or_id.strip()
+    # Already a URN / numeric id.
+    if s.startswith("urn:li:") or (s.isdigit() and len(s) >= 15):
+        return s
+    # ugcPost / share URLs map to URN form per Unipile's docs.
+    m = _POST_URL_UGC_RE.search(s)
+    if m:
+        return f"urn:li:ugcPost:{m.group(1)}"
+    m = _POST_URL_SHARE_RE.search(s)
+    if m:
+        return f"urn:li:share:{m.group(1)}"
+    # activity URLs map to the bare numeric id.
+    m = _POST_URL_ACTIVITY_RE.search(s)
+    if m:
+        return m.group(1)
+    return None
+
+
+def get_post(*, account_id: str, post_id_or_url: str) -> UnipilePost | None:
+    """Fetch the details of a single LinkedIn post.
+
+    Wraps `GET /posts/{post_id}?account_id=...`. `post_id_or_url` can be a
+    Unipile post_id (numeric for activity, `urn:li:ugcPost:...` /
+    `urn:li:share:...` for the other forms) or a LinkedIn post URL — the
+    URL is converted to the right id form via `extract_post_id_from_url`.
+
+    Returns None when the post cannot be parsed into an id, when Unipile
+    returns 404 (not found / hidden), or when the response cannot be
+    parsed.
+    """
+    if not account_id:
+        raise UnipileError("get_post: account_id required")
+    if settings.unipile_mock:
+        return None
+    post_id = extract_post_id_from_url(post_id_or_url)
+    if not post_id:
+        return None
+
+    with _client() as client:
+        resp = client.get(
+            f"/posts/{post_id}",
+            params={"account_id": account_id},
+        )
+    if resp.status_code == 404:
+        return None
+    payload = _check_resp(resp, "get_post")
+    return _parse_unipile_post(payload)
 
 
 # ---------------------------------------------------------------- comments

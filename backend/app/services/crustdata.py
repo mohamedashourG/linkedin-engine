@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import hmac
 import logging
 import threading
@@ -245,13 +246,36 @@ def _client() -> httpx.Client:
     )
 
 
-def _post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _post(
+    path: str,
+    payload: dict[str, Any],
+    *,
+    log_label: str | None = None,
+) -> dict[str, Any]:
+    """POST JSON to Crustdata. When ``log_label`` is set (e.g. watcher register),
+    logs full request JSON and full response body to Docker/backend logs."""
+    if log_label:
+        log.info(
+            "%s.request path=%s body=%s",
+            log_label,
+            path,
+            json.dumps(payload, ensure_ascii=False, default=str),
+        )
     _check_circuit()
     with _client() as client:
         try:
             resp = client.post(path, json=payload)
         except httpx.RequestError as err:
+            if log_label:
+                log.warning("%s.transport_error err=%s", log_label, err)
             raise CrustdataError(f"crustdata transport error: {err}") from err
+    if log_label:
+        log.info(
+            "%s.http_response status=%s body=%s",
+            log_label,
+            resp.status_code,
+            resp.text,
+        )
     if resp.status_code in (401, 402):
         _trip_circuit()
         raise CrustdataQuotaExhausted(
@@ -308,12 +332,16 @@ def register_keyword_watch(
     }
     path = _SIMULATION_PATH if simulation else _PRODUCTION_PATH
     log.info(
-        "crustdata.register: cofounder=%s simulation=%s endpoint=%s",
+        "crustdata.register: cofounder=%s simulation=%s path=%s",
         cofounder_id,
         simulation,
-        notification_endpoint,
+        path,
     )
-    return _post(path, payload)
+    return _post(
+        path,
+        payload,
+        log_label=f"crustdata.watch[{cofounder_id}]",
+    )
 
 
 def list_watches() -> list[dict[str, Any]]:
@@ -328,6 +356,11 @@ def list_watches() -> list[dict[str, Any]]:
         raise CrustdataQuotaExhausted(
             f"crustdata {resp.status_code}: {resp.text[:300]}"
         )
+    # Crustdata returns 404 "Watch not found" instead of an empty list when
+    # no watches exist for this account. Treat that as "no watches" rather
+    # than as an error.
+    if resp.status_code == 404:
+        return []
     if resp.status_code >= 400:
         raise CrustdataError(f"crustdata {resp.status_code}: {resp.text[:300]}")
     body = resp.json() if resp.content else []

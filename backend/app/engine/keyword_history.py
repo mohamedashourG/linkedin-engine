@@ -1,10 +1,14 @@
 """
 Per-query no-repeat ledger (RULE 15 / RULE 15-EXT / RULE 24).
 
-Each (operator_id, source_channel, query) tuple is recorded the first time
-the engine uses it. Subsequent runs filter out queries used in the last
-14 days, so the engine doesn't burn API credits or LinkedIn-account quota
-on the same query day after day.
+When ``settings.discovery_keyword_history_enabled`` is true, each
+(operator_id, source_channel, query) tuple is recorded the first time the
+engine uses it. Subsequent runs filter out queries used in the lookback
+window so the engine does not burn API credits or LinkedIn-account quota on
+the same query day after day.
+
+When that setting is false (default), ``filter_unused`` returns every query
+and ``mark_used`` does nothing — keywords may repeat every run.
 
 Schema:
     keyword_history:
@@ -28,7 +32,11 @@ from pymongo.database import Database
 
 from app.models.common import utcnow
 
-DEFAULT_LOOKBACK_DAYS = 14
+from app.config import get_settings, settings
+
+# Fallback when no override comes via settings (kept for callers that still
+# pass through to the constant). Settings takes precedence at call time.
+DEFAULT_LOOKBACK_DAYS = settings.keyword_history_lookback_days or 14
 
 
 def filter_unused(
@@ -42,6 +50,8 @@ def filter_unused(
     """Return the subset of `queries` that have NOT been used by this
     operator on this channel within the last `days`. Order preserved."""
     queries = [q for q in queries if q]
+    if not get_settings().discovery_keyword_history_enabled:
+        return queries
     if not queries:
         return []
     cutoff = utcnow() - timedelta(days=days)
@@ -69,6 +79,8 @@ def mark_used(
     """Record that `query` was used. Resets last_used_at and bumps the
     expires_at on each call so the ledger always reflects the most recent
     use of a given query."""
+    if not get_settings().discovery_keyword_history_enabled:
+        return
     if not query:
         return
     now = utcnow()

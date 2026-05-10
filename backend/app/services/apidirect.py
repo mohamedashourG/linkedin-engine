@@ -1,11 +1,13 @@
 """
-Sync httpx client for apidirect.io's LinkedIn Search Posts endpoint.
+Sync httpx client for apidirect.io LinkedIn endpoints (same vendor / API key):
 
-Endpoint shape derived from gtm-engine's existing apidirect_client (same vendor,
-same keys):
-  GET https://apidirect.io/v1/linkedin/posts?query=...&page=1
-  Header: X-API-Key: <key>
-  Response: {"posts": [{url, title, domain, snippet, date, authors, source}]}
+  GET https://apidirect.io/v1/linkedin/posts?query=...&page=1  — search
+  GET https://apidirect.io/v1/linkedin/post?url=...             — single post
+
+Header: X-API-Key: <key>
+
+Search response: {"posts": [{url, title, domain, snippet, date, author | authors, ...}]}
+Post details: single JSON object with text, author, author_url, urn, ...
 
 Concurrency: spec says 3 concurrent per endpoint per user; a threading semaphore
 keeps the engine within that bound when called from multiple Celery tasks.
@@ -60,11 +62,15 @@ class LinkedInPost:
 
     @classmethod
     def from_api(cls, raw: dict[str, Any]) -> "LinkedInPost":
+        # Vendor docs use singular `author` (string); older payloads used `authors`.
         authors = raw.get("authors")
         if isinstance(authors, list):
             author = authors[0] if authors else None
+        elif isinstance(authors, str) and authors.strip():
+            author = authors.strip()
         else:
-            author = authors
+            a = raw.get("author")
+            author = a.strip() if isinstance(a, str) and a.strip() else None
         return cls(
             url=raw["url"],
             title=raw.get("title", "") or "",
@@ -73,6 +79,47 @@ class LinkedInPost:
             domain=raw.get("domain"),
             published_at=_parse_iso(raw.get("date")),
             source=raw.get("source"),
+        )
+
+
+@dataclass(frozen=True)
+class LinkedInPostDetails:
+    """Response shape for GET /v1/linkedin/post (single-post enrichment)."""
+
+    url: str
+    text: str
+    author: str | None
+    author_url: str | None
+    author_description: str | None
+    published_at: datetime | None
+    urn: str | None
+    is_repost: bool | None
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> "LinkedInPostDetails":
+        ir = raw.get("is_repost")
+        is_repost = ir if isinstance(ir, bool) else None
+        tx = raw.get("text")
+        text = tx.strip() if isinstance(tx, str) else ""
+        au = raw.get("author_url")
+        author_url = au.strip() if isinstance(au, str) and au.strip() else None
+        ad = raw.get("author_description")
+        author_description = ad if isinstance(ad, str) else None
+        an = raw.get("author")
+        author = an.strip() if isinstance(an, str) and an.strip() else None
+        u = raw.get("url")
+        url = u.strip() if isinstance(u, str) and u.strip() else ""
+        urn_raw = raw.get("urn")
+        urn = urn_raw.strip() if isinstance(urn_raw, str) and urn_raw.strip() else None
+        return cls(
+            url=url,
+            text=text,
+            author=author,
+            author_url=author_url,
+            author_description=author_description,
+            published_at=_parse_iso(raw.get("date")),
+            urn=urn,
+            is_repost=is_repost,
         )
 
 
@@ -177,6 +224,63 @@ def search_linkedin_posts_pages(query: str, *, max_pages: int) -> list[LinkedInP
     return merged
 
 
+def get_linkedin_post_details(url: str) -> LinkedInPostDetails | None:
+    """GET /v1/linkedin/post — full post + author profile URL, text, URN.
+
+    Returns None on 404 or empty body. Raises ApiDirectQuotaExhausted on 402."""
+    url = (url or "").strip()
+    if not url:
+        return None
+    if settings.apidirect_mock:
+        return _mock_post_details(url)
+    _check_circuit()
+
+    params: dict[str, Any] = {"url": url[:500]}
+    if settings.discovery_apidirect_post_details_get_sentiment:
+        params["get_sentiment"] = "true"
+
+    with _concurrency:
+        try:
+            with _client() as client:
+                resp = client.get("/v1/linkedin/post", params=params)
+        except httpx.RequestError as err:
+            raise ApiDirectError(f"apidirect transport error: {err}") from err
+
+    if resp.status_code == 402:
+        _trip_circuit()
+        raise ApiDirectQuotaExhausted(
+            f"apidirect 402 quota exhausted: {resp.text[:300]}"
+        )
+    if resp.status_code == 401:
+        raise ApiDirectError(f"apidirect 401 auth failure: {resp.text[:300]}")
+    if resp.status_code == 429:
+        raise ApiDirectError(f"apidirect 429 rate limit: {resp.text[:300]}")
+    if resp.status_code == 404:
+        log.warning("apidirect post details 404 url=%s", url[:120])
+        return None
+    if resp.status_code >= 400:
+        log.warning(
+            "apidirect post details %s url=%s body=%s",
+            resp.status_code,
+            url[:120],
+            resp.text[:200],
+        )
+        return None
+
+    try:
+        raw = resp.json()
+    except ValueError:
+        log.warning("apidirect post details invalid JSON url=%s", url[:120])
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return LinkedInPostDetails.from_api(raw)
+    except (KeyError, TypeError) as err:
+        log.warning("apidirect post details parse skipped: %s url=%s", err, url[:120])
+        return None
+
+
 # ---------------------------------------------------------------- mock mode
 # Hand-curated dataset for offline demos / when apidirect quota is dry. Each
 # post is intentionally varied so the 4-gate filter has something to actually
@@ -279,6 +383,26 @@ _MOCK_DATASET: list[dict[str, str]] = [
         ),
     },
 ]
+
+
+def _mock_post_details(url: str) -> LinkedInPostDetails | None:
+    """Offline enrichment aligned with `_MOCK_DATASET` URLs."""
+    for raw in _MOCK_DATASET:
+        if raw["url"] == url:
+            slug = url.rstrip("/").rsplit("/", 1)[-1].split("-activity-")[0]
+            fake_profile = f"https://www.linkedin.com/in/{slug[:48]}"
+            return LinkedInPostDetails(
+                url=url,
+                text=raw["snippet"],
+                author=raw["author"],
+                author_url=fake_profile,
+                author_description=None,
+                published_at=None,
+                urn=None,
+                is_repost=False,
+            )
+    log.warning("apidirect MOCK: no post details for url=%s", url[:120])
+    return None
 
 
 def _mock_search(query: str) -> list[LinkedInPost]:

@@ -16,6 +16,7 @@ from app.auth.deps import CurrentUser
 from app.celery_app import daily_run as daily_run_task
 from app.database import get_db
 from app.models.common import utcnow
+from app.routes.slate_pipeline import compute_pipeline_breakdown
 
 router = APIRouter(prefix="/api/slate", tags=["slate"])
 
@@ -54,10 +55,41 @@ class SlateRunPublic(BaseModel):
     stage_note: str | None = None
 
 
+class PipelinePostRef(BaseModel):
+    id: str
+    post_url: str
+    author_name: str | None = None
+    post_preview: str = ""
+    status: str = ""
+    drop_reason: str | None = None
+
+
+class PipelineStepBreakdownPublic(BaseModel):
+    passed: list[PipelinePostRef]
+    failed: list[PipelinePostRef]
+    pending: list[PipelinePostRef] = Field(default_factory=list)
+    passed_total: int
+    failed_total: int
+    pending_total: int
+    truncated: bool
+
+
+class PipelineBreakdownPublic(BaseModel):
+    discovery: PipelineStepBreakdownPublic
+    verification: PipelineStepBreakdownPublic
+    profile_resolve: PipelineStepBreakdownPublic
+    gates: PipelineStepBreakdownPublic
+    allocator: PipelineStepBreakdownPublic
+    drafter: PipelineStepBreakdownPublic
+    rule_23: PipelineStepBreakdownPublic
+    email_delivery: PipelineStepBreakdownPublic
+
+
 class SlateTodayResponse(BaseModel):
     slate_run: SlateRunPublic | None
     candidates: list[CandidatePublic]
     cofounders: list[dict[str, Any]]
+    pipeline: PipelineBreakdownPublic | None = None
 
 
 def _candidate_to_public(c: dict[str, Any]) -> CandidatePublic:
@@ -136,14 +168,21 @@ async def get_today(
         )
 
     candidates_raw: list[dict[str, Any]] = []
+    pipeline: PipelineBreakdownPublic | None = None
     if slate:
-        cursor = db.candidates.find(
-            {
-                "slate_run_id": slate["_id"],
-                "status": {"$in": ["slated", "shipped", "dropped_by_user"]},
-            }
+        all_for_run = await db.candidates.find(
+            {"slate_run_id": slate["_id"]}
+        ).to_list(length=None)
+        pipeline_raw = compute_pipeline_breakdown(
+            all_for_run,
+            slate_status=str(slate.get("status") or "building"),
+            email_sent=bool(slate.get("email_sent", False)),
         )
-        candidates_raw = await cursor.to_list(length=None)
+        pipeline = PipelineBreakdownPublic.model_validate(pipeline_raw)
+
+        candidates_raw = [
+            c for c in all_for_run if c.get("status") in ("slated", "shipped", "dropped_by_user")
+        ]
         # Sort in Python — Mongo can't easily order by a nested gate_results
         # path while also grouping by cofounder. Within each cofounder we
         # rank by ICP score descending so the frontend's #1..N badge
@@ -167,6 +206,7 @@ async def get_today(
         slate_run=_slate_to_public(slate) if slate else None,
         candidates=[_candidate_to_public(c) for c in candidates_raw],
         cofounders=cofounders_serialized,
+        pipeline=pipeline,
     )
 
 

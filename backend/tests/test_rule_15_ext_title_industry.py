@@ -9,9 +9,16 @@ Tests:
 """
 from __future__ import annotations
 
+import pytest
 from bson import ObjectId
 
+from app.config import settings
 from app.engine import keyword_history
+
+
+@pytest.fixture(autouse=True)
+def _keyword_history_ledger_enabled(monkeypatch):
+    monkeypatch.setattr(settings, "discovery_keyword_history_enabled", True)
 from app.engine.constants import DISCOVERY_TITLE_INDUSTRY_PER_RUN
 from app.services import client_config
 

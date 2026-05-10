@@ -10,9 +10,17 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import pytest
 from bson import ObjectId
 
+from app.config import settings
 from app.engine import keyword_history
+
+
+@pytest.fixture(autouse=True)
+def _keyword_history_ledger_enabled(monkeypatch):
+    """Unit tests below assert Mongo-backed ledger behavior."""
+    monkeypatch.setattr(settings, "discovery_keyword_history_enabled", True)
 from app.engine.stages.discovery import _candidate_doc
 
 
@@ -184,6 +192,22 @@ def test_mark_used_is_idempotent():
     # Second call should update, not insert a duplicate.
     matching = [d for d in db.keyword_history.docs if d.get("query") == "x"]
     assert len(matching) == 1
+
+
+def test_ledger_disabled_skips_mongo_and_passes_all_queries(monkeypatch):
+    monkeypatch.setattr(settings, "discovery_keyword_history_enabled", False)
+    db = _DB()
+    op = ObjectId()
+    keyword_history.mark_used(
+        db, operator_id=op, source_channel="keyword_topical", query="x"
+    )
+    assert db.keyword_history.docs == []
+    assert keyword_history.filter_unused(
+        db,
+        operator_id=op,
+        source_channel="keyword_topical",
+        queries=["pharma launch readiness", "VP Sales biotech"],
+    ) == ["pharma launch readiness", "VP Sales biotech"]
 
 
 # ---- candidate doc tagging ----

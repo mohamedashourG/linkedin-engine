@@ -44,6 +44,18 @@ class Rule23ForceAbort(RuntimeError):
         self.details = details or {}
 
 
+def _all_bypass_gates(drafted: list[dict[str, Any]]) -> bool:
+    """True when every drafted row is a contact-direct Unipile bypass candidate.
+
+    Discovery tags those with bypass_gates=True (operator-curated contacts).
+    For those slates we skip RULE 23 floor layers so small lists and
+    per-cofounder targets don't force-abort after drafting.
+    """
+    if not drafted:
+        return False
+    return all(bool(c.get("bypass_gates")) for c in drafted)
+
+
 def seal_slate(
     db: Database,
     *,
@@ -58,69 +70,91 @@ def seal_slate(
         db.candidates.find({"slate_run_id": slate_run_id, "status": "drafted"})
     )
 
-    # Layer 1 — operator-level floors (RULE 2: 50 target / 30 hard / 25 abort).
-    # < abort_floor      → force_abort (engine refuses to ship)
-    # < hard_floor       → audit warning, do NOT abort (operator-visible signal)
-    # ≥ hard_floor       → silent pass
-    abort_floor = int(operator.get("abort_floor") or 25)
-    hard_floor = int(operator.get("hard_floor") or 30)
-    if len(drafted) < abort_floor:
-        _abort(
-            db,
-            slate_run_id,
-            validations,
-            reason="floor_breach",
-            layer="floor",
-            details={
-                "drafted": len(drafted),
-                "abort_floor": abort_floor,
-                "hard_floor": hard_floor,
-            },
+    skip_floor_layers = _all_bypass_gates(drafted)
+    if skip_floor_layers:
+        log.info(
+            "RULE 23: skipping operator + cofounder floor layers "
+            "(all %d drafted rows are contact-direct bypass)",
+            len(drafted),
         )
-    if len(drafted) < hard_floor:
-        db.audit_records.insert_one(
+        validations.append(
             {
-                "operator_id": operator_id,
-                "event_type": "floor_warn",
-                "slate_run_id": slate_run_id,
-                "details": {
-                    "drafted": len(drafted),
-                    "hard_floor": hard_floor,
-                    "abort_floor": abort_floor,
-                },
-                "severity": "warn",
-                "created_at": utcnow(),
+                "layer": "floor",
+                "pass": True,
+                "details": {"skipped": True, "reason": "contact_direct_bypass"},
             }
         )
-        log.warning(
-            "RULE 2: drafted=%d below hard_floor=%d (abort_floor=%d) — slate ships with warning",
-            len(drafted),
-            hard_floor,
-            abort_floor,
+        validations.append(
+            {
+                "layer": "cofounder_floor",
+                "pass": True,
+                "details": {"skipped": True, "reason": "contact_direct_bypass"},
+            }
         )
-    validations.append({"layer": "floor", "pass": True})
-
-    # Layer 2 — per-cofounder floor
-    counts = {cf["_id"]: 0 for cf in cofounders}
-    for c in drafted:
-        counts[c["cofounder_id"]] = counts.get(c["cofounder_id"], 0) + 1
-    for cf in cofounders:
-        target = int(cf.get("daily_volume_target") or 20)
-        floor = max(1, int(target * COFOUNDER_TARGET_FLOOR_RATIO))
-        if counts.get(cf["_id"], 0) < floor:
+    else:
+        # Layer 1 — operator-level floors (RULE 2: 50 target / 30 hard / 25 abort).
+        # < abort_floor      → force_abort (engine refuses to ship)
+        # < hard_floor       → audit warning, do NOT abort (operator-visible signal)
+        # ≥ hard_floor       → silent pass
+        abort_floor = int(operator.get("abort_floor") or 25)
+        hard_floor = int(operator.get("hard_floor") or 30)
+        if len(drafted) < abort_floor:
             _abort(
                 db,
                 slate_run_id,
                 validations,
-                reason="cofounder_imbalance",
-                layer="cofounder_floor",
+                reason="floor_breach",
+                layer="floor",
                 details={
-                    "cofounder_id": str(cf["_id"]),
-                    "got": counts.get(cf["_id"], 0),
-                    "floor": floor,
+                    "drafted": len(drafted),
+                    "abort_floor": abort_floor,
+                    "hard_floor": hard_floor,
                 },
             )
-    validations.append({"layer": "cofounder_floor", "pass": True})
+        if len(drafted) < hard_floor:
+            db.audit_records.insert_one(
+                {
+                    "operator_id": operator_id,
+                    "event_type": "floor_warn",
+                    "slate_run_id": slate_run_id,
+                    "details": {
+                        "drafted": len(drafted),
+                        "hard_floor": hard_floor,
+                        "abort_floor": abort_floor,
+                    },
+                    "severity": "warn",
+                    "created_at": utcnow(),
+                }
+            )
+            log.warning(
+                "RULE 2: drafted=%d below hard_floor=%d (abort_floor=%d) — slate ships with warning",
+                len(drafted),
+                hard_floor,
+                abort_floor,
+            )
+        validations.append({"layer": "floor", "pass": True})
+
+        # Layer 2 — per-cofounder floor
+        counts = {cf["_id"]: 0 for cf in cofounders}
+        for c in drafted:
+            counts[c["cofounder_id"]] = counts.get(c["cofounder_id"], 0) + 1
+        for cf in cofounders:
+            target = int(cf.get("daily_volume_target") or 20)
+            floor = max(1, int(target * COFOUNDER_TARGET_FLOOR_RATIO))
+            if counts.get(cf["_id"], 0) < floor:
+                _abort(
+                    db,
+                    slate_run_id,
+                    validations,
+                    reason="cofounder_imbalance",
+                    layer="cofounder_floor",
+                    details={
+                        "cofounder_id": str(cf["_id"]),
+                        "got": counts.get(cf["_id"], 0),
+                        "floor": floor,
+                    },
+                )
+        validations.append({"layer": "cofounder_floor", "pass": True})
 
     # Layer 3 — comment_text invariants (RULE 5 + min length).
     for c in drafted:

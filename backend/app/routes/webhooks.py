@@ -17,6 +17,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
+from app.config import settings
 from app.database import get_db
 from app.models.common import utcnow
 from app.services.attribution import attribute_booking
@@ -138,7 +139,19 @@ async def crustdata_inbound(
     try:
         payload = json.loads(raw_body or b"null")
     except json.JSONDecodeError:
+        log.warning(
+            "crustdata.webhook invalid JSON cofounder=%s raw_prefix=%r",
+            cofounder_id,
+            (raw_body[:2000] if raw_body else b""),
+        )
         raise HTTPException(400, "invalid JSON")
+
+    if settings.app_env == "dev" or settings.crustdata_log_full_webhook_payload:
+        log.info(
+            "crustdata.webhook full_json cofounder=%s body=%s",
+            cofounder_id,
+            json.dumps(payload, ensure_ascii=False, default=str),
+        )
 
     posts: list[dict[str, Any]]
     if payload is None:

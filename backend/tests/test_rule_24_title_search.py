@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 from bson import ObjectId
 
+from app.config import settings
 from app.engine import keyword_history
 from app.engine.constants import (
     DISCOVERY_TITLE_SEARCH_PEOPLE_PER_QUERY,
@@ -27,6 +28,11 @@ from app.services.unipile import (
     UnipilePerson,
     UnipilePost,
 )
+
+
+@pytest.fixture(autouse=True)
+def _keyword_history_ledger_enabled(monkeypatch):
+    monkeypatch.setattr(settings, "discovery_keyword_history_enabled", True)
 
 
 # ---- audit constants ----

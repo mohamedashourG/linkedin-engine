@@ -42,6 +42,13 @@ const STAGE_ORDER = [
   "email_delivery",
 ];
 
+/** discovery_topup_N uses the same stepper slot as discovery */
+function normalizeStageId(s: string | null | undefined): string {
+  if (!s) return "";
+  if (s.startsWith("discovery")) return "discovery";
+  return s;
+}
+
 function formatEta(seconds: number | null | undefined): string {
   if (!seconds || seconds <= 0) return "";
   if (seconds < 60) return `~${seconds}s`;
@@ -64,12 +71,23 @@ function useElapsed(startedAt: string | null | undefined) {
 }
 
 export function RunProgress({ slate }: { slate: SlateRun }) {
-  const stage = slate.current_stage ?? "";
+  const sealed = slate.status === "sealed";
+  const aborted = slate.status === "force_aborted";
+  const rawStage = slate.current_stage ?? "";
+  const normalized = normalizeStageId(rawStage);
+  const stage = aborted
+    ? "aborted"
+    : sealed
+      ? "complete"
+      : normalized === "complete"
+        ? "complete"
+        : normalized || rawStage;
   const cfg = STAGE_LABEL[stage] ?? { label: stage || "Idle", icon: Brain };
   const Icon = cfg.icon;
   const elapsedSinceStage = useElapsed(slate.stage_started_at);
   const eta = slate.stage_eta_seconds ?? 0;
-  const adjustedEta = Math.max(0, eta - elapsedSinceStage);
+  const adjustedEta =
+    sealed || aborted ? 0 : Math.max(0, eta - elapsedSinceStage);
 
   const processed = slate.stage_progress?.processed ?? 0;
   const total = slate.stage_progress?.total ?? 0;
@@ -77,13 +95,33 @@ export function RunProgress({ slate }: { slate: SlateRun }) {
     total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : null;
 
   // Overall pipeline percent: weight stages roughly by observed time spent.
-  const stageIdx = STAGE_ORDER.indexOf(stage);
+  let stageIdx: number;
+  if (sealed || stage === "complete") {
+    stageIdx = STAGE_ORDER.length;
+  } else if (stage === "aborted") {
+    stageIdx = -1;
+  } else {
+    const stepId =
+      STAGE_ORDER.includes(stage) ? stage : STAGE_ORDER.includes(normalized) ? normalized : "";
+    stageIdx = stepId ? STAGE_ORDER.indexOf(stepId) : -1;
+  }
   const STAGE_WEIGHTS = [3, 1, 5, 75, 1, 8, 1, 6]; // matches observed run mix
   const totalWeight = STAGE_WEIGHTS.reduce((a, b) => a + b, 0);
   let overallPct = 0;
-  if (stage === "complete") {
+  if (sealed || stage === "complete") {
     overallPct = 100;
-  } else if (stageIdx >= 0) {
+  } else if (aborted) {
+    overallPct = Math.min(
+      99,
+      stageIdx >= 0
+        ? Math.round(
+            (STAGE_WEIGHTS.slice(0, Math.max(0, stageIdx)).reduce((a, b) => a + b, 0) /
+              totalWeight) *
+              100,
+          )
+        : 0,
+    );
+  } else if (stageIdx >= 0 && stageIdx < STAGE_ORDER.length) {
     const before = STAGE_WEIGHTS.slice(0, stageIdx).reduce((a, b) => a + b, 0);
     const within =
       stagePct !== null ? (STAGE_WEIGHTS[stageIdx] * stagePct) / 100 : 0;
@@ -109,7 +147,9 @@ export function RunProgress({ slate }: { slate: SlateRun }) {
           <div>
             <div className="text-sm font-semibold">{cfg.label}</div>
             <div className="text-xs text-muted-foreground">
-              {slate.stage_note ?? "Building today's slate"}
+              {sealed
+                ? "Run finished — see posts per step below."
+                : (slate.stage_note ?? "Building today's slate")}
             </div>
           </div>
         </div>
@@ -124,7 +164,7 @@ export function RunProgress({ slate }: { slate: SlateRun }) {
               {formatEta(adjustedEta)} remaining
             </Badge>
           )}
-          {elapsedSinceStage > 0 && stage !== "complete" && (
+          {elapsedSinceStage > 0 && stage !== "complete" && !sealed && (
             <Badge variant="muted" className="rounded-full font-mono text-[11px]">
               elapsed {formatEta(elapsedSinceStage)}
             </Badge>
@@ -152,8 +192,16 @@ export function RunProgress({ slate }: { slate: SlateRun }) {
       {/* Per-stage stepper */}
       <div className="grid grid-cols-8 gap-1">
         {STAGE_ORDER.map((s, i) => {
-          const done = stage === "complete" || (stageIdx >= 0 && i < stageIdx);
-          const active = i === stageIdx && stage !== "complete";
+          const done =
+            stage === "complete" ||
+            sealed ||
+            (stageIdx >= 0 && i < stageIdx);
+          const active =
+            !aborted &&
+            !sealed &&
+            stage !== "complete" &&
+            stageIdx >= 0 &&
+            i === stageIdx;
           const cfg2 = STAGE_LABEL[s];
           return (
             <div

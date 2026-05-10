@@ -108,6 +108,10 @@ def verify_candidates(
             else _MIN_SNIPPET_CHARS
         )
         if not url or len(snippet) < min_len:
+            log.info(
+                "│  [DROP/verify] %s  ←  empty_or_thin_snippet",
+                (url or "<no-url>")[:90],
+            )
             db.candidates.update_one(
                 {"_id": c["_id"]},
                 {
@@ -132,6 +136,10 @@ def verify_candidates(
                 )
             )
             if not _haystack_matches_geo(hay, geos):
+                log.info(
+                    "│  [DROP/verify] %s  ←  geo_not_in_post_or_author",
+                    url[:90],
+                )
                 db.candidates.update_one(
                     {"_id": c["_id"]},
                     {
@@ -151,6 +159,11 @@ def verify_candidates(
         if cutoff is not None:
             published = _coerce_datetime(c.get("post_published_at"))
             if published is not None and published < cutoff:
+                log.info(
+                    "│  [DROP/verify] %s  ←  too_old (>%dd)",
+                    url[:90],
+                    max_age_days,
+                )
                 db.candidates.update_one(
                     {"_id": c["_id"]},
                     {

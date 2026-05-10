@@ -1,15 +1,18 @@
 """
 Discovery stage: 5-source priority pipeline.
 
-  1. apidirect synchronous keyword search — primary source. Fast + cheap
-     keyword-based LinkedIn post search. Skipped when not configured, in
-     mock mode, or circuit-broken (402 quota).
-  2. Exa semantic LinkedIn search — high-volume neural search, ~50 posts/call.
-  3. Crustdata inbox drain — pre-filtered posts pushed asynchronously by
+  1. Crustdata inbox drain — first layer: pre-filtered posts pushed by
      Crustdata's `linkedin-post-with-keyword` watch (keyword + author_title
-     + industry + post_intent + headcount, all evaluated upstream).
-  4. Unipile keyword + seed-author search — runs against the cofounder's
-     connected LinkedIn account. Acts as a fallback / supplemental source.
+     + industry + post_intent + headcount, evaluated upstream). Zero API
+     calls during drain; rows arrive via webhook between runs.
+  2. apidirect synchronous keyword search — fast + cheap keyword LinkedIn
+     post search. Skipped when not configured, in mock mode, or circuit-broken
+     (402 quota).
+  3. Exa semantic LinkedIn search — high-volume neural search, ~50 posts/call.
+  4. Unipile LinkedIn post keyword search — `search_posts_pages` (classic API,
+     omit cursor on first page then paginate; optional past_day → past_week →
+     past_month). RULE 24 title-search runs here when enabled. Profile post
+     fetch is contact-only via `_run_contact_seeds_unipile`.
   5. Contact seeds — imported contacts (CSV/Excel/manual) searched via
      apidirect + Exa by name/title/company. Tagged source="contact_seed".
 
@@ -26,6 +29,7 @@ import logging
 import random
 import re
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from bson import ObjectId
@@ -54,6 +58,8 @@ from app.services.apidirect import (
     ApiDirectNotConfigured,
     ApiDirectQuotaExhausted,
     LinkedInPost as ApiDirectPost,
+    LinkedInPostDetails,
+    get_linkedin_post_details,
     search_linkedin_posts_pages,
 )
 from app.services.exa import (
@@ -71,7 +77,7 @@ from app.services.unipile import (
     UnipilePost,
     get_user_posts,
     search_people,
-    search_posts,
+    search_posts_pages,
 )
 
 log = logging.getLogger(__name__)
@@ -280,6 +286,23 @@ def _doc_from_unipile(
     )
 
 
+def _apidirect_optional_details(post_url: str) -> LinkedInPostDetails | None:
+    """GET /v1/linkedin/post when enabled; quota exhaustion propagates."""
+    if not settings.discovery_apidirect_fetch_post_details:
+        return None
+    try:
+        return get_linkedin_post_details(post_url)
+    except ApiDirectQuotaExhausted:
+        raise
+    except ApiDirectError as err:
+        log.warning(
+            "discovery: apidirect post details failed url=%s err=%s",
+            post_url[:120],
+            err,
+        )
+        return None
+
+
 def _doc_from_apidirect(
     post: ApiDirectPost,
     *,
@@ -289,19 +312,36 @@ def _doc_from_apidirect(
     source_keyword: str,
     source_classification: str,
     source_channel: str = "keyword_topical",
+    details: LinkedInPostDetails | None = None,
 ) -> dict[str, Any]:
+    author_name = post.author
+    author_linkedin_url = None
+    post_text = post.snippet or post.title or ""
+    post_published_at = post.published_at
+    post_id: str | None = None
+    if details is not None:
+        if details.author:
+            author_name = details.author
+        if details.author_url:
+            author_linkedin_url = details.author_url
+        if details.text.strip():
+            post_text = details.text.strip()
+        if details.published_at is not None:
+            post_published_at = details.published_at
+        if details.urn:
+            post_id = details.urn
     return _candidate_doc(
         operator_id=operator_id,
         cofounder_id=cofounder_id,
         slate_run_id=slate_run_id,
         post_url=post.url,
-        post_id=None,
-        author_name=post.author,
+        post_id=post_id,
+        author_name=author_name,
         author_title=None,
         author_company=None,
-        author_linkedin_url=None,
-        post_text=post.snippet or post.title or "",
-        post_published_at=post.published_at,
+        author_linkedin_url=author_linkedin_url,
+        post_text=post_text,
+        post_published_at=post_published_at,
         source="apidirect_kw",
         source_keyword=source_keyword,
         source_classification=source_classification,
@@ -388,9 +428,15 @@ def _drain_crustdata_inbox(
     ).sort("received_at", -1)
 
     inserted = 0
+    scanned = 0
+    skipped_dup = 0
+    skipped_author = 0
+    skipped_exhausted = 0
     for row in cursor:
+        scanned += 1
         post_url = row.get("post_url") or ""
         if not post_url or post_url in seen_urls:
+            skipped_dup += 1
             db.crustdata_inbox.update_one(
                 {"_id": row["_id"]},
                 {"$set": {"consumed": True, "consumed_at": utcnow(), "consumed_reason": "duplicate_url"}},
@@ -398,12 +444,14 @@ def _drain_crustdata_inbox(
             continue
         author_url = row.get("author_linkedin_url") or ""
         if author_url and author_url in seen_authors_shipped:
+            skipped_author += 1
             db.crustdata_inbox.update_one(
                 {"_id": row["_id"]},
                 {"$set": {"consumed": True, "consumed_at": utcnow(), "consumed_reason": "author_shipped"}},
             )
             continue
         if _is_exhausted(db, operator_id, author_url or post_url):
+            skipped_exhausted += 1
             db.crustdata_inbox.update_one(
                 {"_id": row["_id"]},
                 {"$set": {"consumed": True, "consumed_at": utcnow(), "consumed_reason": "exhausted"}},
@@ -423,6 +471,17 @@ def _drain_crustdata_inbox(
             {"$set": {"consumed": True, "consumed_at": utcnow(), "consumed_reason": "inserted"}},
         )
         inserted += 1
+    log.info(
+        "discovery: crustdata_inbox drain cofounder=%s inserted=%d scanned=%d "
+        "(skip dup_url=%d author_shipped=%d exhausted=%d) lookback_h=%d",
+        cofounder_id,
+        inserted,
+        scanned,
+        skipped_dup,
+        skipped_author,
+        skipped_exhausted,
+        settings.crustdata_inbox_lookback_hours,
+    )
     return inserted
 
 
@@ -554,9 +613,9 @@ def discover_for_operator(
     log.info(
         "discovery: source order = %s%s%s%s%s",
         "contacts_unipile → " if contacts_on else "",
+        "crustdata_inbox → " if crustdata_on else "(crustdata off) → ",
         "apidirect → " if apidirect_on else "(apidirect off) → ",
         "exa → " if exa_on else "(exa off) → ",
-        "crustdata_inbox → " if crustdata_on else "(crustdata off) → ",
         "unipile" if unipile_on else "(unipile off)",
     )
 
@@ -580,7 +639,19 @@ def discover_for_operator(
         unipile_inserted = 0
         contacts_inserted = 0
 
-        # ── SOURCE 1: apidirect synchronous keyword search ─────────────────
+        # ── SOURCE 1: Crustdata inbox (zero-cost; pre-filtered upstream) ───
+        if crustdata_on:
+            crustdata_inserted = _drain_crustdata_inbox(
+                db,
+                operator_id=operator_id,
+                cofounder_id=cofounder_id,
+                slate_run_id=slate_run_id,
+                seen_urls=seen_urls,
+                seen_authors_shipped=seen_authors_shipped,
+            )
+            inserted += crustdata_inserted
+
+        # ── SOURCE 2: apidirect synchronous keyword search ─────────────────
         if apidirect_on:
             apidirect_inserted = _run_apidirect(
                 db,
@@ -595,7 +666,7 @@ def discover_for_operator(
             )
             inserted += apidirect_inserted
 
-        # ── SOURCE 2: Exa LinkedIn-scoped search (high numResults per call) ──
+        # ── SOURCE 3: Exa LinkedIn-scoped search (high numResults per call) ──
         if exa_on:
             exa_inserted = _run_exa(
                 db,
@@ -612,19 +683,7 @@ def discover_for_operator(
             )
             inserted += exa_inserted
 
-        # ── SOURCE 3: Crustdata inbox (zero-cost; pre-filtered upstream) ──
-        if crustdata_on:
-            crustdata_inserted = _drain_crustdata_inbox(
-                db,
-                operator_id=operator_id,
-                cofounder_id=cofounder_id,
-                slate_run_id=slate_run_id,
-                seen_urls=seen_urls,
-                seen_authors_shipped=seen_authors_shipped,
-            )
-            inserted += crustdata_inserted
-
-        # ── SOURCE 3: Unipile keyword + seed-author search ─────────────────
+        # ── SOURCE 4: Unipile keyword + seed-author search ─────────────────
         if unipile_on:
             account_id = cofounder.get("unipile_account_id")
             if not account_id:
@@ -762,6 +821,14 @@ def _run_apidirect(
     for kw in _rotate(fresh_t2, DISCOVERY_TIER_2_PER_RUN):
         plan.append((kw, "B"))
 
+    if not plan:
+        log.warning(
+            "│  [apidirect]   plan EMPTY — all kws in 14d ledger (tier_1=%d, tier_2=%d, "
+            "fresh_t1=%d, fresh_t2=%d). Lower KEYWORD_HISTORY_LOOKBACK_DAYS or expand the pool.",
+            len(tier_1), len(tier_2), len(fresh_t1), len(fresh_t2),
+        )
+        return 0
+
     pages = max(1, min(int(settings.discovery_apidirect_max_pages), 5))
     inserted = 0
     for query, classification in plan:
@@ -783,6 +850,14 @@ def _run_apidirect(
                 continue
             if _is_exhausted(db, operator_id, post.url):
                 continue
+            details = None
+            if settings.discovery_apidirect_fetch_post_details:
+                try:
+                    details = _apidirect_optional_details(post.url)
+                except ApiDirectQuotaExhausted as err:
+                    log.warning("discovery: apidirect halted (post details): %s", err)
+                    return inserted
+
             seen_urls.add(post.url)
             db.candidates.insert_one(
                 _doc_from_apidirect(
@@ -792,6 +867,7 @@ def _run_apidirect(
                     slate_run_id=slate_run_id,
                     source_keyword=query,
                     source_classification=classification,
+                    details=details,
                 )
             )
             inserted += 1
@@ -834,6 +910,14 @@ def _run_exa(
         plan.append((kw, "B"))
     for kw in _rotate(fresh_t3, EXA_DISCOVERY_TIER_3_PER_RUN):
         plan.append((kw, "B"))
+
+    if not plan:
+        log.warning(
+            "│  [exa]         plan EMPTY — all kws in ledger (tier_1=%d, tier_2=%d, tier_3=%d, "
+            "fresh_t1=%d, fresh_t2=%d, fresh_t3=%d)",
+            len(tier_1), len(tier_2), len(tier_3), len(fresh_t1), len(fresh_t2), len(fresh_t3),
+        )
+        return 0
 
     inserted = 0
     for query, classification in plan:
@@ -920,64 +1004,77 @@ def _run_unipile(
         seed_source = (
             "manual_seed" if seed.get("source") == "manual" else "embedded_harvest"
         )
-        url = seed.get("linkedin_url")
-        if url:
-            plan.append(("user", url, seed_source, "B"))
+        # General Unipile: `search_posts_pages` only. `get_user_posts` is for
+        # contact-only `_run_contact_seeds_unipile` (and RULE 24 title search).
+        name = seed.get("extracted_name") or ""
+        title = seed.get("extracted_title") or ""
+        company = seed.get("extracted_company") or ""
+        if title and company:
+            query = f"{name} {title} {company}".strip()
+        elif company:
+            query = f"{name} {company}".strip()
         else:
-            name = seed.get("extracted_name") or ""
-            title = seed.get("extracted_title") or ""
-            company = seed.get("extracted_company") or ""
-            if title and company:
-                query = f"{name} {title} {company}".strip()
-            elif company:
-                query = f"{name} {company}".strip()
-            else:
-                query = name
-            if query:
-                plan.append(("kw", query, seed_source, "B"))
+            query = name
+        if query:
+            plan.append(("kw", query, seed_source, "B"))
+
+    if not plan:
+        log.warning(
+            "│  [unipile]     plan EMPTY — all kws in ledger (kw_topical: t1=%d/%d t2=%d/%d t3=%d/%d, "
+            "title_industry: %d/%d, seeds=%d)",
+            len(fresh_t1), len(tier_1),
+            len(fresh_t2), len(tier_2),
+            len(fresh_t3), len(tier_3),
+            len(fresh_ti), len(title_industry),
+            len(seeds),
+        )
+        return 0
 
     inserted = 0
     for kind, payload, source, classification in plan:
+        assert kind == "kw"
         try:
-            if kind == "kw":
-                q = (
-                    _compose_discovery_query(payload, operator)
-                    if source
-                    in ("tier_1_kw", "tier_2_kw", "tier_3_kw", "title_industry_kw")
-                    else payload
-                )
-                posts = search_posts(account_id=account_id, query=q, limit=20)
-            else:
-                posts = get_user_posts(
-                    account_id=account_id,
-                    public_identifier_or_url=payload,
-                    limit=10,
-                )
+            q = (
+                _compose_discovery_query(payload, operator)
+                if source
+                in ("tier_1_kw", "tier_2_kw", "tier_3_kw", "title_industry_kw")
+                else payload
+            )
+            posts = search_posts_pages(
+                account_id=account_id,
+                query=q,
+                max_pages=settings.discovery_unipile_post_max_pages,
+                per_page=settings.discovery_unipile_post_limit,
+                sort_by=settings.discovery_unipile_post_sort_by or None,
+                date_posted=settings.discovery_unipile_post_date_window or None,
+                content_type=(
+                    settings.discovery_unipile_post_content_type.strip()
+                    if settings.discovery_unipile_post_content_type.strip()
+                    else None
+                ),
+                author_keywords=settings.discovery_unipile_post_author_filter or None,
+            )
         except UnipileNotConfigured as err:
             log.warning("discovery: unipile unconfigured, halting: %s", err)
             return inserted
         except UnipileError as err:
-            log.warning("discovery: unipile %s failed for %r: %s", kind, payload, err)
+            log.warning("discovery: unipile kw failed for %r: %s", payload, err)
             continue
 
-        # Mark keyword queries used (only the kw plan items; user/seed lookups
-        # don't go through the keyword ledger). Topical and title-industry
-        # tracked on separate channels.
-        if kind == "kw":
-            if source in ("tier_1_kw", "tier_2_kw", "tier_3_kw"):
-                keyword_history.mark_used(
-                    db,
-                    operator_id=operator_id,
-                    source_channel="keyword_topical",
-                    query=payload,
-                )
-            elif source == "title_industry_kw":
-                keyword_history.mark_used(
-                    db,
-                    operator_id=operator_id,
-                    source_channel="keyword_title_industry",
-                    query=payload,
-                )
+        if source in ("tier_1_kw", "tier_2_kw", "tier_3_kw"):
+            keyword_history.mark_used(
+                db,
+                operator_id=operator_id,
+                source_channel="keyword_topical",
+                query=payload,
+            )
+        elif source == "title_industry_kw":
+            keyword_history.mark_used(
+                db,
+                operator_id=operator_id,
+                source_channel="keyword_title_industry",
+                query=payload,
+            )
         # Tag content-search hits with source_channel for downstream routing.
         if source in ("tier_1_kw", "tier_2_kw", "tier_3_kw"):
             post_source_channel = "keyword_topical"
@@ -1002,7 +1099,7 @@ def _run_unipile(
                     cofounder_id=cofounder_id,
                     slate_run_id=slate_run_id,
                     source=source,
-                    source_keyword=payload if kind == "kw" else "",
+                    source_keyword=payload,
                     source_classification=classification,
                     source_channel=post_source_channel,
                 )
@@ -1212,23 +1309,50 @@ def _run_contact_seeds(
                         continue
                     if _is_exhausted(db, operator_id, post.url):
                         continue
-                    seen_urls.add(post.url)
+
+                    details = None
+                    if settings.discovery_apidirect_fetch_post_details:
+                        try:
+                            details = _apidirect_optional_details(post.url)
+                        except ApiDirectQuotaExhausted as err:
+                            log.warning(
+                                "discovery: contact_seeds apidirect halted (details): %s",
+                                err,
+                            )
+                            return inserted
+
+                    text_src: ApiDirectPost | SimpleNamespace = post
+                    if details is not None and details.text.strip():
+                        text_src = SimpleNamespace(
+                            snippet=details.text,
+                            title=getattr(post, "title", None) or "",
+                        )
                     body = _contact_seed_post_text(
-                        post, name=name, title=title, company=company
+                        text_src, name=name, title=title, company=company
                     )
+                    author_nm = (details.author if details and details.author else None) or post.author or name
+                    author_u = seed_author_url or (
+                        details.author_url if details else None
+                    )
+                    pub_at = post.published_at
+                    if details is not None and details.published_at is not None:
+                        pub_at = details.published_at
+                    post_uid = details.urn if details and details.urn else None
+
+                    seen_urls.add(post.url)
                     db.candidates.insert_one(
                         _candidate_doc(
                             operator_id=operator_id,
                             cofounder_id=cofounder_id,
                             slate_run_id=slate_run_id,
                             post_url=post.url,
-                            post_id=None,
-                            author_name=post.author or name,
+                            post_id=post_uid,
+                            author_name=author_nm,
                             author_title=title or None,
                             author_company=company or None,
-                            author_linkedin_url=seed_author_url,
+                            author_linkedin_url=author_u,
                             post_text=body or (post.snippet or post.title or ""),
-                            post_published_at=post.published_at,
+                            post_published_at=pub_at,
                             source="contact_seed",
                             source_keyword=query,
                             source_classification="A",

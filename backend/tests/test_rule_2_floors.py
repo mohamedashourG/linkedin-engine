@@ -214,3 +214,38 @@ def test_seal_falls_back_to_default_abort_floor_for_legacy_operator():
     assert exc.value.reason == "floor_breach"
     assert exc.value.details["abort_floor"] == 25
     assert exc.value.details["hard_floor"] == 30
+
+
+# ---- contact-direct Unipile: skip floor layers (all bypass_gates) ----
+
+
+def test_seal_skips_floors_when_all_drafted_are_contact_bypass():
+    """Below abort_floor would normally abort; contact-direct slates skip
+    operator + per-cofounder floor checks so curated lists still seal."""
+    slate_id = ObjectId()
+    db = _DB(slate_id, drafted_count=5)  # would abort: 5 < 25
+    cf_id = ObjectId()
+    for c in db.candidates.docs:
+        c["cofounder_id"] = cf_id
+        c["bypass_gates"] = True
+    # Imbalanced vs 3 cofounders would also fail layer 2 without the skip
+    cofounders = [_cofounder(target=20) for _ in range(3)]
+
+    result = seal_slate(db, operator=_operator(), cofounders=cofounders, slate_run_id=slate_id)
+    assert result["slated"] == 5
+
+
+def test_seal_applies_floors_when_bypass_not_universal():
+    """Single non-bypass drafted row restores normal floor enforcement."""
+    slate_id = ObjectId()
+    db = _DB(slate_id, drafted_count=5)
+    cf_ids = [ObjectId() for _ in range(3)]
+    for i, c in enumerate(db.candidates.docs):
+        c["cofounder_id"] = cf_ids[i % 3]
+        c["bypass_gates"] = True
+    db.candidates.docs[0]["bypass_gates"] = False
+    cofounders = [_cofounder(target=20) for _ in range(3)]
+
+    with pytest.raises(Rule23ForceAbort) as exc:
+        seal_slate(db, operator=_operator(), cofounders=cofounders, slate_run_id=slate_id)
+    assert exc.value.reason == "floor_breach"

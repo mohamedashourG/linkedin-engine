@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/shared/empty-state";
 import { SlateCard } from "@/components/slate/slate-card";
+import { PipelineBreakdownView } from "@/components/slate/pipeline-breakdown";
 import { RunProgress } from "@/components/slate/run-progress";
 import { slateApi } from "@/lib/slate";
 
@@ -34,7 +35,7 @@ export default function TodayPage() {
       {/* Header */}
       <div className="flex items-end justify-between gap-3 flex-wrap">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">Today's slate</h1>
+          <h1 className="text-2xl font-bold tracking-tight">Today&apos;s slate</h1>
           {data?.slate_run ? (
             <div className="mt-1 flex items-center gap-2 text-sm text-muted-foreground">
               <span>
@@ -78,12 +79,16 @@ export default function TodayPage() {
         </div>
       </div>
 
-      {/* Live progress while building */}
-      {data?.slate_run &&
-        data.slate_run.status === "building" &&
-        data.slate_run.current_stage && (
-          <RunProgress slate={data.slate_run} />
-        )}
+      {/* Pipeline progress + stepper (stays visible after seal) */}
+      {data?.slate_run && <RunProgress slate={data.slate_run} />}
+
+      {/* Per-step post lists — same data after the run completes */}
+      {!isLoading && data?.pipeline && data.slate_run && (
+        <PipelineBreakdownView
+          pipeline={data.pipeline}
+          emailSent={data.slate_run.email_sent}
+        />
+      )}
 
       {/* Force-abort banner */}
       {data?.slate_run?.status === "force_aborted" && (

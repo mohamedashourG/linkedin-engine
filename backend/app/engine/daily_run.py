@@ -618,6 +618,14 @@ def _drop(
     *,
     gate_results: dict[str, Any] | None = None,
 ) -> None:
+    # Surface the drop inline so operators reviewing worker logs can see
+    # which posts failed at each gate without grepping the candidates
+    # collection. URL is truncated to keep lines readable.
+    log.info(
+        "│  [DROP] %s  ←  %s",
+        (candidate.get("post_url") or "<no-url>")[:90],
+        reason[:140],
+    )
     update: dict[str, Any] = {
         "status": "gate_dropped",
         "drop_reason": reason,
