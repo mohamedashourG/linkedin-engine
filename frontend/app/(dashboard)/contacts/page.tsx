@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FileSpreadsheet, Trash2, Upload, X } from "lucide-react";
 
@@ -36,10 +36,32 @@ export default function ContactsPage() {
   const [uploadResult, setUploadResult] = useState<UploadResult | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
 
+  // Multi-select state for bulk delete
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+
   const { data: contacts = [] } = useQuery({
     queryKey: ["contacts"],
     queryFn: contactsApi.list,
   });
+
+  const allIds = useMemo(() => contacts.map((c) => c._id), [contacts]);
+  const allSelected =
+    allIds.length > 0 && allIds.every((id) => selectedIds.has(id));
+
+  const toggleOne = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAll = () => {
+    setSelectedIds((prev) =>
+      prev.size === allIds.length ? new Set() : new Set(allIds),
+    );
+  };
 
   const bulkMutation = useMutation({
     mutationFn: (t: string) => contactsApi.bulk(t),
@@ -64,8 +86,50 @@ export default function ContactsPage() {
 
   const removeMutation = useMutation({
     mutationFn: (id: string) => contactsApi.remove(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["contacts"] }),
+    onSuccess: (_data, id) => {
+      setSelectedIds((prev) => {
+        if (!prev.has(id)) return prev;
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      qc.invalidateQueries({ queryKey: ["contacts"] });
+    },
   });
+
+  const removeManyMutation = useMutation({
+    mutationFn: (ids: string[]) => contactsApi.removeMany(ids),
+    onSuccess: () => {
+      setSelectedIds(new Set());
+      qc.invalidateQueries({ queryKey: ["contacts"] });
+    },
+  });
+
+  const removeAllMutation = useMutation({
+    mutationFn: () => contactsApi.removeAll(),
+    onSuccess: () => {
+      setSelectedIds(new Set());
+      qc.invalidateQueries({ queryKey: ["contacts"] });
+    },
+  });
+
+  const handleDeleteSelected = () => {
+    if (selectedIds.size === 0) return;
+    const n = selectedIds.size;
+    if (!confirm(`Delete ${n} selected contact${n === 1 ? "" : "s"}?`)) return;
+    removeManyMutation.mutate(Array.from(selectedIds));
+  };
+
+  const handleDeleteAll = () => {
+    if (contacts.length === 0) return;
+    if (
+      !confirm(
+        `Delete all ${contacts.length} contacts? This cannot be undone.`,
+      )
+    )
+      return;
+    removeAllMutation.mutate();
+  };
 
   const handleFile = useCallback((file: File | null) => {
     setUploadError(null);
@@ -261,10 +325,48 @@ export default function ContactsPage() {
 
       {/* ── Contact list ── */}
       <div className="space-y-3">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-lg font-semibold">
             Your list ({contacts.length})
           </h2>
+          {contacts.length > 0 && (
+            <div className="flex items-center gap-2">
+              <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={allSelected}
+                  onChange={toggleAll}
+                  className="h-4 w-4 cursor-pointer"
+                  aria-label="Select all contacts"
+                />
+                Select all
+              </label>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={
+                  selectedIds.size === 0 || removeManyMutation.isPending
+                }
+                onClick={handleDeleteSelected}
+              >
+                <Trash2 className="mr-2 h-4 w-4" />
+                {removeManyMutation.isPending
+                  ? "Deleting…"
+                  : `Delete selected${
+                      selectedIds.size > 0 ? ` (${selectedIds.size})` : ""
+                    }`}
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
+                disabled={removeAllMutation.isPending}
+                onClick={handleDeleteAll}
+              >
+                <Trash2 className="mr-2 h-4 w-4" />
+                {removeAllMutation.isPending ? "Deleting…" : "Delete all"}
+              </Button>
+            </div>
+          )}
         </div>
 
         {contacts.length === 0 ? (
@@ -279,24 +381,33 @@ export default function ContactsPage() {
                 key={c._id}
                 className="flex items-center justify-between rounded-md border bg-background p-3"
               >
-                <div className="space-y-0.5">
-                  <div className="font-medium">{c.name}</div>
-                  <div className="text-xs text-muted-foreground">
-                    {[c.title, c.company].filter(Boolean).join(" · ") ||
-                      "—"}
-                    {c.linkedin_url && (
-                      <>
-                        {" · "}
-                        <a
-                          href={c.linkedin_url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="underline"
-                        >
-                          {c.linkedin_url}
-                        </a>
-                      </>
-                    )}
+                <div className="flex items-center gap-3">
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(c._id)}
+                    onChange={() => toggleOne(c._id)}
+                    className="h-4 w-4 cursor-pointer"
+                    aria-label={`Select ${c.name}`}
+                  />
+                  <div className="space-y-0.5">
+                    <div className="font-medium">{c.name}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {[c.title, c.company].filter(Boolean).join(" · ") ||
+                        "—"}
+                      {c.linkedin_url && (
+                        <>
+                          {" · "}
+                          <a
+                            href={c.linkedin_url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="underline"
+                          >
+                            {c.linkedin_url}
+                          </a>
+                        </>
+                      )}
+                    </div>
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
@@ -304,7 +415,10 @@ export default function ContactsPage() {
                   <Button
                     variant="ghost"
                     size="icon"
-                    onClick={() => removeMutation.mutate(c._id)}
+                    onClick={() => {
+                      if (!confirm(`Delete ${c.name}?`)) return;
+                      removeMutation.mutate(c._id);
+                    }}
                   >
                     <Trash2 className="h-4 w-4" />
                   </Button>

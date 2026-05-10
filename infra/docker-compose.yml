@@ -35,8 +35,11 @@ services:
     environment:
       - MONGODB_URI=mongodb://mongo:27017
       - REDIS_URL=redis://redis:6379/0
+      # Repo configs/ lives outside backend/; default path resolution hits /configs otherwise.
+      - CLIENT_CONFIGS_DIR=/configs
     volumes:
       - ../backend:/app
+      - ../configs:/configs:ro
     depends_on:
       mongo:
         condition: service_healthy
@@ -53,8 +56,11 @@ services:
     environment:
       - MONGODB_URI=mongodb://mongo:27017
       - REDIS_URL=redis://redis:6379/0
+      - CLIENT_CONFIGS_DIR=/configs
+      - SKIP_RULE_23=true
     volumes:
       - ../backend:/app
+      - ../configs:/configs:ro
     depends_on:
       mongo:
         condition: service_healthy
@@ -71,8 +77,11 @@ services:
     environment:
       - MONGODB_URI=mongodb://mongo:27017
       - REDIS_URL=redis://redis:6379/0
+      - CLIENT_CONFIGS_DIR=/configs
+      - SKIP_RULE_23=true
     volumes:
       - ../backend:/app
+      - ../configs:/configs:ro
     depends_on:
       mongo:
         condition: service_healthy

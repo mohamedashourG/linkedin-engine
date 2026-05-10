@@ -84,6 +84,7 @@ def evaluate(
     author_name: str | None,
     author_title: str | None = None,
     author_company: str | None = None,
+    author_title_levels: list[str] | None = None,
     icp_rubric: dict[str, Any],
 ) -> _IcpScore:
     rubric_text = _format_rubric(icp_rubric)
@@ -94,6 +95,11 @@ def evaluate(
         author_block.append(f"Title: {author_title}")
     if author_company:
         author_block.append(f"Company: {author_company}")
+    if author_title_levels:
+        author_block.append(
+            "Seniority / title levels (enrichment): "
+            + ", ".join(str(x) for x in author_title_levels if x)
+        )
     if not author_block:
         author_block.append("(no enriched data available — infer from post)")
 

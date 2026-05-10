@@ -4,6 +4,38 @@ export class ApiError extends Error {
   }
 }
 
+/** FastAPI/Pydantic 422 uses `detail` as an array of { loc, msg, ... }; other errors use a string. */
+function formatErrorBody(data: unknown, status: number): string {
+  if (data == null || typeof data !== "object") {
+    return `Request failed (${status})`;
+  }
+  const d = data as Record<string, unknown>;
+  if (typeof d.detail === "string") {
+    return d.detail;
+  }
+  if (Array.isArray(d.detail)) {
+    return d.detail
+      .map((item: unknown) => {
+        if (item && typeof item === "object" && "msg" in item) {
+          const loc = (item as { loc?: unknown }).loc;
+          const locStr = Array.isArray(loc) ? loc.join(".") : String(loc ?? "");
+          const msg = String((item as { msg: unknown }).msg);
+          return locStr ? `${locStr}: ${msg}` : msg;
+        }
+        try {
+          return JSON.stringify(item);
+        } catch {
+          return String(item);
+        }
+      })
+      .join("; ");
+  }
+  if (d.message != null) {
+    return String(d.message);
+  }
+  return `Request failed (${status})`;
+}
+
 async function request<T>(
   path: string,
   init: RequestInit = {},
@@ -22,12 +54,15 @@ async function request<T>(
   }
 
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
+  let data: unknown = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    throw new ApiError(res.status, text || `Request failed (${res.status})`);
+  }
 
   if (!res.ok) {
-    const detail =
-      (data && (data.detail || data.message)) || `Request failed (${res.status})`;
-    throw new ApiError(res.status, detail);
+    throw new ApiError(res.status, formatErrorBody(data, res.status));
   }
   return data as T;
 }

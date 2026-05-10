@@ -61,19 +61,30 @@ export default function CalendlyPage() {
         </p>
       )}
 
-      <div className="flex justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <Button variant="ghost" onClick={() => router.back()}>
           Back
         </Button>
-        <Button
-          disabled={!url || save.isPending}
-          onClick={() => {
-            setError(null);
-            save.mutate();
-          }}
-        >
-          {save.isPending ? "Saving..." : "Save and continue"}
-        </Button>
+        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+          <Button
+            variant="outline"
+            onClick={() => {
+              router.push("/");
+              router.refresh();
+            }}
+          >
+            Skip for now — set up in Settings
+          </Button>
+          <Button
+            disabled={!url || save.isPending}
+            onClick={() => {
+              setError(null);
+              save.mutate();
+            }}
+          >
+            {save.isPending ? "Saving..." : "Save and continue"}
+          </Button>
+        </div>
       </div>
     </div>
   );

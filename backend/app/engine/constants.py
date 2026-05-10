@@ -14,8 +14,8 @@ EXA_DISCOVERY_TIER_1_PER_RUN = 12
 EXA_DISCOVERY_TIER_2_PER_RUN = 8
 EXA_DISCOVERY_TIER_3_PER_RUN = 4
 
-# Pages per keyword search on apidirect.
-DISCOVERY_PAGES_PER_KEYWORD = 1
+# Pages per keyword search on apidirect (default; overridden by settings.discovery_apidirect_max_pages).
+DISCOVERY_PAGES_PER_KEYWORD = 3
 
 # RULE 15-EXT: title-plus-industry queries through the cofounder's LinkedIn
 # content search (Unipile). Per cofounder per run; 4 keeps the daily mix

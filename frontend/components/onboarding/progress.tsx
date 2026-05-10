@@ -3,12 +3,12 @@ import { cn } from "@/lib/utils";
 
 export type WizardStep = "product" | "accounts" | "voice" | "calendly" | "schedule";
 
-const STEPS: { key: WizardStep; label: string }[] = [
+const STEPS: { key: WizardStep; label: string; optional?: boolean }[] = [
   { key: "product", label: "Product" },
   { key: "accounts", label: "Accounts" },
-  { key: "voice", label: "Voice" },
-  { key: "calendly", label: "Calendly" },
-  { key: "schedule", label: "Schedule" },
+  { key: "voice", label: "Voice", optional: true },
+  { key: "calendly", label: "Calendly", optional: true },
+  { key: "schedule", label: "Schedule", optional: true },
 ];
 
 export function WizardProgress({ current }: { current: WizardStep }) {
@@ -41,6 +41,11 @@ export function WizardProgress({ current }: { current: WizardStep }) {
               )}
             >
               {step.label}
+              {step.optional && (
+                <span className="ml-1 text-[10px] font-normal text-muted-foreground">
+                  (optional)
+                </span>
+              )}
             </span>
             {idx < STEPS.length - 1 && (
               <div

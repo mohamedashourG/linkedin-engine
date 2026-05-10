@@ -1,13 +1,14 @@
 """
-Onboarding wizard — 5 steps:
+Onboarding wizard — 5 steps (last 3 optional at first-run):
   1. /product   — extract + save ICP / keyword tiers
   2. /cofounders — add 1+ LinkedIn accounts to manage
-  3. /cofounders/{id}/voice — build per-cofounder voice templates
-  4. /calendly — connect Calendly URL (webhook registration is Phase 5)
-  5. /schedule — set daily run time + target
+  3. /cofounders/{id}/voice — per-cofounder voice (skippable; configure in Settings)
+  4. /calendly — Calendly URL (skippable; Settings)
+  5. /schedule — run time + target (defaults exist; tune in Settings → Engine)
 
-Onboarding completes when all five flags pass; the dashboard layout reads
-`onboarding_complete` and gates accordingly.
+`onboarding_complete` is True once product + ≥1 cofounder exist. Voice, Calendly,
+and schedule can be filled in later from Settings; the engine still requires
+voice before drafting (daily_run drops rows without voice_profile).
 """
 from __future__ import annotations
 
@@ -72,13 +73,9 @@ async def _refresh_onboarding_complete(
     has_calendly = bool(user and user.get("calendly_webhook_signing_key"))
     has_schedule = bool(user and user.get("run_time_local"))
 
-    complete = bool(
-        has_product
-        and cofounder_count >= 1
-        and cofounders_with_voice == cofounder_count
-        and has_calendly
-        and has_schedule
-    )
+    # Minimal gate: product + at least one cofounder. Voice / Calendly / schedule
+    # are recommended but configurable later from Settings.
+    complete = bool(has_product and cofounder_count >= 1)
     was_complete = bool(user and user.get("onboarding_complete"))
     if complete != was_complete:
         await db.users.update_one(
@@ -169,13 +166,7 @@ async def status_endpoint(
     cofounders_with_voice = sum(1 for cf in cofounders if cf.get("voice_profile"))
     has_calendly = bool(user.get("calendly_webhook_signing_key"))
     has_schedule = bool(user.get("run_time_local")) and bool(user.get("daily_target"))
-    complete = bool(
-        has_product
-        and cofounder_count >= 1
-        and cofounders_with_voice == cofounder_count
-        and has_calendly
-        and has_schedule
-    )
+    complete = bool(has_product and cofounder_count >= 1)
     return OnboardingStatus(
         has_product=has_product,
         cofounder_count=cofounder_count,

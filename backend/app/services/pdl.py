@@ -45,6 +45,8 @@ class PDLProfile:
     location_country: str | None
     full_name: str | None
     headline: str | None
+    # PDL seniority / level tags (e.g. cxo, vp, director) — used for ICP + audit.
+    job_title_levels: tuple[str, ...]
 
 
 def _client() -> httpx.Client:
@@ -89,6 +91,16 @@ def enrich_by_linkedin_url(linkedin_url: str) -> PDLProfile | None:
     data = payload.get("data") or {}
     if not data:
         return None
+
+    raw_levels = data.get("job_title_levels")
+    levels: tuple[str, ...] = ()
+    if isinstance(raw_levels, list):
+        levels = tuple(
+            str(x).strip().lower()
+            for x in raw_levels
+            if x is not None and str(x).strip()
+        )
+
     return PDLProfile(
         job_title=data.get("job_title"),
         job_company_name=data.get("job_company_name"),
@@ -96,4 +108,5 @@ def enrich_by_linkedin_url(linkedin_url: str) -> PDLProfile | None:
         location_country=data.get("location_country"),
         full_name=data.get("full_name"),
         headline=data.get("headline") or data.get("job_title"),
+        job_title_levels=levels,
     )

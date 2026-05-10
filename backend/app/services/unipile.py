@@ -223,7 +223,16 @@ def _parse_unipile_post(raw: dict[str, Any]) -> UnipilePost | None:
         author_profile_url=author.get("public_profile_url")
         or author.get("profile_url")
         or author.get("url"),
-        published_at=_parse_iso(raw.get("date") or raw.get("created_at") or raw.get("published_at")),
+        # Unipile returns `date` as a relative string like "2d" / "3h" — not
+        # ISO-parseable. The actual ISO timestamp lives in `parsed_datetime`.
+        # Try the ISO fields first; fall back to `date` only for older
+        # responses that did inline ISO there.
+        published_at=_parse_iso(
+            raw.get("parsed_datetime")
+            or raw.get("created_at")
+            or raw.get("published_at")
+            or raw.get("date")
+        ),
     )
 
 
@@ -308,16 +317,26 @@ def search_people(
     account_id: str,
     query: str,
     limit: int = 10,
-    network_distances: tuple[str, ...] = ("DISTANCE_2",),
+    location_ids: tuple[str, ...] = (LINKEDIN_GEO_URN_US,),
+    network_distance_degrees: tuple[int, ...] = (2,),
 ) -> list[UnipilePerson]:
-    """RULE 24 — LinkedIn people search via Unipile. Sends a minimal body
-    (Unipile rejects 400 on geo_urns / network_distance request fields in
-    this tenant) and applies the 2nd-degree filter client-side using the
-    `network_distance` field that Unipile returns on each result.
+    """RULE 24 — LinkedIn classic people search via Unipile.
 
-    Defaults to 2nd-degree only ("DISTANCE_2"). Pass an empty tuple to
-    accept any distance. Locked / private profiles (public_identifier =
-    None, "LinkedIn Member" name) are dropped by _parse_unipile_person."""
+    Per Unipile's documented schema (POST /linkedin/search, classic+people):
+
+      location           array of digit-STRINGS (e.g. ["103644278"] for US)
+      network_distance   array of NUMBERS, enum {1, 2, 3}
+
+    Default is US + 2nd-degree only, matching the audit URL
+    (geoUrn=103644278, 2nd-degree network filter).
+
+    Pass `location_ids=()` to skip the geo filter, `network_distance_degrees=()`
+    to accept any connection degree. Both filters are sent server-side AND
+    re-checked client-side as a belt-and-suspenders against tenant-side
+    schema drift.
+
+    Locked / private profiles ("LinkedIn Member" with public_identifier=None)
+    are dropped by _parse_unipile_person."""
     if settings.unipile_mock or not query.strip():
         return []
     body: dict[str, Any] = {
@@ -325,6 +344,10 @@ def search_people(
         "category": "people",
         "keywords": query[:300],
     }
+    if location_ids:
+        body["location"] = list(location_ids)
+    if network_distance_degrees:
+        body["network_distance"] = list(network_distance_degrees)
     with _client() as client:
         resp = client.post(
             "/linkedin/search",
@@ -334,7 +357,11 @@ def search_people(
     payload = _check_resp(resp, "search_people")
     items = payload.get("items") or payload.get("results") or []
     out: list[UnipilePerson] = []
-    allowed = {d.upper() for d in network_distances} if network_distances else None
+    allowed = (
+        {f"DISTANCE_{d}" for d in network_distance_degrees}
+        if network_distance_degrees
+        else None
+    )
     for raw in items:
         person = _parse_unipile_person(raw)
         if not person:
@@ -347,10 +374,48 @@ def search_people(
     return out
 
 
+def _resolve_user_provider_id(client: httpx.Client, *, account_id: str, slug: str) -> str | None:
+    """Resolve a LinkedIn public-identifier slug to its `provider_id` URN.
+
+    Unipile's `/users/{slug}/posts` endpoint rejects public slugs with
+    422 "invalid_recipient" — it only accepts the provider_id URN
+    (e.g. `ACoAA...`). The `/users/{slug}` endpoint, however, accepts
+    slugs and returns the URN in `provider_id`.
+
+    Returns None if the slug can't be resolved (locked profile, etc.).
+    """
+    try:
+        resp = client.get(f"/users/{slug}", params={"account_id": account_id})
+    except httpx.RequestError:
+        return None
+    if resp.status_code == 404:
+        return None
+    if resp.status_code >= 400:
+        # Don't raise — caller will treat None as "skip" without aborting
+        # the entire seed loop.
+        return None
+    try:
+        body = resp.json() or {}
+    except ValueError:
+        return None
+    pid = body.get("provider_id")
+    return str(pid) if pid else None
+
+
 def get_user_posts(
     *, account_id: str, public_identifier_or_url: str, limit: int = 10
 ) -> list[UnipilePost]:
-    """Fetch a specific LinkedIn user's recent posts."""
+    """Fetch a specific LinkedIn user's recent posts.
+
+    Two-step against Unipile:
+      1. `/users/{slug}` resolves the public-identifier to a provider_id URN.
+      2. `/users/{provider_id}/posts` returns the actual feed.
+
+    Why two calls: Unipile's posts endpoint rejects public slugs with
+    422 "invalid_recipient" — only URNs work. The resolve step accepts
+    slugs and gives back the URN, so we never have to ask the caller
+    to provide one.
+    """
     if settings.unipile_mock:
         return []
     slug = public_identifier_or_url
@@ -359,8 +424,16 @@ def get_user_posts(
     if not slug:
         return []
     with _client() as client:
+        # If the caller already passed a provider_id (URN), skip the resolve
+        # step. URNs always start with "AC" or contain "fsd_profile:".
+        if slug.startswith("AC") and len(slug) >= 30:
+            user_id = slug
+        else:
+            user_id = _resolve_user_provider_id(client, account_id=account_id, slug=slug)
+            if not user_id:
+                return []
         resp = client.get(
-            f"/users/{slug}/posts",
+            f"/users/{user_id}/posts",
             params={"account_id": account_id, "limit": limit},
         )
     if resp.status_code == 404:

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 from datetime import timedelta
 from typing import Any
 
@@ -52,13 +53,14 @@ from app.services.apidirect import (
     ApiDirectNotConfigured,
     ApiDirectQuotaExhausted,
     LinkedInPost as ApiDirectPost,
-    search_linkedin_posts,
+    search_linkedin_posts_pages,
 )
 from app.services.exa import (
     ExaError,
     ExaNotConfigured,
     ExaPost,
     ExaQuotaExhausted,
+    reset_exa_circuit,
     search_linkedin_posts as exa_search_linkedin_posts,
 )
 from app.services.unipile import (
@@ -73,6 +75,67 @@ from app.services.unipile import (
 
 log = logging.getLogger(__name__)
 
+_SENIORITY_HINT_RE = re.compile(
+    r"\b(?:c[\s]?suite|chief|evp|svp|vp|vice\s+president|director|head|partner|"
+    r"president|cfo|coo|ceo|cto|cmo|managing\s+director)\b",
+    re.I,
+)
+
+
+def _operator_geo_terms(operator: dict[str, Any]) -> list[str]:
+    """Geography phrases from onboarding / ICP for query bias + post filter."""
+    ext = operator.get("product_extracted") or {}
+    raw = ext.get("target_geographies") or []
+    out: list[str] = []
+    for x in raw:
+        s = str(x).strip()
+        if len(s) >= 2:
+            out.append(s.lower())
+    rub = operator.get("icp_rubric") or {}
+    geo = rub.get("geography") or {}
+    for tier in geo.get("tiers") or []:
+        if not isinstance(tier, dict):
+            continue
+        for m in tier.get("matches") or []:
+            s = str(m).strip()
+            if len(s) >= 2:
+                out.append(s.lower())
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    return uniq[:15]
+
+
+def _seniority_hints_from_titles(operator: dict[str, Any]) -> str:
+    """Short phrase of seniority tokens mined from target job titles."""
+    ext = operator.get("product_extracted") or {}
+    titles = ext.get("target_titles") or []
+    hints: set[str] = set()
+    for t in titles:
+        if not isinstance(t, str):
+            continue
+        for m in _SENIORITY_HINT_RE.finditer(t):
+            hints.add(m.group(0).strip())
+    if not hints:
+        return ""
+    return " ".join(sorted(hints, key=len, reverse=True))[:160]
+
+
+def _compose_discovery_query(base_kw: str, operator: dict[str, Any]) -> str:
+    """Append geography + seniority so LinkedIn search stays ICP-local."""
+    parts = [base_kw.strip()]
+    geos = _operator_geo_terms(operator)
+    if geos:
+        parts.append(" ".join(geos[:5]))
+    sen = _seniority_hints_from_titles(operator)
+    if sen:
+        parts.append(sen)
+    q = " ".join(p for p in parts if p).strip()
+    return q[:480]
+
 
 def _rotate(values: list[str], n: int) -> list[str]:
     """Pick up to N keywords with mild shuffling so successive runs vary."""
@@ -84,13 +147,17 @@ def _rotate(values: list[str], n: int) -> list[str]:
 
 
 def _is_exhausted(db: Database, operator_id: ObjectId, author_url: str) -> bool:
-    if not author_url:
-        return False
-    cutoff = utcnow() - timedelta(days=EXHAUSTION_LOOKBACK_DAYS)
-    doc = db.exhaustion_ledger.find_one(
-        {"operator_id": operator_id, "linkedin_url": author_url}
-    )
-    return bool(doc and doc.get("last_engaged_at") and doc["last_engaged_at"] >= cutoff)
+    # DEMO OVERRIDE: exhaustion ledger check disabled so previously-engaged
+    # authors resurface as candidates. RESTORE BY REMOVING this early return.
+    return False
+    # Original:
+    # if not author_url:
+    #     return False
+    # cutoff = utcnow() - timedelta(days=EXHAUSTION_LOOKBACK_DAYS)
+    # doc = db.exhaustion_ledger.find_one(
+    #     {"operator_id": operator_id, "linkedin_url": author_url}
+    # )
+    # return bool(doc and doc.get("last_engaged_at") and doc["last_engaged_at"] >= cutoff)
 
 
 def _seen_post_urls(db: Database, operator_id: ObjectId) -> set[str]:
@@ -410,23 +477,54 @@ def discover_for_operator(
     )
 
     inserted = 0
-    # Pre-seed the in-run dedupe set with every post_url we've already
-    # inserted in the last 90 days, so re-running the engine never surfaces
-    # the same post twice.
-    seen_urls: set[str] = _seen_post_urls(db, operator_id)
-    seen_authors_shipped: set[str] = _seen_author_urls(db, operator_id)
+    # DEMO OVERRIDE: ALL three cross-run dedup layers disabled so every run
+    # surfaces every match — useful for "show the raw data" demos. Restore
+    # by uncommenting the original lines and removing the empty-set fallbacks.
+    #
+    # Original (90-day post-URL dedup pre-seed):
+    # seen_urls: set[str] = _seen_post_urls(db, operator_id)
+    # Original (90-day already-shipped-author dedup pre-seed):
+    # seen_authors_shipped: set[str] = _seen_author_urls(db, operator_id)
+    seen_urls: set[str] = set()
+    seen_authors_shipped: set[str] = set()
     log.info(
         "discovery: pre-seeded dedupe sets — %d seen post URLs, %d shipped authors",
         len(seen_urls),
         len(seen_authors_shipped),
     )
 
-    apidirect_on = _apidirect_enabled()
-    exa_on = _exa_enabled()
-    crustdata_on = settings.discovery_use_crustdata
-    unipile_on = settings.discovery_use_unipile
+    # Manual contact seeds — searched via Unipile direct (gates bypassed).
+    contact_seeds = [s for s in seeds if s.get("source") == "manual"]
+    contacts_on = bool(contact_seeds)
     log.info(
-        "discovery: source order = %s%s%s%s",
+        "discovery: %d contact seeds loaded for operator=%s",
+        len(contact_seeds),
+        operator_id,
+    )
+
+    # CONTACTS-ONLY MODE: when the operator has curated a contact list, run
+    # ONLY the Unipile contact-direct path. Skip apidirect / Exa / Crustdata
+    # / Unipile-keyword / title-search entirely so we don't burn LLM gate
+    # cost on random keyword-surfaced authors the operator never asked for.
+    # Restore full discovery by clearing the contacts list.
+    if contacts_on:
+        apidirect_on = False
+        exa_on = False
+        crustdata_on = False
+        unipile_on = False  # disables keyword + seed-author walk + title-search
+        log.info(
+            "discovery: CONTACTS-ONLY mode active (%d contacts) — keyword sources skipped",
+            len(contact_seeds),
+        )
+    else:
+        apidirect_on = _apidirect_enabled()
+        exa_on = _exa_enabled()
+        crustdata_on = settings.discovery_use_crustdata
+        unipile_on = settings.discovery_use_unipile
+
+    log.info(
+        "discovery: source order = %s%s%s%s%s",
+        "contacts_unipile → " if contacts_on else "",
         "apidirect → " if apidirect_on else "(apidirect off) → ",
         "exa → " if exa_on else "(exa off) → ",
         "crustdata_inbox → " if crustdata_on else "(crustdata off) → ",
@@ -442,14 +540,8 @@ def discover_for_operator(
         else None
     )
 
-    # Manual contact seeds — searched via apidirect + exa (separate from keyword pool)
-    contact_seeds = [s for s in seeds if s.get("source") == "manual"]
-    contacts_on = bool(contact_seeds)
-    log.info(
-        "discovery: %d contact seeds loaded for operator=%s",
-        len(contact_seeds),
-        operator_id,
-    )
+    if settings.exa_reset_circuit_each_discovery:
+        reset_exa_circuit()
 
     for cofounder in cofounders:
         cofounder_id: ObjectId = cofounder["_id"]
@@ -463,6 +555,7 @@ def discover_for_operator(
         if apidirect_on:
             apidirect_inserted = _run_apidirect(
                 db,
+                operator=operator,
                 operator_id=operator_id,
                 cofounder_id=cofounder_id,
                 slate_run_id=slate_run_id,
@@ -477,6 +570,7 @@ def discover_for_operator(
         if exa_on:
             exa_inserted = _run_exa(
                 db,
+                operator=operator,
                 operator_id=operator_id,
                 cofounder_id=cofounder_id,
                 slate_run_id=slate_run_id,
@@ -530,6 +624,7 @@ def discover_for_operator(
             else:
                 unipile_inserted = _run_unipile(
                     db,
+                    operator=operator,
                     operator_id=operator_id,
                     cofounder_id=cofounder_id,
                     slate_run_id=slate_run_id,
@@ -556,6 +651,7 @@ def discover_for_operator(
         ):
             title_search_inserted = _run_unipile_title_search(
                 db,
+                operator=operator,
                 operator_id=operator_id,
                 cofounder_id=cofounder_id,
                 slate_run_id=slate_run_id,
@@ -566,17 +662,20 @@ def discover_for_operator(
             )
             inserted += title_search_inserted
 
-        # ── SOURCE 5: Contact seeds (apidirect + Exa search by name) ─────
+        # ── SOURCE 5: Contact seeds (Unipile direct, gates bypassed) ─────
+        # Operator-curated list: pull each contact's recent posts straight
+        # from Unipile and write them with status="gate_passed" so the
+        # allocator + drafter pick them up without running verification or
+        # any of the four gates.
         if contacts_on:
-            contacts_inserted = _run_contact_seeds(
+            contacts_inserted = _run_contact_seeds_unipile(
                 db,
                 operator_id=operator_id,
                 cofounder_id=cofounder_id,
                 slate_run_id=slate_run_id,
+                account_id=cofounder.get("unipile_account_id") or "",
                 seeds=contact_seeds,
                 seen_urls=seen_urls,
-                seen_authors_shipped=seen_authors_shipped,
-                start_published_date=exa_after,
             )
             inserted += contacts_inserted
 
@@ -607,6 +706,7 @@ def discover_for_operator(
 def _run_apidirect(
     db: Database,
     *,
+    operator: dict[str, Any],
     operator_id: ObjectId,
     cofounder_id: ObjectId,
     slate_run_id: ObjectId,
@@ -633,15 +733,17 @@ def _run_apidirect(
     for kw in _rotate(fresh_t2, DISCOVERY_TIER_2_PER_RUN):
         plan.append((kw, "B"))
 
+    pages = max(1, min(int(settings.discovery_apidirect_max_pages), 5))
     inserted = 0
     for query, classification in plan:
+        vendor_q = _compose_discovery_query(query, operator)
         try:
-            posts = search_linkedin_posts(query)
+            posts = search_linkedin_posts_pages(vendor_q, max_pages=pages)
         except (ApiDirectQuotaExhausted, ApiDirectNotConfigured) as err:
             log.warning("discovery: apidirect halted mid-run: %s", err)
             return inserted
         except ApiDirectError as err:
-            log.warning("discovery: apidirect %r failed: %s", query, err)
+            log.warning("discovery: apidirect %r failed: %s", vendor_q, err)
             continue
 
         keyword_history.mark_used(
@@ -670,6 +772,7 @@ def _run_apidirect(
 def _run_exa(
     db: Database,
     *,
+    operator: dict[str, Any],
     operator_id: ObjectId,
     cofounder_id: ObjectId,
     slate_run_id: ObjectId,
@@ -705,15 +808,16 @@ def _run_exa(
 
     inserted = 0
     for query, classification in plan:
+        vendor_q = _compose_discovery_query(query, operator)
         try:
             posts = exa_search_linkedin_posts(
-                query, start_published_date=start_published_date
+                vendor_q, start_published_date=start_published_date
             )
         except (ExaQuotaExhausted, ExaNotConfigured) as err:
             log.warning("discovery: exa halted mid-run: %s", err)
             return inserted
         except ExaError as err:
-            log.warning("discovery: exa %r failed: %s", query, err)
+            log.warning("discovery: exa %r failed: %s", vendor_q, err)
             continue
 
         keyword_history.mark_used(
@@ -742,6 +846,7 @@ def _run_exa(
 def _run_unipile(
     db: Database,
     *,
+    operator: dict[str, Any],
     operator_id: ObjectId,
     cofounder_id: ObjectId,
     slate_run_id: ObjectId,
@@ -806,7 +911,13 @@ def _run_unipile(
     for kind, payload, source, classification in plan:
         try:
             if kind == "kw":
-                posts = search_posts(account_id=account_id, query=payload, limit=20)
+                q = (
+                    _compose_discovery_query(payload, operator)
+                    if source
+                    in ("tier_1_kw", "tier_2_kw", "tier_3_kw", "title_industry_kw")
+                    else payload
+                )
+                posts = search_posts(account_id=account_id, query=q, limit=20)
             else:
                 posts = get_user_posts(
                     account_id=account_id,
@@ -874,6 +985,7 @@ def _run_unipile(
 def _run_unipile_title_search(
     db: Database,
     *,
+    operator: dict[str, Any],
     operator_id: ObjectId,
     cofounder_id: ObjectId,
     slate_run_id: ObjectId,
@@ -907,11 +1019,12 @@ def _run_unipile_title_search(
 
     inserted = 0
     for query in plan:
+        vendor_q = _compose_discovery_query(query, operator)
         # Step 1 — people search (US, 2nd-degree).
         try:
             people = search_people(
                 account_id=account_id,
-                query=query,
+                query=vendor_q,
                 limit=DISCOVERY_TITLE_SEARCH_PEOPLE_PER_QUERY,
             )
         except UnipileNotConfigured as err:
@@ -977,9 +1090,27 @@ def _run_unipile_title_search(
     return inserted
 
 
+def _contact_seed_post_text(
+    post: ApiDirectPost | ExaPost,
+    *,
+    name: str,
+    title: str,
+    company: str,
+) -> str:
+    """Merge vendor snippet with seed identity so verification min-length passes."""
+    snip = (getattr(post, "snippet", None) or "").strip()
+    ptitle = (getattr(post, "title", None) or "").strip()
+    return " ".join(
+        p
+        for p in (snip, ptitle, name, title, company)
+        if isinstance(p, str) and p.strip()
+    ).strip()
+
+
 def _run_contact_seeds(
     db: Database,
     *,
+    operator: dict[str, Any],
     operator_id: ObjectId,
     cofounder_id: ObjectId,
     slate_run_id: ObjectId,
@@ -1027,6 +1158,8 @@ def _run_contact_seeds(
         if not query:
             continue
 
+        vendor_query = _compose_discovery_query(query, operator)
+
         # Track the seed's author URL for dedupe
         seed_author_url = linkedin_url or None
         if seed_author_url and seed_author_url in seen_authors_shipped:
@@ -1034,14 +1167,16 @@ def _run_contact_seeds(
         if seed_author_url and _is_exhausted(db, operator_id, seed_author_url):
             continue
 
+        seed_pages = max(1, min(int(settings.discovery_contact_seed_apidirect_pages), 5))
+
         # ── apidirect search ──────────────────────────────────────────────
         if apidirect_on:
             try:
-                posts = search_linkedin_posts(query)
+                posts = search_linkedin_posts_pages(vendor_query, max_pages=seed_pages)
             except (ApiDirectQuotaExhausted, ApiDirectNotConfigured) as err:
                 log.warning("discovery: contact_seeds apidirect halted: %s", err)
             except ApiDirectError as err:
-                log.warning("discovery: contact_seeds apidirect %r failed: %s", query, err)
+                log.warning("discovery: contact_seeds apidirect %r failed: %s", vendor_query, err)
             else:
                 for post in posts:
                     if not post.url or post.url in seen_urls:
@@ -1049,6 +1184,9 @@ def _run_contact_seeds(
                     if _is_exhausted(db, operator_id, post.url):
                         continue
                     seen_urls.add(post.url)
+                    body = _contact_seed_post_text(
+                        post, name=name, title=title, company=company
+                    )
                     db.candidates.insert_one(
                         _candidate_doc(
                             operator_id=operator_id,
@@ -1060,7 +1198,7 @@ def _run_contact_seeds(
                             author_title=title or None,
                             author_company=company or None,
                             author_linkedin_url=seed_author_url,
-                            post_text=post.snippet or post.title or "",
+                            post_text=body or (post.snippet or post.title or ""),
                             post_published_at=post.published_at,
                             source="contact_seed",
                             source_keyword=query,
@@ -1073,8 +1211,8 @@ def _run_contact_seeds(
         if exa_on:
             try:
                 exa_posts = exa_search_linkedin_posts(
-                    query,
-                    num_results=30,
+                    vendor_query,
+                    num_results=settings.exa_results_per_query,
                     start_published_date=start_published_date,
                 )
             except (ExaQuotaExhausted, ExaNotConfigured) as err:
@@ -1091,6 +1229,9 @@ def _run_contact_seeds(
                     seen_urls.add(post.url)
                     # Prefer seed's author URL; fall back to URL extraction
                     author_url = seed_author_url or _author_url_from_post_url(post.url)
+                    body = _contact_seed_post_text(
+                        post, name=name, title=title, company=company
+                    )
                     db.candidates.insert_one(
                         _candidate_doc(
                             operator_id=operator_id,
@@ -1102,7 +1243,7 @@ def _run_contact_seeds(
                             author_title=title or None,
                             author_company=company or None,
                             author_linkedin_url=author_url,
-                            post_text=post.snippet or post.title or "",
+                            post_text=body or (post.snippet or post.title or ""),
                             post_published_at=post.published_at,
                             source="contact_seed",
                             source_keyword=query,
@@ -1113,6 +1254,128 @@ def _run_contact_seeds(
 
     log.info(
         "discovery: contact_seeds searched %d contacts, inserted %d candidates",
+        len(seeds),
+        inserted,
+    )
+    return inserted
+
+
+def _run_contact_seeds_unipile(
+    db: Database,
+    *,
+    operator_id: ObjectId,
+    cofounder_id: ObjectId,
+    slate_run_id: ObjectId,
+    account_id: str,
+    seeds: list[dict[str, Any]],
+    seen_urls: set[str],
+) -> int:
+    """Contact-only path: pull recent posts via Unipile and skip the entire
+    verification + 4-gate funnel.
+
+    For every imported contact we walk their public LinkedIn profile via
+    Unipile's `get_user_posts` endpoint. Each returned post is written
+    directly with status="gate_passed" so the allocator + drafter pick them
+    up unchanged — the operator already curated this list, we don't need
+    the engine to second-guess them.
+
+    A synthetic ICP score (10) is attached so the allocator's score-desc
+    sort floats these candidates ahead of any keyword-discovered survivors
+    in the same cofounder bucket.
+    """
+    if not seeds:
+        return 0
+    if not account_id:
+        log.info(
+            "discovery: contact_seeds_unipile skipped — no unipile_account_id "
+            "for cofounder=%s",
+            cofounder_id,
+        )
+        return 0
+
+    inserted = 0
+    posts_per_contact = max(1, int(settings.discovery_contact_unipile_posts_per_user))
+
+    for seed in seeds:
+        linkedin_url = (seed.get("linkedin_url") or "").strip()
+        if not linkedin_url:
+            # No URL → can't address Unipile by slug. Skip silently; the
+            # operator can edit the contact and add their LinkedIn URL.
+            log.info(
+                "discovery: contact_seeds_unipile skipping %s — no linkedin_url",
+                seed.get("extracted_name") or seed.get("_id"),
+            )
+            continue
+
+        name = seed.get("extracted_name") or ""
+        title = seed.get("extracted_title") or ""
+        company = seed.get("extracted_company") or ""
+
+        try:
+            posts = get_user_posts(
+                account_id=account_id,
+                public_identifier_or_url=linkedin_url,
+                limit=posts_per_contact,
+            )
+        except (UnipileError, UnipileNotConfigured) as err:
+            log.warning(
+                "discovery: contact_seeds_unipile %r failed: %s",
+                linkedin_url,
+                err,
+            )
+            continue
+
+        for post in posts:
+            # Pass through every post URL the contact actually has — no
+            # cross-contact / cross-run dedup. The operator curated this
+            # list; if two contacts share a post we want to see it twice.
+            if not post.url:
+                continue
+
+            doc = _candidate_doc(
+                operator_id=operator_id,
+                cofounder_id=cofounder_id,
+                slate_run_id=slate_run_id,
+                post_url=post.url,
+                post_id=post.id,
+                # Prefer the post-level author payload (Unipile gives it back
+                # explicitly) but fall back to the seed's metadata so we never
+                # ship blanks to the drafter.
+                author_name=post.author_name or name or None,
+                author_title=post.author_title or title or None,
+                author_company=post.author_company or company or None,
+                author_linkedin_url=post.author_profile_url or linkedin_url,
+                post_text=post.text or "",
+                post_published_at=post.published_at,
+                source="contact_unipile",
+                source_keyword=name or linkedin_url,
+                source_classification="A",
+                source_channel="contact_direct",
+            )
+            # Skip the entire funnel: verification + cheap_gates +
+            # profile_resolve + expensive_gates. The allocator reads
+            # status="gate_passed" so we land right on its doorstep.
+            doc["status"] = "gate_passed"
+            doc["bypass_gates"] = True
+            doc["gate_results"] = {
+                # Synthetic top-tier ICP score so the allocator's
+                # score-desc sort floats contacts above any keyword
+                # survivors competing for the same cofounder bucket.
+                "icp": {"score_0_10": 10, "total": 100, "synthetic": True},
+                "non_buyer": {"verdict": "buyer", "synthetic": True},
+                "post_quality": {
+                    "verdict": "pass",
+                    "qualifying_signal": "operator_curated_contact",
+                    "synthetic": True,
+                },
+                "analyst": {"verdict": "not_analyst", "synthetic": True},
+            }
+            db.candidates.insert_one(doc)
+            inserted += 1
+
+    log.info(
+        "discovery: contact_seeds_unipile cofounder=%s contacts=%d inserted=%d (gates bypassed)",
+        cofounder_id,
         len(seeds),
         inserted,
     )

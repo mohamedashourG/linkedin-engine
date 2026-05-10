@@ -83,19 +83,30 @@ export default function SchedulePage() {
         </p>
       )}
 
-      <div className="flex justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <Button variant="ghost" onClick={() => router.back()}>
           Back
         </Button>
-        <Button
-          disabled={save.isPending}
-          onClick={() => {
-            setError(null);
-            save.mutate();
-          }}
-        >
-          {save.isPending ? "Saving..." : "Finish onboarding"}
-        </Button>
+        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+          <Button
+            variant="outline"
+            onClick={() => {
+              router.push("/");
+              router.refresh();
+            }}
+          >
+            Skip — defaults already apply (edit in Settings → Engine)
+          </Button>
+          <Button
+            disabled={save.isPending}
+            onClick={() => {
+              setError(null);
+              save.mutate();
+            }}
+          >
+            {save.isPending ? "Saving..." : "Save schedule & finish"}
+          </Button>
+        </div>
       </div>
     </div>
   );

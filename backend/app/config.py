@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     jwt_expires_hours: int = 720
 
     rule_23_pepper: str = "change-me-in-prod-and-rotate"
+    # When true, daily_run seals without RULE 23 floor / cofounder / comment checks.
+    # Use SKIP_RULE_23=true for local debugging; keep false in production.
+    skip_rule_23: bool = False
 
     openai_api_key: str = ""
     openai_model_primary: str = "gpt-5.4"
@@ -56,17 +59,31 @@ class Settings(BaseSettings):
     # Candidates with no published_at are kept (we don't penalize missing
     # data). Set to 0 to disable the recency filter.
     discovery_max_age_days: int = 14
+    # Apidirect: fetch this many pages per keyword (page=1..N, ~20 posts/page).
+    discovery_apidirect_max_pages: int = 4
+    # Contact-seed name searches: pages per contact on apidirect.
+    discovery_contact_seed_apidirect_pages: int = 4
+    # Contact-seed Unipile direct path: posts pulled per contact via
+    # `unipile.get_user_posts`. These are written with status="gate_passed"
+    # and bypass the entire verification + 4-gate funnel.
+    discovery_contact_unipile_posts_per_user: int = 5
+    # When product_extracted.target_geographies (or ICP geography tiers) is
+    # non-empty, drop verified candidates whose post + author text does not
+    # mention any geography term (substring match, case-insensitive).
+    discovery_require_geo_in_post: bool = True
+    # Clear Exa circuit at the start of each discover_for_operator so a fixed
+    # API key takes effect without restarting Celery (set false to keep circuit latched).
+    exa_reset_circuit_each_discovery: bool = True
 
     exa_api_key: str = ""
     exa_results_per_query: int = 100
 
     pdl_api_key: str = ""
-    # Enrichment toggles. The author-resolution stage prefers Crustdata when
-    # enrich_with_crustdata=true (3 credits/profile, returns title +
-    # employer_name + headline), falls back to PDL when enrich_with_pdl=true
-    # (~$0.20-$0.28/match, returns name only in practice), and becomes a
-    # no-op when both are false (ICP scoring relies on LLM inference from
-    # post text alone).
+    # Enrichment toggles. Profile-resolve runs Crustdata first when
+    # enrich_with_crustdata=true (batched title + employer + headline).
+    # When enrich_with_pdl=true, PDL runs after Crustdata (supplement) or alone
+    # if Crustdata is off: job_title_levels (seniority) plus gap-fill for
+    # title/company/name. Enable both for best ICP signals.
     enrich_with_pdl: bool = False
     enrich_with_crustdata: bool = True
 

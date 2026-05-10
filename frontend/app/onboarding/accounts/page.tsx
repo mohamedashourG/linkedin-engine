@@ -37,8 +37,9 @@ export default function AccountsPage() {
         <CardHeader>
           <CardTitle>Add the LinkedIn accounts you'll manage</CardTitle>
           <CardDescription>
-            Each "cofounder" is a real person whose LinkedIn account will post
-            comments. You'll set their voice in the next step.
+            Each &quot;cofounder&quot; is a real person whose LinkedIn account will post
+            comments. Voice, Calendly, and run schedule can be set here next or
+            skipped and completed later in Settings.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -58,16 +59,28 @@ export default function AccountsPage() {
         </CardContent>
       </Card>
 
-      <div className="flex justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <Button variant="ghost" onClick={() => router.push("/onboarding/product")}>
           Back
         </Button>
-        <Button
-          disabled={cofounders.length === 0}
-          onClick={() => router.push(`/onboarding/voice/${cofounders[0]._id}`)}
-        >
-          Continue to voice profiles
-        </Button>
+        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+          <Button
+            variant="outline"
+            disabled={cofounders.length === 0}
+            onClick={() => {
+              router.push("/");
+              router.refresh();
+            }}
+          >
+            Finish later — go to dashboard
+          </Button>
+          <Button
+            disabled={cofounders.length === 0}
+            onClick={() => router.push(`/onboarding/voice/${cofounders[0]._id}`)}
+          >
+            Continue to voice (optional)
+          </Button>
+        </div>
       </div>
     </div>
   );

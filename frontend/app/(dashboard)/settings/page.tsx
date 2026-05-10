@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { useSearchParams, useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -97,6 +98,15 @@ export default function SettingsPage() {
               ))
             )}
           </Section>
+
+          <OptionalSetupSection
+            cofounders={cofoundersQ.data}
+            cofoundersLoading={cofoundersQ.isLoading}
+            onOpenEngineTab={() => {
+              setTab("engine");
+              router.replace("/settings?tab=engine");
+            }}
+          />
         </TabsContent>
 
         <TabsContent value="engine">
@@ -109,6 +119,134 @@ export default function SettingsPage() {
         </TabsContent>
       </Tabs>
     </div>
+  );
+}
+
+function OptionalSetupSection({
+  cofounders,
+  cofoundersLoading,
+  onOpenEngineTab,
+}: {
+  cofounders: Cofounder[] | undefined;
+  cofoundersLoading: boolean;
+  onOpenEngineTab: () => void;
+}) {
+  const qc = useQueryClient();
+  const statusQ = useQuery({
+    queryKey: ["onboarding-status"],
+    queryFn: onboardingApi.status,
+  });
+  const [calUrl, setCalUrl] = useState("");
+  const connectCal = useMutation({
+    mutationFn: () => onboardingApi.connectCalendly(calUrl.trim()),
+    onSuccess: () => {
+      toast.success("Calendly connected");
+      setCalUrl("");
+      void qc.invalidateQueries({ queryKey: ["onboarding-status"] });
+    },
+    onError: (err: ApiError) => toast.error(err.detail),
+  });
+
+  if (cofoundersLoading || statusQ.isLoading) {
+    return (
+      <Section title="Voice, Calendly & schedule" description="Loading…">
+        <Skeleton className="h-32 w-full" />
+      </Section>
+    );
+  }
+
+  const list = cofounders ?? [];
+  const missingVoice = list.filter((c) => !c.voice_profile);
+  const hasCal = statusQ.data?.has_calendly ?? false;
+  const hasSchedule = statusQ.data?.has_schedule ?? false;
+
+  return (
+    <Section
+      title="Voice, Calendly & schedule"
+      description="Skipped these during onboarding? Configure them here. Run time and daily volume live on the Engine tab."
+    >
+      <div className="rounded-xl border bg-background p-5 space-y-5">
+        <div>
+          <h3 className="text-sm font-semibold">Voice profiles</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            The daily drafter needs at least one example set per cofounder before
+            comments can ship.
+          </p>
+          {list.length === 0 ? (
+            <p className="mt-2 text-sm text-muted-foreground">No cofounders yet.</p>
+          ) : (
+            <ul className="mt-3 space-y-2">
+              {list.map((cf) => (
+                <li
+                  key={cf._id}
+                  className="flex items-center justify-between rounded-md border px-3 py-2 text-sm"
+                >
+                  <span className="font-medium">{cf.display_name}</span>
+                  {cf.voice_profile ? (
+                    <Badge variant="success" className="rounded-full text-[10px]">
+                      Voice set
+                    </Badge>
+                  ) : (
+                    <Button size="sm" variant="outline" asChild>
+                      <Link href={`/onboarding/voice/${cf._id}`}>Set up voice</Link>
+                    </Button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <div>
+          <h3 className="text-sm font-semibold">Calendly</h3>
+          {hasCal ? (
+            <p className="mt-2 text-sm text-muted-foreground">
+              Connected. Bookings can be attributed to slates when webhooks are
+              active.
+            </p>
+          ) : (
+            <div className="mt-3 space-y-2">
+              <Label>Calendly URL</Label>
+              <Input
+                value={calUrl}
+                onChange={(e) => setCalUrl(e.target.value)}
+                placeholder="https://calendly.com/your-handle/intro"
+              />
+              <Button
+                size="sm"
+                disabled={!calUrl.trim() || connectCal.isPending}
+                onClick={() => connectCal.mutate()}
+              >
+                {connectCal.isPending ? "Saving…" : "Save Calendly"}
+              </Button>
+            </div>
+          )}
+        </div>
+
+        <div>
+          <h3 className="text-sm font-semibold">Schedule</h3>
+          <p className="mt-2 text-sm text-muted-foreground">
+            {hasSchedule
+              ? "Run time and daily target are set (defaults apply if you skipped onboarding)."
+              : "Set weekday run time and daily target on the Engine tab."}{" "}
+            <button
+              type="button"
+              className="text-primary underline-offset-4 hover:underline"
+              onClick={onOpenEngineTab}
+            >
+              Open Engine tab
+            </button>
+          </p>
+        </div>
+
+        {(missingVoice.length > 0 || !hasCal) && (
+          <p className="text-[11px] text-muted-foreground border-t pt-3">
+            Tip: finish voice before expecting drafted comments. Calendly is only
+            needed for meeting attribution.
+          </p>
+        )}
+      </div>
+    </Section>
   );
 }
 

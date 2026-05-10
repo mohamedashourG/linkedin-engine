@@ -203,6 +203,72 @@ def seal_slate(
     return {"slated": len(drafted), "hmac_token": token, "validations": validations}
 
 
+def seal_slate_skip_checks(
+    db: Database,
+    *,
+    operator: dict[str, Any],
+    cofounders: list[dict[str, Any]],
+    slate_run_id: ObjectId,
+) -> dict[str, Any]:
+    """Seal like `seal_slate` but skip all abort layers (floors, cofounder
+    balance, comment invariants, verified tuple). Use when `skip_rule_23` is
+    enabled. Still promotes drafted → slated and writes HMAC."""
+    _ = cofounders  # same signature as seal_slate; unused here
+    operator_id: ObjectId = operator["_id"]
+    drafted = list(
+        db.candidates.find({"slate_run_id": slate_run_id, "status": "drafted"})
+    )
+    validations: list[dict[str, Any]] = [
+        {
+            "layer": "disabled",
+            "pass": True,
+            "details": {"reason": "skip_rule_23", "drafted": len(drafted)},
+        }
+    ]
+    pepper = (settings.rule_23_pepper or os.getenv("RULE_23_PEPPER") or "").encode()
+    if not pepper or pepper == b"change-me-in-prod-and-rotate":
+        log.warning("RULE_23_PEPPER is unset or default — token has no security value")
+    slate = db.slate_runs.find_one({"_id": slate_run_id})
+    payload = f"{slate_run_id}:{len(drafted)}:{(slate or {}).get('run_date')}".encode()
+    token = hmac.new(pepper, payload, hashlib.sha256).hexdigest()
+    validations.append({"layer": "hmac", "pass": True})
+
+    db.slate_runs.update_one(
+        {"_id": slate_run_id},
+        {
+            "$set": {
+                "status": "sealed",
+                "sealed_at": utcnow(),
+                "rule_23_validations": validations,
+                "hmac_token": token,
+                "total_slated": len(drafted),
+                "updated_at": utcnow(),
+            }
+        },
+    )
+    db.candidates.update_many(
+        {"slate_run_id": slate_run_id, "status": "drafted"},
+        {"$set": {"status": "slated", "updated_at": utcnow()}},
+    )
+
+    db.audit_records.insert_one(
+        {
+            "operator_id": operator_id,
+            "event_type": "rule_23_skipped",
+            "slate_run_id": slate_run_id,
+            "details": {"slated": len(drafted), "hmac_token": token},
+            "severity": "warn",
+            "created_at": utcnow(),
+        }
+    )
+    log.warning(
+        "RULE 23 skipped (skip_rule_23): slate=%s slated=%d — not production-safe",
+        slate_run_id,
+        len(drafted),
+    )
+    return {"slated": len(drafted), "hmac_token": token, "validations": validations}
+
+
 def _abort(
     db: Database,
     slate_run_id: ObjectId,

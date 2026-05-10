@@ -67,6 +67,14 @@ def _trip_circuit() -> None:
         _circuit_open = True
 
 
+def reset_exa_circuit() -> None:
+    """Clear the process-wide quota/auth circuit (e.g. after fixing EXA_API_KEY
+    without restarting the worker). Safe to call at the start of each discovery run."""
+    global _circuit_open
+    with _circuit_lock:
+        _circuit_open = False
+
+
 def _client() -> httpx.Client:
     if not settings.exa_api_key:
         raise ExaNotConfigured("EXA_API_KEY is not set.")

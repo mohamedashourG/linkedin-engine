@@ -156,8 +156,13 @@ function SlateByCofounder({ data }: { data: ReturnType<typeof slateApi.today> ex
               </span>
             </div>
             <div className="grid gap-3">
-              {items.map((c) => (
-                <SlateCard key={c.id} candidate={c} />
+              {items.map((c, i) => (
+                <SlateCard
+                  key={c.id}
+                  candidate={c}
+                  rank={i + 1}
+                  total={items.length}
+                />
               ))}
             </div>
           </section>

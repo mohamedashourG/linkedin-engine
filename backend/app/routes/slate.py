@@ -62,6 +62,12 @@ class SlateTodayResponse(BaseModel):
 
 def _candidate_to_public(c: dict[str, Any]) -> CandidatePublic:
     icp = (c.get("gate_results") or {}).get("icp") or {}
+    # Prefer the audit's normalized 0-10 score (RULE 14). Fall back to raw
+    # `total` for slates predating the normalization patch — those will
+    # render larger numbers but the relative ordering still works.
+    score = icp.get("score_0_10")
+    if score is None:
+        score = icp.get("total")
     return CandidatePublic(
         id=str(c["_id"]),
         cofounder_id=str(c["cofounder_id"]),
@@ -74,9 +80,24 @@ def _candidate_to_public(c: dict[str, Any]) -> CandidatePublic:
         status=c.get("status", ""),
         comment_text=c.get("comment_text"),
         comment_type=c.get("comment_type"),
-        icp_score=icp.get("total"),
+        icp_score=score,
         user_action=c.get("user_action", "pending"),
         drop_reason=c.get("drop_reason"),
+    )
+
+
+def _candidate_sort_key(c: dict[str, Any]) -> tuple:
+    """Per-cofounder ranking: ICP score descending, then comment_type, then
+    most-recently published first. Frontend uses this order to render
+    rank #1..N inside each cofounder section."""
+    icp = (c.get("gate_results") or {}).get("icp") or {}
+    score = icp.get("score_0_10")
+    if score is None:
+        score = icp.get("total") or 0
+    return (
+        str(c.get("cofounder_id", "")),  # group by cofounder first
+        -int(score or 0),                 # highest ICP first
+        c.get("comment_type") or "Z",
     )
 
 
@@ -121,8 +142,13 @@ async def get_today(
                 "slate_run_id": slate["_id"],
                 "status": {"$in": ["slated", "shipped", "dropped_by_user"]},
             }
-        ).sort([("cofounder_id", 1), ("comment_type", 1)])
+        )
         candidates_raw = await cursor.to_list(length=None)
+        # Sort in Python — Mongo can't easily order by a nested gate_results
+        # path while also grouping by cofounder. Within each cofounder we
+        # rank by ICP score descending so the frontend's #1..N badge
+        # reflects the engine's quality ordering.
+        candidates_raw.sort(key=_candidate_sort_key)
 
     cofounders = await db.cofounders.find(
         {"operator_id": user["_id"], "active": True}

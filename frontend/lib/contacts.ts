@@ -29,6 +29,9 @@ export const contactsApi = {
     api.post<BulkResult>("/api/contacts/bulk", { text }),
   remove: (id: string) =>
     api.delete<{ ok: boolean }>(`/api/contacts/${id}`),
+  removeMany: (ids: string[]) =>
+    api.post<{ deleted: number }>("/api/contacts/bulk-delete", { ids }),
+  removeAll: () => api.delete<{ deleted: number }>("/api/contacts/"),
   upload: async (file: File): Promise<UploadResult> => {
     const form = new FormData();
     form.append("file", file);

@@ -45,6 +45,8 @@ log = logging.getLogger(__name__)
 
 _BASE_URL = "https://api.crustdata.com"
 _TIMEOUT = 60.0
+# Realtime screener endpoints (keyword + person posts) are slower than watcher.
+_SCREENER_TIMEOUT = 120.0
 _KEYWORD_EVENT_SLUG = "linkedin-post-with-keyword"
 _PRODUCTION_PATH = "/watcher/watches"
 _SIMULATION_PATH = "/watcher/simulation/watches"
@@ -351,6 +353,211 @@ def delete_watch(watch_id: str | int) -> bool:
     if resp.status_code >= 400:
         raise CrustdataError(f"crustdata {resp.status_code}: {resp.text[:300]}")
     return True
+
+
+# ---------------------------------------------------------------- realtime screener
+# POST /screener/linkedin_posts/keyword_search/  — keyword + optional filters
+# GET  /screener/linkedin_posts                     — posts for one profile URL
+
+
+def _screener_headers() -> dict[str, str]:
+    if not settings.crustdata_api_key:
+        raise CrustdataNotConfigured("CRUSTDATA_API_KEY is not set.")
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Token {settings.crustdata_api_key}",
+        "Accept": "application/json, text/plain, */*",
+    }
+
+
+def _screener_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    _check_circuit()
+    with httpx.Client(
+        base_url=_BASE_URL,
+        headers=_screener_headers(),
+        timeout=_SCREENER_TIMEOUT,
+    ) as client:
+        try:
+            resp = client.post(path, json=payload)
+        except httpx.RequestError as err:
+            raise CrustdataError(f"crustdata screener transport error: {err}") from err
+    if resp.status_code in (401, 402):
+        _trip_circuit()
+        raise CrustdataQuotaExhausted(
+            f"crustdata screener {resp.status_code}: {resp.text[:300]}"
+        )
+    if resp.status_code == 429:
+        _trip_circuit()
+        raise CrustdataError(f"crustdata screener 429: {resp.text[:300]}")
+    if resp.status_code == 404:
+        return {}
+    if resp.status_code >= 400:
+        raise CrustdataError(f"crustdata screener {resp.status_code}: {resp.text[:400]}")
+    if not resp.content:
+        return {}
+    try:
+        body = resp.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _screener_get(path: str, params: dict[str, Any]) -> dict[str, Any]:
+    _check_circuit()
+    with httpx.Client(
+        base_url=_BASE_URL,
+        headers=_screener_headers(),
+        timeout=_SCREENER_TIMEOUT,
+    ) as client:
+        try:
+            resp = client.get(path, params=params)
+        except httpx.RequestError as err:
+            raise CrustdataError(f"crustdata screener transport error: {err}") from err
+    if resp.status_code in (401, 402):
+        _trip_circuit()
+        raise CrustdataQuotaExhausted(
+            f"crustdata screener {resp.status_code}: {resp.text[:300]}"
+        )
+    if resp.status_code == 429:
+        _trip_circuit()
+        raise CrustdataError(f"crustdata screener 429: {resp.text[:300]}")
+    if resp.status_code == 404:
+        return {}
+    if resp.status_code >= 400:
+        raise CrustdataError(f"crustdata screener {resp.status_code}: {resp.text[:400]}")
+    if not resp.content:
+        return {}
+    try:
+        body = resp.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _screener_extract_posts(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        for key in ("posts", "results", "data", "items"):
+            block = payload.get(key)
+            if isinstance(block, list):
+                return [x for x in block if isinstance(x, dict)]
+    return []
+
+
+def author_profile_url_from_screener_post(raw: dict[str, Any]) -> str | None:
+    """Best-effort author /in/ URL from a Crustdata screener post object."""
+    for key in (
+        "person_linkedin_flagship_profile_url",
+        "author_linkedin_url",
+        "linkedin_profile_url",
+        "person_linkedin_url",
+    ):
+        v = raw.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    hyp = raw.get("hyperlinks")
+    if isinstance(hyp, dict):
+        urls = hyp.get("person_linkedin_urls") or []
+        if urls and isinstance(urls[0], str) and urls[0].strip():
+            return urls[0].strip()
+    actor = raw.get("actor")
+    if isinstance(actor, dict):
+        for key in (
+            "linkedin_flagship_url",
+            "flagship_profile_url",
+            "profile_url",
+            "url",
+        ):
+            v = actor.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
+
+def screener_keyword_search_posts(
+    *,
+    keyword: str,
+    limit: int = 20,
+    page: int | None = None,
+    date_posted: str = "past-month",
+    filters: list[dict[str, Any]] | None = None,
+    exact_keyword_match: bool | None = None,
+) -> list[dict[str, Any]]:
+    """POST ``/screener/linkedin_posts/keyword_search/`` — realtime LinkedIn posts.
+
+    When ``page`` is set, Crustdata caps ``limit`` at 5. For bulk retrieval omit
+    ``page`` and pass ``limit`` up to 500."""
+    kw = (keyword or "").strip()
+    if not kw:
+        return []
+    body: dict[str, Any] = {"keyword": kw[:400], "date_posted": date_posted}
+    if page is not None:
+        body["page"] = int(page)
+        body["limit"] = min(int(limit), 5)
+    else:
+        body["limit"] = min(max(int(limit), 1), 500)
+    if filters:
+        body["filters"] = filters
+    if exact_keyword_match is not None:
+        body["exact_keyword_match"] = bool(exact_keyword_match)
+    payload = _screener_post("/screener/linkedin_posts/keyword_search/", body)
+    return _screener_extract_posts(payload)
+
+
+def screener_person_posts(
+    *,
+    person_linkedin_url: str,
+    limit: int = 5,
+    page: int | None = None,
+) -> list[dict[str, Any]]:
+    """GET ``/screener/linkedin_posts`` — recent posts for a single profile URL."""
+    url = (person_linkedin_url or "").strip()
+    if not url:
+        return []
+    params: dict[str, Any] = {"person_linkedin_url": url}
+    if page is not None:
+        params["page"] = int(page)
+        params["limit"] = min(int(limit), 5)
+    else:
+        params["limit"] = min(max(int(limit), 1), 100)
+    payload = _screener_get("/screener/linkedin_posts", params)
+    return _screener_extract_posts(payload)
+
+
+def screener_posts_for_members(
+    *,
+    member_profile_urls: list[str],
+    keyword: str = "a",
+    limit: int = 40,
+    date_posted: str = "past-month",
+    max_members: int = 12,
+) -> list[dict[str, Any]]:
+    """Keyword search with ``MEMBER`` filter — one call for several ``/in/`` URLs.
+
+    Crustdata allows a placeholder keyword (e.g. ``\"a\"``) when filtering by
+    specific members."""
+    seen: set[str] = set()
+    urls: list[str] = []
+    for u in member_profile_urls:
+        u = (u or "").strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        urls.append(u)
+    if not urls:
+        return []
+    urls = urls[: max(1, int(max_members))]
+    filters: list[dict[str, Any]] = [
+        {"filter_type": "MEMBER", "type": "in", "value": urls},
+    ]
+    return screener_keyword_search_posts(
+        keyword=keyword[:400] or "a",
+        limit=limit,
+        page=None,
+        date_posted=date_posted,
+        filters=filters,
+    )
 
 
 def build_keyword_expression(

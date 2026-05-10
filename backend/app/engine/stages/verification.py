@@ -26,6 +26,41 @@ from app.models.common import utcnow
 log = logging.getLogger(__name__)
 
 _MIN_SNIPPET_CHARS = 80
+_MIN_SNIPPET_CHARS_CONTACT_SEED = 32
+
+
+def _operator_geo_terms(operator: dict[str, Any]) -> list[str]:
+    """Same geography sources as discovery `_compose_discovery_query` (kept local to avoid import cycles)."""
+    ext = operator.get("product_extracted") or {}
+    raw = ext.get("target_geographies") or []
+    out: list[str] = []
+    for x in raw:
+        s = str(x).strip()
+        if len(s) >= 2:
+            out.append(s.lower())
+    rub = operator.get("icp_rubric") or {}
+    geo = rub.get("geography") or {}
+    for tier in geo.get("tiers") or []:
+        if not isinstance(tier, dict):
+            continue
+        for m in tier.get("matches") or []:
+            s = str(m).strip()
+            if len(s) >= 2:
+                out.append(s.lower())
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    return uniq[:15]
+
+
+def _haystack_matches_geo(haystack: str, geos: list[str]) -> bool:
+    if not geos:
+        return True
+    h = haystack.lower()
+    return any(g in h for g in geos)
 
 
 def _coerce_datetime(value: Any) -> datetime | None:
@@ -45,7 +80,12 @@ def _coerce_datetime(value: Any) -> datetime | None:
     return None
 
 
-def verify_candidates(db: Database, slate_run_id: ObjectId) -> tuple[int, int]:
+def verify_candidates(
+    db: Database,
+    slate_run_id: ObjectId,
+    *,
+    operator: dict[str, Any] | None = None,
+) -> tuple[int, int]:
     """Returns (verified_count, rejected_count) for this slate run."""
     raw = db.candidates.find({"slate_run_id": slate_run_id, "status": "raw"})
     verified, rejected = 0, 0
@@ -55,10 +95,19 @@ def verify_candidates(db: Database, slate_run_id: ObjectId) -> tuple[int, int]:
         utcnow() - timedelta(days=max_age_days) if max_age_days > 0 else None
     )
 
+    geos: list[str] = []
+    if operator and settings.discovery_require_geo_in_post:
+        geos = _operator_geo_terms(operator)
+
     for c in raw:
         snippet: str = (c.get("post_text") or "").strip()
         url: str = c.get("post_url") or ""
-        if not url or len(snippet) < _MIN_SNIPPET_CHARS:
+        min_len = (
+            _MIN_SNIPPET_CHARS_CONTACT_SEED
+            if c.get("source") == "contact_seed"
+            else _MIN_SNIPPET_CHARS
+        )
+        if not url or len(snippet) < min_len:
             db.candidates.update_one(
                 {"_id": c["_id"]},
                 {
@@ -71,6 +120,30 @@ def verify_candidates(db: Database, slate_run_id: ObjectId) -> tuple[int, int]:
             )
             rejected += 1
             continue
+
+        if geos:
+            hay = " ".join(
+                str(x or "")
+                for x in (
+                    snippet,
+                    c.get("author_title"),
+                    c.get("author_company"),
+                    c.get("author_name"),
+                )
+            )
+            if not _haystack_matches_geo(hay, geos):
+                db.candidates.update_one(
+                    {"_id": c["_id"]},
+                    {
+                        "$set": {
+                            "status": "rejected_url_mismatch",
+                            "drop_reason": "geo_not_in_post_or_author",
+                            "updated_at": utcnow(),
+                        }
+                    },
+                )
+                rejected += 1
+                continue
 
         # Recency gate: drop posts older than max_age_days. Candidates with
         # no parseable published_at are KEPT (don't penalize missing data —

@@ -37,7 +37,8 @@ from app.engine.stages.gates import (
     non_buyer,
     post_quality,
 )
-from app.engine.stages.rule_23 import Rule23ForceAbort, seal_slate
+from app.config import settings
+from app.engine.stages.rule_23 import Rule23ForceAbort, seal_slate, seal_slate_skip_checks
 from app.models.common import utcnow
 from app.services import client_config
 from app.services.email import EmailNotConfigured
@@ -172,7 +173,9 @@ def run_for_operator(db: Database, operator_id: ObjectId) -> dict[str, Any]:
             # 2. Verification (only newly-raw rows)
             t = utcnow()
             _set_stage(db, slate_run_id, "verification", started_at=t, total=discovered, note="checking URLs + text")
-            verified, rejected = verification.verify_candidates(db, slate_run_id)
+            verified, rejected = verification.verify_candidates(
+                db, slate_run_id, operator=operator
+            )
             verified_total += verified
             log.info("│  [verify]      %d verified, %d rejected  (%.1fs)", verified, rejected, (utcnow() - t).total_seconds())
             _audit(db, operator_id, slate_run_id, "stage_complete", "verification", {"verified": verified, "rejected": rejected, "round": round_num})
@@ -204,8 +207,10 @@ def run_for_operator(db: Database, operator_id: ObjectId) -> dict[str, Any]:
             t = utcnow()
             _set_stage(db, slate_run_id, "profile_resolve", started_at=t, total=cheap_passed, note="enriching survivors")
             resolve_counts = profile_resolve.resolve_profiles(db, slate_run_id)
-            log.info("│  [enrich]      %d resolved, %d no-match, %d filtered  (%.1fs)",
+            log.info(
+                "│  [enrich]      %d resolved, %d pdl_supplemented, %d no-match, %d filtered  (%.1fs)",
                 resolve_counts.get("resolved", 0),
+                resolve_counts.get("pdl_supplemented", 0),
                 resolve_counts.get("no_match", 0),
                 resolve_counts.get("skipped_filtered", 0),
                 (utcnow() - t).total_seconds(),
@@ -263,13 +268,36 @@ def run_for_operator(db: Database, operator_id: ObjectId) -> dict[str, Any]:
         log.info("│  [drafter]     %d drafted, validators all pass  (%.1fs)", drafted_count, (utcnow() - t).total_seconds())
         _audit(db, operator_id, slate_run_id, "stage_complete", "drafter", {"drafted": drafted_count})
 
-        # 6. RULE 23
+        # 6. RULE 23 (optional bypass: settings.skip_rule_23 / SKIP_RULE_23)
         t = utcnow()
-        _set_stage(db, slate_run_id, "rule_23", started_at=t, note="atomic 6-layer gate")
-        seal = seal_slate(
-            db, operator=operator, cofounders=cofounders, slate_run_id=slate_run_id
-        )
-        log.info("│  [rule_23]     sealed slated=%d  hmac=%s…  (%.1fs)", seal["slated"], (seal.get("hmac_token") or "")[:12], (utcnow() - t).total_seconds())
+        if settings.skip_rule_23:
+            _set_stage(
+                db,
+                slate_run_id,
+                "rule_23",
+                started_at=t,
+                note="skipped (skip_rule_23)",
+            )
+            seal = seal_slate_skip_checks(
+                db, operator=operator, cofounders=cofounders, slate_run_id=slate_run_id
+            )
+            log.info(
+                "│  [rule_23]     skipped floors; sealed slated=%d  hmac=%s…  (%.1fs)",
+                seal["slated"],
+                (seal.get("hmac_token") or "")[:12],
+                (utcnow() - t).total_seconds(),
+            )
+        else:
+            _set_stage(db, slate_run_id, "rule_23", started_at=t, note="atomic 6-layer gate")
+            seal = seal_slate(
+                db, operator=operator, cofounders=cofounders, slate_run_id=slate_run_id
+            )
+            log.info(
+                "│  [rule_23]     sealed slated=%d  hmac=%s…  (%.1fs)",
+                seal["slated"],
+                (seal.get("hmac_token") or "")[:12],
+                (utcnow() - t).total_seconds(),
+            )
 
         # 7. Email
         t = utcnow()
@@ -440,12 +468,16 @@ def _evaluate_expensive_gates(
             "gate_results": {**prior, "analyst": ar.model_dump()},
         }
 
+    lv_raw = c.get("author_title_levels")
+    title_levels = lv_raw if isinstance(lv_raw, list) else None
+
     try:
         icp = icp_scoring.evaluate(
             post_text=post_text,
             author_name=author,
             author_title=c.get("author_title"),
             author_company=c.get("author_company"),
+            author_title_levels=title_levels,
             icp_rubric=rubric,
         )
     except Exception as err:
@@ -698,9 +730,21 @@ def _run_drafter(
     allocated = list(db.candidates.find({"slate_run_id": slate_run_id, "status": "allocated"}))
     for c in allocated:
         cofounder = by_id.get(c["cofounder_id"])
-        if not cofounder or not cofounder.get("voice_profile"):
-            _drop(db, c, "drafter_no_voice")
+        if not cofounder:
+            _drop(db, c, "drafter_no_cofounder")
             continue
+        # Fallback: if the cofounder hasn't completed voice onboarding yet,
+        # use the engine's default operator-tone profile so we still draft
+        # a comment instead of silently dropping. The cofounder dict is
+        # mutated in-place so _draft_one sees the populated voice profile,
+        # and a one-time warning per slate flags that voice onboarding is
+        # incomplete (operator can finish it without re-running discovery).
+        if not cofounder.get("voice_profile"):
+            cofounder["voice_profile"] = drafter.DEFAULT_VOICE_PROFILE
+            log.warning(
+                "drafter: cofounder=%s missing voice_profile — using DEFAULT_VOICE_PROFILE fallback. Complete voice onboarding to silence this.",
+                cofounder.get("_id"),
+            )
         if _draft_one(db, c, cofounder):
             drafted += 1
     # Slate-level rebalancer: kick over-represented formulas off the slate.

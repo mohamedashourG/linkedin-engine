@@ -13,6 +13,7 @@ from typing import Annotated, Any
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Path, UploadFile, File, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pydantic import BaseModel, Field
 
 from app.auth.deps import CurrentUser
 from app.database import get_db
@@ -26,6 +27,16 @@ from app.models.contact import (
     parse_csv_bytes,
     parse_excel_bytes,
 )
+
+
+class ContactBulkDeleteRequest(BaseModel):
+    """Body for POST /api/contacts/bulk-delete.
+
+    `ids` is a list of contact IDs to delete. Empty list is a no-op (returns 0).
+    To wipe the entire list, use `DELETE /api/contacts/` instead.
+    """
+
+    ids: list[str] = Field(default_factory=list)
 
 router = APIRouter(prefix="/api/contacts", tags=["contacts"])
 
@@ -200,3 +211,37 @@ async def delete_contact(
     if result.deleted_count == 0:
         raise HTTPException(404, "Contact not found")
     return {"ok": True}
+
+
+@router.post("/bulk-delete")
+async def bulk_delete(
+    payload: ContactBulkDeleteRequest,
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> dict[str, int]:
+    """Delete a set of manual contacts by id."""
+    if not payload.ids:
+        return {"deleted": 0}
+    object_ids = [ObjectId(i) for i in payload.ids if ObjectId.is_valid(i)]
+    if not object_ids:
+        raise HTTPException(400, "No valid ids provided")
+    result = await db.discovery_seeds.delete_many(
+        {
+            "_id": {"$in": object_ids},
+            "operator_id": user["_id"],
+            "source": "manual",
+        }
+    )
+    return {"deleted": result.deleted_count}
+
+
+@router.delete("/")
+async def delete_all_contacts(
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> dict[str, int]:
+    """Wipe every manual contact for the current user."""
+    result = await db.discovery_seeds.delete_many(
+        {"operator_id": user["_id"], "source": "manual"}
+    )
+    return {"deleted": result.deleted_count}

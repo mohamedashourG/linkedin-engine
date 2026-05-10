@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Copy, Check, ExternalLink, Trash2, Edit3, Send } from "lucide-react";
+import { Clock, Copy, Check, ExternalLink, Trash2, Edit3, Send } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -25,9 +25,39 @@ const SOURCE_LABELS: Record<string, string> = {
   tier_3_kw: "tier-3 keyword",
   embedded_harvest: "harvested name",
   manual_seed: "target contact",
+  contact_unipile: "target contact",
 };
 
-export function SlateCard({ candidate }: { candidate: Candidate }) {
+/** Format an ISO timestamp as a short relative-time string ("3h ago", "2d ago"). */
+function formatPostAge(iso: string | null): string | null {
+  if (!iso) return null;
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) return null;
+  const seconds = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  const weeks = Math.floor(days / 7);
+  if (weeks < 5) return `${weeks}w ago`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${months}mo ago`;
+  const years = Math.floor(days / 365);
+  return `${years}y ago`;
+}
+
+export function SlateCard({
+  candidate,
+  rank,
+  total,
+}: {
+  candidate: Candidate;
+  rank?: number;
+  total?: number;
+}) {
   const qc = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState(candidate.comment_text ?? "");
@@ -74,6 +104,12 @@ export function SlateCard({ candidate }: { candidate: Candidate }) {
       {/* Header chips */}
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-1.5 flex-wrap">
+          {typeof rank === "number" && (
+            <Badge variant="muted" className="rounded-full font-mono tabular-nums">
+              #{rank}
+              {typeof total === "number" ? ` of ${total}` : ""}
+            </Badge>
+          )}
           {candidate.comment_type && (
             <Badge variant="default" className="rounded-full">
               {candidate.comment_type} · {COMMENT_TYPE_LABELS[candidate.comment_type] ?? candidate.comment_type}
@@ -81,10 +117,10 @@ export function SlateCard({ candidate }: { candidate: Candidate }) {
           )}
           {candidate.icp_score !== null && (
             <Badge
-              variant={candidate.icp_score >= 10 ? "success" : "secondary"}
+              variant={candidate.icp_score >= 8 ? "success" : "secondary"}
               className="rounded-full"
             >
-              ICP {candidate.icp_score}
+              ICP {candidate.icp_score}/10
             </Badge>
           )}
           <Badge variant="outline" className="rounded-full">
@@ -110,8 +146,19 @@ export function SlateCard({ candidate }: { candidate: Candidate }) {
 
       {/* Author + original post */}
       <div className="rounded-lg border bg-muted/30 p-3">
-        <div className="text-xs font-semibold mb-1">
-          {candidate.author_name ?? "Unknown author"}
+        <div className="flex items-center justify-between gap-2 mb-1">
+          <div className="text-xs font-semibold">
+            {candidate.author_name ?? "Unknown author"}
+          </div>
+          {(() => {
+            const age = formatPostAge(candidate.post_published_at);
+            return age ? (
+              <div className="inline-flex items-center gap-1 text-[11px] text-muted-foreground tabular-nums">
+                <Clock className="h-3 w-3" />
+                {age}
+              </div>
+            ) : null;
+          })()}
         </div>
         <p className="line-clamp-4 text-sm text-muted-foreground whitespace-pre-wrap">
           {candidate.post_text}

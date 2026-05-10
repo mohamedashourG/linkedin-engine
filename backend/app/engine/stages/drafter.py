@@ -31,6 +31,65 @@ class _Draft(BaseModel):
     )
 
 
+# Fallback voice profile used when a cofounder hasn't completed onboarding.
+# Generic operator-to-operator tone with three minimal example pairs so the
+# drafter has enough signal to produce a coherent comment. The slate's
+# resulting comments will be neutral but ship-able — once the cofounder
+# completes voice onboarding, this stops being used.
+DEFAULT_VOICE_PROFILE: dict = {
+    "tone_description": (
+        "Direct and operator-minded. Drop the obligatory hedge, lead with "
+        "the specific number or constraint, and ask the question that the "
+        "post implicitly raised but did not answer. No emojis, no hype "
+        "words. Short sentences. Lower-case is fine when it reads natural. "
+        "Always treat the author as a peer, never as a prospect."
+    ),
+    "examples": [
+        {
+            "post": (
+                "We just hit 100 customers. The hardest part was not closing "
+                "them, it was figuring out which of the first 10 actually "
+                "told us the truth about why they bought."
+            ),
+            "comment": (
+                "the first 10 lying problem is real. half the time the "
+                "stated reason is the polite version of the actual reason, "
+                "and the actual reason is what tells you whether to double "
+                "down on the wedge or rip it out. how did you separate the "
+                "two in your case?"
+            ),
+        },
+        {
+            "post": (
+                "Hot take: most onboarding flows are too long because product "
+                "teams treat them like a feature spec instead of a forcing "
+                "function. You should be deleting steps every week."
+            ),
+            "comment": (
+                "the spec vs forcing function framing is the part most teams "
+                "miss. once a step is in there, deleting it feels political "
+                "even when the data says it should go. did you find a way to "
+                "make deletion the default rather than the exception?"
+            ),
+        },
+        {
+            "post": (
+                "Sales engineers are the most leveraged hire at a Series A "
+                "B2B company. Change my mind."
+            ),
+            "comment": (
+                "fully agree on the leverage. the part i would add: the SE "
+                "is also the only person on the call who can cost you a "
+                "deal in the first 60 seconds by being too technical too "
+                "early. so leveraged on the upside, leveraged on the "
+                "downside. how do you train the second part?"
+            ),
+        },
+    ],
+    "source": "fallback_default",
+}
+
+
 DRAFTER_SYSTEM_PROMPT = """\
 You draft a single LinkedIn comment in {cofounder_name}'s voice on a post written by an ICP-fit operator. The goal is to land a substantive reply, eventually a connection request, eventually a 30-minute call.
 

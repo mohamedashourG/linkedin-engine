@@ -158,6 +158,25 @@ def search_linkedin_posts(query: str, *, page: int = 1) -> list[LinkedInPost]:
     return out
 
 
+def search_linkedin_posts_pages(query: str, *, max_pages: int) -> list[LinkedInPost]:
+    """Fetch pages 1..max_pages (inclusive), deduping by post URL. Stops early
+    when a page returns no posts. max_pages is clamped to [1, 5]."""
+    if not query.strip():
+        return []
+    cap = max(1, min(int(max_pages), 5))
+    seen: set[str] = set()
+    merged: list[LinkedInPost] = []
+    for page in range(1, cap + 1):
+        batch = search_linkedin_posts(query, page=page)
+        if not batch:
+            break
+        for p in batch:
+            if p.url and p.url not in seen:
+                seen.add(p.url)
+                merged.append(p)
+    return merged
+
+
 # ---------------------------------------------------------------- mock mode
 # Hand-curated dataset for offline demos / when apidirect quota is dry. Each
 # post is intentionally varied so the 4-gate filter has something to actually

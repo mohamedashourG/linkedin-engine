@@ -99,5 +99,16 @@ async def logout(response: Response) -> None:
 
 
 @router.get("/me", response_model=UserPublic)
-async def get_me(user: CurrentUser) -> UserPublic:
+async def get_me(
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> UserPublic:
+    # Sync DB flag when criteria changed (e.g. optional steps skipped; product+cofounder enough).
+    if not user.get("onboarding_complete"):
+        from app.routes.onboarding import _refresh_onboarding_complete
+
+        await _refresh_onboarding_complete(db, user["_id"])
+        fresh = await db.users.find_one({"_id": user["_id"]})
+        if fresh:
+            user = fresh
     return user_to_public(user)

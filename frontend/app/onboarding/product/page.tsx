@@ -100,7 +100,7 @@ export default function ProductPage() {
               disabled={freeText.trim().length < 20 || extract.isPending}
               onClick={() => {
                 setError(null);
-                extract.mutate(freeText);
+                extract.mutate(freeText.trim());
               }}
             >
               {extract.isPending ? "Extracting..." : "Extract ICP"}
