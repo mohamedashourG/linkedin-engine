@@ -9,8 +9,8 @@ Discovery stage: 5-source priority pipeline.
      rubric (title 5 + industry 3 + geo 2); Path B passes on post text
      keyword-tier hits (tier_1=3, tier_2=2, tier_3=1, capped at 12). Geo is
      required on both paths when the operator has ``target_geographies``
-     set. Inline-enriched candidates skip ``profile_resolve`` so Crustdata
-     / PDL credits aren't spent on data we already have. Reference:
+     set. Inline-enriched candidates carry ``enriched_inline`` for downstream
+     bookkeeping. Reference:
      ``unipile_hybrid_sweep.py``.
   2. Crustdata — (a) inbox drain of webhook-written Mongo rows; (b) optional
      realtime ``POST /screener/linkedin_posts/keyword_search/``; (c) optional
@@ -349,7 +349,7 @@ def _doc_from_unipile(
     the reasoning.
 
     When ``enriched_profile`` is set we also stamp ``enriched_inline=True``
-    so ``profile_resolve`` can skip the candidate (saves Crustdata credits)."""
+    for downstream consumers (audits / UI)."""
     ep = enriched_profile or {}
     doc = _candidate_doc(
         operator_id=operator_id,
@@ -660,9 +660,8 @@ def _doc_from_exa(
     source_classification: str,
     source_channel: str = "keyword_topical",
 ) -> dict[str, Any]:
-    # Pre-derive author URL from the LinkedIn post slug so profile_resolve
-    # can enrich it. /pulse/ and /feed/update/ URLs return None and stay
-    # unenrichable (Crustdata has nothing to look up).
+    # Pre-derive author URL from the LinkedIn post slug when the URL shape
+    # allows it. /pulse/ and /feed/update/ URLs return None.
     from app.engine.stages.verification import _author_url_from_post_url
     return _candidate_doc(
         operator_id=operator_id,
@@ -2210,7 +2209,7 @@ def _run_contact_seeds_unipile(
                 source_channel="contact_direct",
             )
             # Skip the rest of the funnel: verification + non_buyer +
-            # profile_resolve + analyst + ICP scoring. The allocator reads
+            # analyst + ICP scoring. The allocator reads
             # status="gate_passed" so we land right on its doorstep.
             doc["status"] = "gate_passed"
             doc["bypass_gates"] = True

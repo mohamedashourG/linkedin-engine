@@ -1,7 +1,7 @@
 """
 Crustdata People Enrichment client (`/screener/person/enrich`).
 
-Used as a higher-quality, batched replacement for PDL in profile_resolve.
+Used as a higher-quality, batched replacement for PDL when enriching authors by LinkedIn URL.
 Returns title + employer_name + headline + location for each LinkedIn URL —
 the fields ICP scoring needs but apidirect's post search doesn't include.
 

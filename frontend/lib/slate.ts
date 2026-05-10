@@ -65,7 +65,6 @@ export type PipelineStepBreakdown = {
 export type PipelineBreakdown = {
   discovery: PipelineStepBreakdown;
   verification: PipelineStepBreakdown;
-  profile_resolve: PipelineStepBreakdown;
   gates: PipelineStepBreakdown;
   allocator: PipelineStepBreakdown;
   drafter: PipelineStepBreakdown;

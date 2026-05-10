@@ -95,9 +95,11 @@ def verify_candidates(
         utcnow() - timedelta(days=max_age_days) if max_age_days > 0 else None
     )
 
+    # Geo-in-post gate disabled at verification: discovery / gates may still
+    # bias on geography; we do not reject raw → verified here for missing terms.
     geos: list[str] = []
-    if operator and settings.discovery_require_geo_in_post:
-        geos = _operator_geo_terms(operator)
+    # if operator and settings.discovery_require_geo_in_post:
+    #     geos = _operator_geo_terms(operator)
 
     for c in raw:
         snippet: str = (c.get("post_text") or "").strip()
@@ -125,33 +127,33 @@ def verify_candidates(
             rejected += 1
             continue
 
-        if geos:
-            hay = " ".join(
-                str(x or "")
-                for x in (
-                    snippet,
-                    c.get("author_title"),
-                    c.get("author_company"),
-                    c.get("author_name"),
-                )
-            )
-            if not _haystack_matches_geo(hay, geos):
-                log.info(
-                    "│  [DROP/verify] %s  ←  geo_not_in_post_or_author",
-                    url[:90],
-                )
-                db.candidates.update_one(
-                    {"_id": c["_id"]},
-                    {
-                        "$set": {
-                            "status": "rejected_url_mismatch",
-                            "drop_reason": "geo_not_in_post_or_author",
-                            "updated_at": utcnow(),
-                        }
-                    },
-                )
-                rejected += 1
-                continue
+        # if geos:
+        #     hay = " ".join(
+        #         str(x or "")
+        #         for x in (
+        #             snippet,
+        #             c.get("author_title"),
+        #             c.get("author_company"),
+        #             c.get("author_name"),
+        #         )
+        #     )
+        #     if not _haystack_matches_geo(hay, geos):
+        #         log.info(
+        #             "│  [DROP/verify] %s  ←  geo_not_in_post_or_author",
+        #             url[:90],
+        #         )
+        #         db.candidates.update_one(
+        #             {"_id": c["_id"]},
+        #             {
+        #                 "$set": {
+        #                     "status": "rejected_url_mismatch",
+        #                     "drop_reason": "geo_not_in_post_or_author",
+        #                     "updated_at": utcnow(),
+        #                 }
+        #             },
+        #         )
+        #         rejected += 1
+        #         continue
 
         # Recency gate: drop posts older than max_age_days. Candidates with
         # no parseable published_at are KEPT (don't penalize missing data —

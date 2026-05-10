@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -29,6 +30,9 @@ from app.config import settings
 log = logging.getLogger(__name__)
 
 _TIMEOUT = 30.0
+# Transient 429 from Unipile/LinkedIn — brief exponential backoff then re-raise via _check_resp.
+_UNIPILE_429_MAX_ATTEMPTS = 3
+_UNIPILE_429_BACKOFF_BASE_S = 0.75
 
 
 class UnipileNotConfigured(RuntimeError):
@@ -126,6 +130,38 @@ def _client() -> httpx.Client:
     )
 
 
+def _request_with_429_retry(client: httpx.Client, method: str, path: str, **kwargs: Any) -> httpx.Response:
+    """Run one HTTP call; on 429 retry with exponential backoff (in-process)."""
+    m = method.upper()
+    last: httpx.Response | None = None
+    for attempt in range(_UNIPILE_429_MAX_ATTEMPTS):
+        last = client.request(m, path, **kwargs)
+        if last.status_code != 429:
+            return last
+        if attempt < _UNIPILE_429_MAX_ATTEMPTS - 1:
+            delay = _UNIPILE_429_BACKOFF_BASE_S * (2**attempt)
+            log.warning(
+                "unipile 429 %s %s attempt %d/%d, sleeping %.2fs",
+                m,
+                path[:120],
+                attempt + 1,
+                _UNIPILE_429_MAX_ATTEMPTS,
+                delay,
+            )
+            time.sleep(delay)
+    assert last is not None
+    return last
+
+
+def _rule24_default_location_ids() -> tuple[str, ...]:
+    """Geo filter for RULE 24 people search; env override or US default."""
+    raw = (settings.unipile_rule24_location_ids or "").strip()
+    if not raw:
+        return (LINKEDIN_GEO_URN_US,)
+    ids = [x.strip() for x in raw.split(",") if x.strip()][:10]
+    return tuple(ids) if ids else (LINKEDIN_GEO_URN_US,)
+
+
 def _check_resp(resp: httpx.Response, context: str) -> dict[str, Any]:
     if resp.status_code == 401:
         raise UnipileError(f"unipile 401 ({context}): {resp.text[:300]}")
@@ -169,7 +205,7 @@ def list_accounts() -> list[UnipileAccount]:
             )
         ]
     with _client() as client:
-        resp = client.get("/accounts", params={"limit": 50})
+        resp = _request_with_429_retry(client, "GET", "/accounts", params={"limit": 50})
     payload = _check_resp(resp, "list_accounts")
     items = payload.get("items") or []
     out: list[UnipileAccount] = []
@@ -325,7 +361,9 @@ def _search_posts_call(
     if cursor is not None and str(cursor).strip():
         params["cursor"] = cursor
     with _client() as client:
-        resp = client.post("/linkedin/search", params=params, json=body)
+        resp = _request_with_429_retry(
+            client, "POST", "/linkedin/search", params=params, json=body
+        )
     payload = _check_resp(resp, "search_posts")
     items = payload.get("items") or payload.get("results") or []
     out: list[UnipilePost] = []
@@ -388,7 +426,7 @@ def search_posts_pages(
     per_page: int = 50,
     sort_by: str | None = "relevance",
     date_posted: str | None = None,
-    content_type: str | list[str] | None = "documents",
+    content_type: str | list[str] | None = None,
     author_keywords: str | None = None,
     location_ids: list[str] | None = None,
 ) -> list[UnipilePost]:
@@ -403,6 +441,9 @@ def search_posts_pages(
 
     ``max_pages`` applies per date window (each window is clamped to [1, 10]
     pages).
+
+    ``content_type`` defaults to ``None`` (no server-side content-type filter),
+    matching ``search_posts``. Discovery passes e.g. ``documents`` via settings.
 
     ``location_ids`` are passed as ``body["location"]`` (up to 10 ids) when set.
     """
@@ -443,6 +484,11 @@ def search_posts_pages(
             if not next_cursor:
                 break
             cursor = str(next_cursor)
+    log.info(
+        "unipile search_posts_pages merged_posts=%d query=%.120s",
+        len(merged),
+        query,
+    )
     return merged
 
 
@@ -521,7 +567,9 @@ def search_parameter_ids(
         "limit": max(1, min(int(limit), 100)),
     }
     with _client() as client:
-        resp = client.get("/linkedin/search/parameters", params=params)
+        resp = _request_with_429_retry(
+            client, "GET", "/linkedin/search/parameters", params=params
+        )
     payload = _check_resp(resp, "search_parameter_ids")
     items = payload.get("items") or []
     out: list[UnipileSearchParameter] = []
@@ -727,7 +775,7 @@ def search_people(
     account_id: str,
     query: str,
     limit: int = 10,
-    location_ids: tuple[str, ...] = (LINKEDIN_GEO_URN_US,),
+    location_ids: tuple[str, ...] | None = None,
     network_distance_degrees: tuple[int, ...] = (2,),
 ) -> list[UnipilePerson]:
     """RULE 24 — LinkedIn classic people search via Unipile.
@@ -737,11 +785,13 @@ def search_people(
       location           array of digit-STRINGS (e.g. ["103644278"] for US)
       network_distance   array of NUMBERS, enum {1, 2, 3}
 
-    Default is US + 2nd-degree only, matching the audit URL
-    (geoUrn=103644278, 2nd-degree network filter).
+    Default ``location`` is US (``LINKEDIN_GEO_URN_US``) unless overridden via
+    ``UNIPILE_RULE24_LOCATION_IDS`` (comma-separated). ``None`` uses that default;
+    pass ``location_ids=()`` to skip the geo filter entirely.
 
-    Pass `location_ids=()` to skip the geo filter, `network_distance_degrees=()`
-    to accept any connection degree. Both filters are sent server-side AND
+    Default network filter is 2nd-degree only, matching the audit URL.
+    Pass ``network_distance_degrees=()`` to accept any connection degree. Both
+    filters are sent server-side AND
     re-checked client-side as a belt-and-suspenders against tenant-side
     schema drift.
 
@@ -749,17 +799,20 @@ def search_people(
     are dropped by _parse_unipile_person."""
     if settings.unipile_mock or not query.strip():
         return []
+    loc_ids = _rule24_default_location_ids() if location_ids is None else location_ids
     body: dict[str, Any] = {
         "api": "classic",
         "category": "people",
         "keywords": query[:300],
     }
-    if location_ids:
-        body["location"] = list(location_ids)
+    if loc_ids:
+        body["location"] = list(loc_ids)
     if network_distance_degrees:
         body["network_distance"] = list(network_distance_degrees)
     with _client() as client:
-        resp = client.post(
+        resp = _request_with_429_retry(
+            client,
+            "POST",
             "/linkedin/search",
             params={"account_id": account_id, "limit": limit},
             json=body,
@@ -781,6 +834,7 @@ def search_people(
             if nd not in allowed:
                 continue
         out.append(person)
+    log.info("unipile search_people people=%d query=%.120s", len(out), query)
     return out
 
 
@@ -795,7 +849,9 @@ def _resolve_user_provider_id(client: httpx.Client, *, account_id: str, slug: st
     Returns None if the slug can't be resolved (locked profile, etc.).
     """
     try:
-        resp = client.get(f"/users/{slug}", params={"account_id": account_id})
+        resp = _request_with_429_retry(
+            client, "GET", f"/users/{slug}", params={"account_id": account_id}
+        )
     except httpx.RequestError:
         return None
     if resp.status_code == 404:
@@ -842,7 +898,9 @@ def get_user_posts(
             user_id = _resolve_user_provider_id(client, account_id=account_id, slug=slug)
             if not user_id:
                 return []
-        resp = client.get(
+        resp = _request_with_429_retry(
+            client,
+            "GET",
             f"/users/{user_id}/posts",
             params={"account_id": account_id, "limit": limit},
         )
@@ -915,7 +973,9 @@ def get_post(*, account_id: str, post_id_or_url: str) -> UnipilePost | None:
         return None
 
     with _client() as client:
-        resp = client.get(
+        resp = _request_with_429_retry(
+            client,
+            "GET",
             f"/posts/{post_id}",
             params={"account_id": account_id},
         )
@@ -940,7 +1000,9 @@ def get_post_comments(*, account_id: str, post_url: str) -> list[UnipileComment]
     if not post_url:
         return []
     with _client() as client:
-        resp = client.get(
+        resp = _request_with_429_retry(
+            client,
+            "GET",
             "/posts/comments",
             params={"account_id": account_id, "post_url": post_url, "limit": 100},
         )
@@ -975,7 +1037,7 @@ def send_invite(
     if message:
         body["message"] = message[:300]
     with _client() as client:
-        resp = client.post("/users/invite", json=body)
+        resp = _request_with_429_retry(client, "POST", "/users/invite", json=body)
     payload = _check_resp(resp, "send_invite")
     return str(payload.get("invitation_id") or payload.get("id") or "")
 
@@ -1013,7 +1075,9 @@ def create_hosted_auth_link(
         body["notify_url"] = notify_url
 
     with _client() as client:
-        resp = client.post("/hosted/accounts/link", json=body)
+        resp = _request_with_429_retry(
+            client, "POST", "/hosted/accounts/link", json=body
+        )
     payload = _check_resp(resp, "create_hosted_auth_link")
     url = payload.get("url") or payload.get("hosted_url")
     if not url:
@@ -1026,7 +1090,9 @@ def find_account_by_name(name: str) -> UnipileAccount | None:
     if settings.unipile_mock:
         return None
     with _client() as client:
-        resp = client.get("/accounts", params={"name": name, "limit": 5})
+        resp = _request_with_429_retry(
+            client, "GET", "/accounts", params={"name": name, "limit": 5}
+        )
     payload = _check_resp(resp, "find_account_by_name")
     items = payload.get("items") or []
     if not items:
@@ -1057,7 +1123,9 @@ def resolve_profile(*, account_id: str, public_identifier_or_url: str) -> dict[s
     if "/in/" in slug:
         slug = slug.split("/in/", 1)[1].split("/", 1)[0].split("?", 1)[0]
     with _client() as client:
-        resp = client.get(f"/users/{slug}", params={"account_id": account_id})
+        resp = _request_with_429_retry(
+            client, "GET", f"/users/{slug}", params={"account_id": account_id}
+        )
     return _check_resp(resp, "resolve_profile")
 
 

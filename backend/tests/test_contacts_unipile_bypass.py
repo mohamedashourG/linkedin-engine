@@ -1,6 +1,6 @@
 """
 Contact-only fast path: pull posts via Unipile and skip
-verification + cheap-gates + profile_resolve + expensive-gates.
+verification + cheap-gates + expensive-gates (no separate profile-resolve stage).
 
 These tests drive `_run_contact_seeds_unipile` against a fake Unipile
 (monkeypatched) and a fake mongo collection. They prove:

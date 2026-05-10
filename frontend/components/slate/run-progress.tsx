@@ -11,7 +11,6 @@ import {
   Search,
   ShieldCheck,
   Sparkles,
-  UserCheck,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -21,7 +20,6 @@ import type { SlateRun } from "@/lib/slate";
 const STAGE_LABEL: Record<string, { label: string; icon: typeof Search }> = {
   discovery: { label: "Discovery", icon: Search },
   verification: { label: "Verification", icon: CheckCircle2 },
-  profile_resolve: { label: "Profile resolve", icon: UserCheck },
   gates: { label: "4-gate filter", icon: ListFilter },
   allocator: { label: "Allocation", icon: Activity },
   drafter: { label: "Drafting", icon: PenLine },
@@ -34,7 +32,6 @@ const STAGE_LABEL: Record<string, { label: string; icon: typeof Search }> = {
 const STAGE_ORDER = [
   "discovery",
   "verification",
-  "profile_resolve",
   "gates",
   "allocator",
   "drafter",
@@ -46,6 +43,8 @@ const STAGE_ORDER = [
 function normalizeStageId(s: string | null | undefined): string {
   if (!s) return "";
   if (s.startsWith("discovery")) return "discovery";
+  // Legacy slates: profile_resolve stage removed from the pipeline.
+  if (s === "profile_resolve") return "gates";
   return s;
 }
 

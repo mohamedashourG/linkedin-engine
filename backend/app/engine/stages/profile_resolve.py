@@ -1,9 +1,9 @@
 """
-Profile-resolve stage: enrich each verified candidate's author with title /
-employer (+ seniority) using Crustdata and/or PDL.
+Profile-resolve (Crustdata / PDL enrichment).
 
-Runs between cheap gates and expensive gates. Resolved fields are persisted
-on the candidate doc so the ICP scorer can use real evidence.
+Not invoked by ``daily_run`` anymore — author fields are expected from discovery
+(e.g. Unipile). This module remains for ad-hoc scripts or future reuse: it would
+enrich each cheap-gate-passed candidate's author and persist fields for ICP.
 
 Source behavior:
   1. Crustdata `/screener/person/enrich` when enrich_with_crustdata=true

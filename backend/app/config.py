@@ -197,6 +197,9 @@ class Settings(BaseSettings):
     unipile_subdomain: str = ""
     unipile_port: int = 443
     unipile_mock: bool = False
+    # RULE 24 people search: default LinkedIn geoUrn id(s), comma-separated.
+    # Empty string → single US urn ``103644278`` (see unipile.LINKEDIN_GEO_URN_US).
+    unipile_rule24_location_ids: str = ""
 
     resend_api_key: str = ""
     resend_from_email: str = "hello@example.com"

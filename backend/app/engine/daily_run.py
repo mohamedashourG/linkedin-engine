@@ -4,7 +4,7 @@ Daily run orchestrator. Runs sync inside a Celery worker.
 Pipeline (per spec):
   1. Discovery
   2. Verification
-  3. 4-gate filter (sequential, drop on first fail)
+  3. 4-gate filter (cheap then expensive; sequential, drop on first fail)
   4. Allocation (per-cofounder + comment type)
   5. Drafting + validator
   6. RULE 23 atomic gate
@@ -27,7 +27,6 @@ from app.engine.stages import (
     allocator,
     discovery,
     drafter,
-    profile_resolve,
     validator,
     verification,
 )
@@ -52,7 +51,6 @@ _STAGE_ETA_SECONDS = {
     # runs ~4 LLM calls.
     "discovery": 0.05,           # ~6s for 13 keyword searches
     "verification": 0.005,
-    "profile_resolve": 0.20,
     "gates": 1.20,                # ~5 min for 250 candidates × 4 gates
     "allocator": 0.02,
     "drafter": 8.0,               # per-survivor LLM call
@@ -64,7 +62,6 @@ _STAGE_ETA_SECONDS = {
 _STAGE_ORDER = (
     "discovery",
     "verification",
-    "profile_resolve",
     "gates",
     "allocator",
     "drafter",
@@ -135,7 +132,7 @@ def run_for_operator(db: Database, operator_id: ObjectId) -> dict[str, Any]:
     log.info("┌── daily_run start  operator=%s  slate=%s", operator_id, slate_run_id)
 
     try:
-        # 1-3. Discovery → verification → profile_resolve → gates, with up to
+        # 1-3. Discovery → verification → gates (cheap then expensive), with up to
         # _MAX_TOP_UP_ROUNDS top-up passes targeting cofounders below their
         # RULE 23 per-cofounder floor. Each round only fetches/processes for
         # the deficit cofounders, so cost scales with how short we are, not
@@ -205,23 +202,8 @@ def run_for_operator(db: Database, operator_id: ObjectId) -> dict[str, Any]:
             )
             _audit(db, operator_id, slate_run_id, "stage_complete", f"cheap_gates_round_{round_num}", cheap_counts)
 
-            # 2c. Profile-resolve (Crustdata or PDL) — only on cheap-passed survivors.
-            # profile_resolve queries status="cheap_gate_passed" so cost scales with
-            # survivor count, not with raw discovery volume.
-            t = utcnow()
-            _set_stage(db, slate_run_id, "profile_resolve", started_at=t, total=cheap_passed, note="enriching survivors")
-            resolve_counts = profile_resolve.resolve_profiles(db, slate_run_id)
-            log.info(
-                "│  [enrich]      %d resolved, %d pdl_supplemented, %d no-match, %d filtered  (%.1fs)",
-                resolve_counts.get("resolved", 0),
-                resolve_counts.get("pdl_supplemented", 0),
-                resolve_counts.get("no_match", 0),
-                resolve_counts.get("skipped_filtered", 0),
-                (utcnow() - t).total_seconds(),
-            )
-            _audit(db, operator_id, slate_run_id, "stage_complete", "profile_resolve", resolve_counts)
-
-            # 2d. EXPENSIVE gates (analyst + icp_scoring) — uses enriched title
+            # 2c. EXPENSIVE gates (analyst + icp_scoring) — author fields come from
+            # discovery (e.g. Unipile inline / post payload), not a separate enrich stage.
             t = utcnow()
             _set_stage(db, slate_run_id, "gates", started_at=t, total=cheap_passed, note=f"expensive gates (round {round_num})")
             expensive_counts = _run_gates(
@@ -448,11 +430,11 @@ def _evaluate_expensive_gates(
     *,
     rubric: dict[str, Any],
 ) -> tuple[str, dict[str, Any]]:
-    """Phase C: expensive gates that benefit from enriched author data.
+    """Phase C: expensive gates (analyst + ICP).
 
-    Runs analyst_reportage then icp_scoring. ICP uses author_title and
-    author_company (set by Crustdata enrich between phases) to score against
-    the rubric. Existing gate_results from the cheap phase are merged in.
+    ICP uses author_title, author_company, and optional author_title_levels
+    from discovery (e.g. Unipile post + inline profile) when present. Existing
+    gate_results from the cheap phase are merged in.
 
     verdict ∈ {"analyst", "icp_low", "passed", "error_<gate>"}
     """

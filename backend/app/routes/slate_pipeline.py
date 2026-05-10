@@ -105,34 +105,6 @@ def compute_pipeline_breakdown(
         else:
             ver_pass.append(c)
 
-    prof_pass: list[dict[str, Any]] = []
-    prof_pending: list[dict[str, Any]] = []
-    for c in candidates:
-        st = c.get("status") or ""
-        dr = c.get("drop_reason")
-        if st == "rejected_url_mismatch":
-            continue
-        if st == "gate_dropped" and dr and _cheap_gate_reason(dr):
-            continue
-        if building and st in ("raw", "verified"):
-            prof_pending.append(c)
-            continue
-        if building and st == "cheap_gate_passed":
-            prof_pending.append(c)
-            continue
-        if st in (
-            "cheap_gate_passed",
-            "gate_passed",
-            "allocated",
-            "drafted",
-            "slated",
-            "shipped",
-            "dropped_by_user",
-        ):
-            prof_pass.append(c)
-        elif st == "gate_dropped" and dr and _is_gate_failure(dr):
-            prof_pass.append(c)
-
     gate_pass: list[dict[str, Any]] = []
     gate_fail: list[dict[str, Any]] = []
     for c in candidates:
@@ -194,11 +166,6 @@ def compute_pipeline_breakdown(
             [pipeline_post_ref(c) for c in ver_pass],
             [pipeline_post_ref(c) for c in ver_fail],
             [pipeline_post_ref(c) for c in ver_pending],
-        ),
-        "profile_resolve": _finalize_lists(
-            [pipeline_post_ref(c) for c in prof_pass],
-            [],
-            [pipeline_post_ref(c) for c in prof_pending],
         ),
         "gates": _finalize_lists(
             [pipeline_post_ref(c) for c in gate_pass],

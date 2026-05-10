@@ -9,7 +9,6 @@ import type { PipelineBreakdown, PipelinePostRef } from "@/lib/slate";
 const STEPS: { key: keyof PipelineBreakdown; title: string; hint?: string }[] = [
   { key: "discovery", title: "Discovery", hint: "Posts pulled from search" },
   { key: "verification", title: "Verification" },
-  { key: "profile_resolve", title: "Profile", hint: "Enrichment before ICP gates" },
   { key: "gates", title: "4-gate filter" },
   { key: "allocator", title: "Allocation" },
   { key: "drafter", title: "Drafting" },

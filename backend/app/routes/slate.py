@@ -77,7 +77,6 @@ class PipelineStepBreakdownPublic(BaseModel):
 class PipelineBreakdownPublic(BaseModel):
     discovery: PipelineStepBreakdownPublic
     verification: PipelineStepBreakdownPublic
-    profile_resolve: PipelineStepBreakdownPublic
     gates: PipelineStepBreakdownPublic
     allocator: PipelineStepBreakdownPublic
     drafter: PipelineStepBreakdownPublic
