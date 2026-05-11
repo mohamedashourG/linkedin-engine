@@ -79,15 +79,40 @@ def compute_score_0_10(total: int, rubric: dict[str, Any]) -> int:
     return max(0, min(10, round(total * 10 / cap)))
 
 
+def _top_tier_score(rubric: dict[str, Any], axis: str) -> tuple[int, list[str]]:
+    """Return (score, matched_terms) for the highest tier on the given axis."""
+    tiers = (rubric.get(axis) or {}).get("tiers") or []
+    if not tiers:
+        return 0, []
+    best = max(tiers, key=lambda t: int(t.get("score", 0) or 0))
+    return int(best.get("score", 0) or 0), list(best.get("matches") or [])
+
+
 def evaluate(
     *,
     post_text: str,
     author_name: str | None,
     author_title: str | None = None,
     author_company: str | None = None,
+    author_location: str | None = None,
     author_title_levels: list[str] | None = None,
     icp_rubric: dict[str, Any],
+    geo_verified_at_source: bool = False,
+    industry_verified_at_source: bool = False,
 ) -> _IcpScore:
+    """Score author against the operator's ICP rubric.
+
+    When ``geo_verified_at_source`` is True the candidate came from a source
+    that already enforced geography server-side (Unipile RULE 24 people-search
+    with geoUrn, Crustdata watcher with AUTHOR_LOCATION). We bypass the LLM's
+    re-evaluation of the geo axis and credit it at the rubric's top tier —
+    the LLM scoring is rubric-faithful, so a too-narrow rubric (e.g.
+    ``["United States", "US", "USA"]``) can wrongly drop verified-US authors
+    whose location string is region-shaped (`"Atlanta Metropolitan Area"`).
+
+    Same for ``industry_verified_at_source`` — when the people-search applied
+    the INDUSTRY filter, all returned candidates are guaranteed in-industry.
+    """
     rubric_text = _format_rubric(icp_rubric)
     author_block: list[str] = []
     if author_name:
@@ -96,6 +121,8 @@ def evaluate(
         author_block.append(f"Title: {author_title}")
     if author_company:
         author_block.append(f"Company: {author_company}")
+    if author_location:
+        author_block.append(f"Location: {author_location}")
     if author_title_levels:
         author_block.append(
             "Seniority / title levels (enrichment): "
@@ -109,12 +136,47 @@ def evaluate(
         f"AUTHOR DATA:\n{chr(10).join(author_block)}\n\n"
         f"POST:\n{post_text}"
     )
-    return parse_structured_sync(
+    result = parse_structured_sync(
         model_tier="primary",
         system=_SYSTEM,
         user=user_msg,
         schema=_IcpScore,
     )
+
+    # Server-side filter overrides — only credit when the LLM didn't already
+    # score the axis at top tier (avoid double-counting if it did match).
+    overridden_axes: list[str] = []
+    if geo_verified_at_source:
+        top, matches = _top_tier_score(icp_rubric, "geography")
+        if top > result.geography.score:
+            result.geography.score = top
+            # First few rubric terms shown for audit. Real evidence is the
+            # source-side filter that guaranteed the geography match.
+            result.geography.matched_terms = [
+                "verified at source (server-side geoUrn)",
+                *matches[:2],
+            ]
+            overridden_axes.append("geography")
+    if industry_verified_at_source:
+        top, matches = _top_tier_score(icp_rubric, "industry")
+        if top > result.industry.score:
+            result.industry.score = top
+            result.industry.matched_terms = [
+                "verified at source (server-side INDUSTRY filter)",
+                *matches[:2],
+            ]
+            overridden_axes.append("industry")
+    if overridden_axes:
+        result.total = (
+            result.title.score
+            + result.industry.score
+            + result.geography.score
+            + result.stage.score
+        )
+        suffix = f" [auto-credited at top tier: {', '.join(overridden_axes)}]"
+        result.rationale = (result.rationale or "") + suffix
+
+    return result
 
 
 def _format_rubric(rubric: dict[str, Any]) -> str:

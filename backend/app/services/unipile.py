@@ -776,6 +776,7 @@ def search_people(
     query: str,
     limit: int = 10,
     location_ids: tuple[str, ...] | None = None,
+    industry_ids: tuple[str, ...] | None = None,
     network_distance_degrees: tuple[int, ...] = (2,),
 ) -> list[UnipilePerson]:
     """RULE 24 — LinkedIn classic people search via Unipile.
@@ -807,6 +808,8 @@ def search_people(
     }
     if loc_ids:
         body["location"] = list(loc_ids)
+    if industry_ids:
+        body["industry"] = list(industry_ids)
     if network_distance_degrees:
         body["network_distance"] = list(network_distance_degrees)
     with _client() as client:

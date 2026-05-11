@@ -22,6 +22,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { RangePicker } from "@/components/charts/range-picker";
+import { GateFunnel } from "@/components/charts/gate-funnel";
 import { analyticsApi, type Range } from "@/lib/analytics";
 
 const TYPE_LABELS: Record<string, string> = {
@@ -67,6 +68,8 @@ export default function AnalyticsPage() {
         </div>
         <RangePicker value={range} onChange={setRange} />
       </div>
+
+      <GateFunnel />
 
       <Card>
         <CardHeader>

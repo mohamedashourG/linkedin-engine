@@ -59,7 +59,33 @@
           "Mental Health Care",
           "Hospitals and Health Care",
           "Health Wellness and Fitness",
-          "Health Care Services"
+          "Health Care Services",
+          "Family Medicine",
+          "Internal Medicine",
+          "Pediatrics",
+          "Geriatrics",
+          "Emergency Medicine",
+          "General Practice",
+          "Primary Care",
+          "Direct Primary Care",
+          "DPC",
+          "Concierge Medicine",
+          "Outpatient Care",
+          "Private Practice",
+          "Independent Physician Practice",
+          "Physician Practice",
+          "Physician Office",
+          "Solo Practice",
+          "Group Practice",
+          "Multispecialty Practice",
+          "Medical Group",
+          "Cardiology",
+          "Dermatology",
+          "Psychiatry",
+          "Podiatry",
+          "Ambulatory Care",
+          "Telemedicine",
+          "Telehealth"
         ],
         "score": 3
       }
@@ -68,7 +94,20 @@
   "geography": {
     "tiers": [
       {
-        "matches": ["United States", "US", "USA"],
+        "matches": [
+          "United States", "US", "USA", "U.S.", "U.S.A.",
+          "Alabama", "Alaska", "Arizona", "Arkansas", "California",
+          "Colorado", "Connecticut", "Delaware", "Florida", "Georgia",
+          "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa",
+          "Kansas", "Kentucky", "Louisiana", "Maine", "Maryland",
+          "Massachusetts", "Michigan", "Minnesota", "Mississippi", "Missouri",
+          "Montana", "Nebraska", "Nevada", "New Hampshire", "New Jersey",
+          "New Mexico", "New York", "North Carolina", "North Dakota", "Ohio",
+          "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island", "South Carolina",
+          "South Dakota", "Tennessee", "Texas", "Utah", "Vermont",
+          "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming",
+          "District of Columbia", "Washington, DC", "DC", "Puerto Rico"
+        ],
         "score": 2
       }
     ]

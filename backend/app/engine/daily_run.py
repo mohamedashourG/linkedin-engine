@@ -463,8 +463,16 @@ def _evaluate_expensive_gates(
             author_name=author,
             author_title=c.get("author_title"),
             author_company=c.get("author_company"),
+            author_location=c.get("author_location"),
             author_title_levels=title_levels,
             icp_rubric=rubric,
+            # When the candidate came from a source that filtered geo or
+            # industry server-side (RULE 24 people-search with geoUrn /
+            # INDUSTRY filter), the LLM auto-credits those axes at the
+            # rubric's top tier — no re-evaluation that could wrongly drop
+            # verified candidates whose location string is region-shaped.
+            geo_verified_at_source=bool(c.get("geo_verified_at_source")),
+            industry_verified_at_source=bool(c.get("industry_verified_at_source")),
         )
     except Exception as err:
         return "error_icp", {"err": str(err)}

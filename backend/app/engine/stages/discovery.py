@@ -59,6 +59,7 @@ from app.engine.constants import (
 )
 from app.models.common import utcnow
 from app.services import client_config
+from app.services.geo_resolver import is_us_location
 from app.services.apidirect import (
     ApiDirectError,
     ApiDirectNotConfigured,
@@ -101,6 +102,130 @@ _SENIORITY_HINT_RE = re.compile(
     r"president|cfo|coo|ceo|cto|cmo|managing\s+director)\b",
     re.I,
 )
+
+
+def _resolve_industry_ids_for_operator(
+    db: Database,
+    *,
+    operator_id: ObjectId,
+    operator: dict[str, Any],
+    account_id: str,
+    max_terms: int = 6,
+    max_ids_per_term: int = 2,
+) -> list[str]:
+    """Resolve the operator's target industries → Unipile/LinkedIn INDUSTRY
+    parameter IDs, cached cross-run.
+
+    The Unipile people-search ``industry`` body field accepts an array of
+    digit-string IDs (e.g. ``["14"]`` for Hospital & Health Care). We look
+    them up once per run via GET /linkedin/search/parameters?type=INDUSTRY
+    and cache them in ``unipile_industry_id_cache`` keyed by the operator.
+
+    Returns at most ``max_terms × max_ids_per_term`` IDs to keep the
+    request lean (LinkedIn's filter is OR-style, more IDs = wider net).
+    """
+    from app.services.unipile import (
+        search_parameter_ids,
+        UnipileError,
+        UnipileNotConfigured,
+    )
+
+    ext = operator.get("product_extracted") or {}
+    target_inds = [str(s).strip() for s in (ext.get("target_industries") or []) if str(s).strip()]
+    if not target_inds:
+        return []
+
+    # Cross-run cache. Industry IDs don't change at LinkedIn's level, so a
+    # 30-day TTL is fine; we just want to avoid the PARAMETERS lookup on
+    # every run for the same operator.
+    cache_key = {"operator_id": operator_id, "kind": "industry_ids"}
+    cached = db.unipile_industry_id_cache.find_one(cache_key) if hasattr(db, "unipile_industry_id_cache") else None
+    try:
+        cached = db["unipile_industry_id_cache"].find_one(cache_key)
+    except Exception:
+        cached = None
+    if cached:
+        ttl_cutoff = utcnow() - timedelta(days=30)
+        if cached.get("fetched_at") and cached["fetched_at"] >= ttl_cutoff:
+            return list(cached.get("ids") or [])
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for term in target_inds[:max_terms]:
+        try:
+            hits = search_parameter_ids(
+                account_id=account_id, type="INDUSTRY", keywords=term, limit=max_ids_per_term
+            )
+        except (UnipileError, UnipileNotConfigured) as err:
+            log.warning("discovery: industry lookup failed for term=%r: %s", term, err)
+            continue
+        for h in hits[:max_ids_per_term]:
+            sid = str(h.id).strip() if hasattr(h, "id") else ""
+            if sid and sid not in seen:
+                seen.add(sid)
+                resolved.append(sid)
+
+    if resolved:
+        db["unipile_industry_id_cache"].update_one(
+            cache_key,
+            {"$set": {**cache_key, "ids": resolved, "fetched_at": utcnow()}},
+            upsert=True,
+        )
+        log.info(
+            "discovery: resolved %d industry IDs for operator (cached 30d): %s",
+            len(resolved), resolved,
+        )
+    return resolved
+
+
+def _operator_primary_geography(operator: dict[str, Any]) -> str | None:
+    """First entry of ``operator.product_extracted.target_geographies`` (or
+    the first ``geography.tiers[0].matches`` entry on the rubric if extracted
+    is empty). Used as the default Location for Exa candidates that have no
+    enriched location — Exa's API doesn't expose a location field, so we
+    treat its results as operator-primary-geo unless the LLM finds explicit
+    counter-evidence in the post text."""
+    ext = operator.get("product_extracted") or {}
+    raw = ext.get("target_geographies") or []
+    for x in raw:
+        s = str(x).strip()
+        if len(s) >= 2:
+            return s
+    rub = operator.get("icp_rubric") or {}
+    tiers = (rub.get("geography") or {}).get("tiers") or []
+    if tiers:
+        for m in (tiers[0].get("matches") or []):
+            s = str(m).strip()
+            if len(s) >= 2:
+                return s
+    return None
+
+
+def _operator_targets_us(operator: dict[str, Any]) -> bool:
+    """True iff any of the operator's geography terms (target_geographies or
+    rubric.geography.tiers[*].matches) resolves to a US signal.
+
+    Used to switch the inline-geo gate from a brittle substring rubric to
+    the `geo_resolver.is_us_location` resolver. For US-targeting operators
+    we trust the offline geonamescache resolver across keyword Unipile and
+    APIDirect paths (direct-author RULE 24 and Exa already enforce geo at
+    the source so they're untouched)."""
+    ext = operator.get("product_extracted") or {}
+    raw_geos: list[str] = []
+    for x in ext.get("target_geographies") or []:
+        if isinstance(x, str) and x.strip():
+            raw_geos.append(x.strip())
+    rub = operator.get("icp_rubric") or {}
+    for tier in (rub.get("geography") or {}).get("tiers") or []:
+        if not isinstance(tier, dict):
+            continue
+        for m in tier.get("matches") or []:
+            if isinstance(m, str) and m.strip():
+                raw_geos.append(m.strip())
+    for g in raw_geos:
+        if is_us_location(g) is True:
+            return True
+    return False
 
 
 def _operator_geo_terms(operator: dict[str, Any]) -> list[str]:
@@ -201,15 +326,33 @@ def _unipile_post_location_ids_for_operator(
     return []
 
 
-def _compose_discovery_query(base_kw: str, operator: dict[str, Any]) -> str:
-    """Append geography + seniority so LinkedIn search stays ICP-local."""
+def _compose_discovery_query(
+    base_kw: str,
+    operator: dict[str, Any],
+    *,
+    with_geo: bool = True,
+    with_seniority: bool = True,
+) -> str:
+    """Append geography + seniority hints to keyword so LinkedIn search stays
+    ICP-local. Vendors that enforce geo server-side (Unipile content search via
+    ``location_ids``; Unipile people search via ``geoUrn`` default) should pass
+    ``with_geo=False`` to avoid baking geo terms into the literal text-match
+    keyword, which silently kills recall."""
     parts = [base_kw.strip()]
-    geos = _operator_geo_terms(operator)
-    if geos:
-        parts.append(" ".join(geos[:5]))
-    sen = _seniority_hints_from_titles(operator)
-    if sen:
-        parts.append(sen)
+    if with_geo:
+        geos = _operator_geo_terms(operator)
+        if geos:
+            # Cap geo terms at ONE — LinkedIn / APIDirect / Exa keyword
+            # indices are strict text-match, so a 5-term geo list ("United
+            # States Florida Texas Georgia US") tacked onto every keyword
+            # collapses recall to zero. One country-level term is enough
+            # text-bias; finer geo is enforced via location_ids/geoUrn for
+            # the vendors that support it.
+            parts.append(geos[0])
+    if with_seniority:
+        sen = _seniority_hints_from_titles(operator)
+        if sen:
+            parts.append(sen)
     q = " ".join(p for p in parts if p).strip()
     return q[:480]
 
@@ -240,7 +383,10 @@ def _is_exhausted(db: Database, operator_id: ObjectId, author_url: str) -> bool:
 def _seen_post_urls(db: Database, operator_id: ObjectId) -> set[str]:
     """All post URLs we've already inserted as candidates within the lookback
     window. Used to prevent re-discovery of the same post across runs (the
-    exhaustion ledger only tracks authors, not posts)."""
+    exhaustion ledger only tracks authors, not posts).
+
+    URLs are canonicalized as we read so legacy entries (stored before the
+    canonicalization patch) still dedupe against new canonical writes."""
     cutoff = utcnow() - timedelta(days=EXHAUSTION_LOOKBACK_DAYS)
     cursor = db.candidates.find(
         {
@@ -250,7 +396,9 @@ def _seen_post_urls(db: Database, operator_id: ObjectId) -> set[str]:
         },
         {"post_url": 1},
     )
-    return {doc["post_url"] for doc in cursor if doc.get("post_url")}
+    return {
+        _canonical_post_url(doc["post_url"]) for doc in cursor if doc.get("post_url")
+    }
 
 
 def _seen_author_urls(db: Database, operator_id: ObjectId) -> set[str]:
@@ -296,6 +444,12 @@ def _candidate_doc(
     keyword_topical, RULE 15-EXT: keyword_title_industry, RULE 24:
     title_search) used by allocator/drafter routing."""
     now = utcnow()
+    # Single chokepoint for URL canonicalization on the WRITE side. Every
+    # vendor's doc-builder (_doc_from_unipile / _doc_from_apidirect /
+    # _doc_from_exa / _doc_from_inbox / _doc_from_crustdata_screener) flows
+    # through here, so canonicalizing once means every stored URL is dedup-
+    # ready (no per-viewer rcm tokens, no UTM tracking).
+    post_url = _canonical_post_url(post_url)
     return {
         "operator_id": operator_id,
         "cofounder_id": cofounder_id,
@@ -436,7 +590,14 @@ def _score_unipile_author_against_operator(
 
     title_pts = 5 if any(_rubric_substring_match(headline, t) for t in titles) else 0
     industry_pts = 3 if any(_rubric_substring_match(blob, i) for i in industries) else 0
-    geo_pts = 2 if any(_rubric_substring_match(location, g) for g in geos) else 0
+    # Geo: when operator targets US, use the offline geonamescache resolver
+    # (handles 'Atlanta Metropolitan Area', 'Greater Cincinnati', etc. that
+    # the 87-term substring rubric misses). Otherwise fall back to substring
+    # match against the operator's literal target_geographies entries.
+    if _operator_targets_us(operator):
+        geo_pts = 2 if is_us_location(location) is True else 0
+    else:
+        geo_pts = 2 if any(_rubric_substring_match(location, g) for g in geos) else 0
 
     return {
         "title": title_pts,
@@ -507,6 +668,242 @@ def _qualifies_inline_rubric(
     if post_relevance >= settings.discovery_unipile_inline_path_b_threshold:
         paths.append("B_post")
     return bool(paths), paths
+
+
+_LINKEDIN_POST_AUTHOR_SLUG_RE = re.compile(
+    r"linkedin\.com/posts/([^_/?#]+)_", re.IGNORECASE
+)
+
+
+# Tracking-param names we strip when canonicalizing post URLs. Keep this list
+# scoped to known LinkedIn / vendor instrumentation so we don't drop anything
+# meaningful (e.g. ``id`` on /pulse/ URLs would be load-bearing).
+_TRACKING_PARAMS = frozenset({
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "rcm",            # LinkedIn recommendation-context (per-viewer account id)
+    "refid",          # LinkedIn referral id
+    "trackingId",     # LinkedIn search-result tracking
+    "trk", "trkInfo", # legacy LinkedIn click-tracking
+    "midToken", "midSig", "ts",  # legacy LinkedIn email-share tracking
+    "fbclid", "gclid", "mc_cid", "mc_eid",
+})
+
+
+class _CanonicalUrlSet:
+    """Set-like wrapper that canonicalizes URLs on every ``add`` and ``in``
+    check. Lets every legacy ``post.url in seen_urls`` / ``seen_urls.add(...)``
+    callsite in this module stay as-is while still deduping against tracking-
+    param-stripped canonical URLs. Implements the subset of ``set`` the
+    engine actually uses (``in``, ``add``, ``__len__``, ``__iter__``)."""
+
+    __slots__ = ("_set",)
+
+    def __init__(self, initial=()) -> None:
+        self._set: set[str] = set()
+        for u in initial:
+            self.add(u)
+
+    def add(self, url: str | None) -> None:
+        if not url:
+            return
+        self._set.add(_canonical_post_url(url))
+
+    def __contains__(self, url: object) -> bool:
+        if not isinstance(url, str) or not url:
+            return False
+        return _canonical_post_url(url) in self._set
+
+    def __len__(self) -> int:
+        return len(self._set)
+
+    def __iter__(self):
+        return iter(self._set)
+
+
+def _canonical_post_url(url: str | None) -> str:
+    """Strip per-viewer tracking params so the same LinkedIn post resolves
+    to one canonical URL across vendors (Unipile vs Exa vs APIDirect), across
+    cofounders (different LinkedIn accounts produce different ``rcm`` values),
+    and across runs. This is the dedup key for ``seen_urls`` / 90-day
+    exhaustion ledger — without canonicalization the same post sneaks past
+    dedup whenever the tracking shape changes."""
+    if not url:
+        return url or ""
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+    try:
+        parts = urlsplit(url.strip())
+    except Exception:
+        return url
+    if not parts.scheme or not parts.netloc:
+        return url
+    kept = [
+        (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=False)
+        if k not in _TRACKING_PARAMS
+    ]
+    new_query = urlencode(kept, doseq=True)
+    # Drop fragment too (LinkedIn ignores it).
+    return urlunsplit((parts.scheme, parts.netloc.lower(), parts.path, new_query, ""))
+
+
+# Heuristic markers that a slug or "name" is actually a brand/company rather
+# than a person. Single-token lowercase identifiers that look like a brand
+# (no first/last name shape, no spaces) are downgraded — Unipile's profile
+# lookup for slugs like ``innovaccer`` or ``salesforce`` either 404s or
+# returns a company shape, and we end up with no usable human author.
+_COMPANY_SHAPED_SLUG_RE = re.compile(
+    r"^(?!.* )[a-z0-9][a-z0-9-]{2,}$"  # one lowercase token, optional dashes
+)
+
+
+def _looks_like_company_slug(slug: str | None) -> bool:
+    if not slug:
+        return False
+    s = slug.strip().lower()
+    if not _COMPANY_SHAPED_SLUG_RE.match(s):
+        return False
+    # Person slugs typically include either a first+last with a separating
+    # dash (e.g. ``anand-mehta-b9106a94``) or end in a numeric LinkedIn ID
+    # hash. A single non-dashed token is almost always a brand.
+    if "-" not in s:
+        return True
+    return False
+
+
+def _is_company_authored(
+    raw_author: str | None,
+    enriched_profile: dict[str, Any] | None,
+    post_url: str | None,
+) -> bool:
+    """Return True only when we can POSITIVELY identify the post as
+    company-authored (brand page, organization profile, etc.) rather than
+    a human author. Default is False — when uncertain, keep the candidate
+    and let post-relevance + LLM ICP gates make the call.
+
+    Positive company signals (any one is enough):
+      1. The post URL itself is on a ``/company/`` path.
+      2. Enriched profile carries ``is_company=True`` or a company-typed
+         ``type`` / ``profile_type`` value.
+      3. URL author slug is brand-shaped (single lowercase token, no dashes
+         — e.g. ``/posts/innovaccer_…``) AND we have no other human-author
+         signal (no vendor-inline author string, no enriched name).
+    """
+    # Signal 1: company page post path.
+    if post_url and "/company/" in post_url.lower():
+        return True
+    # Signal 2: explicit is_company / type from enrichment.
+    if enriched_profile:
+        if enriched_profile.get("is_company") is True:
+            return True
+        ptype = str(
+            enriched_profile.get("type")
+            or enriched_profile.get("profile_type")
+            or ""
+        ).upper()
+        if "COMPANY" in ptype and "PERSON" not in ptype:
+            return True
+        if "ORGANIZATION" in ptype:
+            return True
+    # Signal 3: brand-shaped slug AND no human-author signal elsewhere.
+    slug = _extract_author_slug_from_post_url(post_url)
+    if slug and _looks_like_company_slug(slug):
+        has_human_signal = bool(
+            (raw_author and raw_author.strip())
+            or (enriched_profile and (enriched_profile.get("name") or "").strip())
+        )
+        if not has_human_signal:
+            return True
+    return False
+
+
+def _extract_author_slug_from_post_url(url: str | None) -> str | None:
+    """Pull the author's LinkedIn public-identifier slug out of a post URL.
+
+    LinkedIn post URLs follow the pattern
+    ``https://www.linkedin.com/posts/<author-slug>_<post-content>-activity-<id>-<rcm>``
+    so the slug is everything between ``/posts/`` and the first underscore.
+    Returns None if the URL doesn't match the pattern (e.g. share links of
+    the form ``/posts/activity-<id>-...`` which have no author slug).
+    """
+    if not url:
+        return None
+    m = _LINKEDIN_POST_AUTHOR_SLUG_RE.search(url)
+    if not m:
+        return None
+    slug = m.group(1).strip()
+    if not slug or slug.lower() == "activity":
+        return None
+    return slug
+
+
+def _get_cached_unipile_author_profile_by_slug(
+    db: Database,
+    *,
+    operator_id: ObjectId,
+    slug: str,
+    account_id: str,
+    ttl_days: int,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Slug-keyed variant for vendors that give us a LinkedIn post URL but
+    no provider_id (APIDirect, Exa).
+
+    Same Mongo collection (``unipile_author_cache``) but a different lookup
+    key (``public_identifier``) so we share cache hits with the provider_id
+    path when both paths see the same author.
+    """
+    from app.services.unipile import (
+        resolve_profile as unipile_resolve_profile,
+        UnipileError,
+        UnipileNotConfigured,
+    )
+
+    if not slug:
+        return None, False
+    now = utcnow()
+    cutoff = now - timedelta(days=max(1, ttl_days))
+    cached = db.unipile_author_cache.find_one(
+        {
+            "operator_id": operator_id,
+            "public_identifier": slug,
+            "fetched_at": {"$gte": cutoff},
+        }
+    )
+    if cached:
+        return cached, False
+
+    try:
+        raw = unipile_resolve_profile(account_id=account_id, public_identifier_or_url=slug)
+    except (UnipileError, UnipileNotConfigured) as err:
+        log.debug("unipile: profile fetch failed for slug=%s: %s", slug[:40], err)
+        return None, True
+    if not raw:
+        return None, True
+
+    work = raw.get("work_experience") or []
+    first_job = work[0] if isinstance(work, list) and work else {}
+    provider_id = raw.get("provider_id") or raw.get("id") or ""
+    name = (
+        raw.get("name")
+        or " ".join(filter(None, [raw.get("first_name"), raw.get("last_name")])).strip()
+        or None
+    )
+    doc = {
+        "operator_id": operator_id,
+        "provider_id": provider_id,
+        "public_identifier": raw.get("public_identifier") or slug,
+        "name": name or "",
+        "headline": raw.get("headline") or "",
+        "location": raw.get("location") or "",
+        "company": (first_job.get("company") or first_job.get("company_name") or ""),
+        "title": (first_job.get("title") or first_job.get("role") or ""),
+        "fetched_at": now,
+    }
+    db.unipile_author_cache.update_one(
+        {"operator_id": operator_id, "public_identifier": slug},
+        {"$set": doc},
+        upsert=True,
+    )
+    return doc, True
 
 
 def _get_cached_unipile_author_profile(
@@ -614,9 +1011,13 @@ def _doc_from_apidirect(
     source_classification: str,
     source_channel: str = "keyword_topical",
     details: LinkedInPostDetails | None = None,
+    enriched_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     author_name = post.author
     author_linkedin_url = None
+    author_title: str | None = None
+    author_company: str | None = None
+    author_location: str | None = None
     post_text = post.snippet or post.title or ""
     post_published_at = post.published_at
     post_id: str | None = None
@@ -631,15 +1032,26 @@ def _doc_from_apidirect(
             post_published_at = details.published_at
         if details.urn:
             post_id = details.urn
-    return _candidate_doc(
+    # Unipile-enriched profile (via slug extracted from post URL) wins on
+    # fields the search payload doesn't carry.
+    if enriched_profile:
+        if enriched_profile.get("name"):
+            author_name = enriched_profile["name"]
+        if enriched_profile.get("headline"):
+            author_title = enriched_profile["headline"]
+        if enriched_profile.get("company"):
+            author_company = enriched_profile["company"]
+        if enriched_profile.get("location"):
+            author_location = enriched_profile["location"]
+    doc = _candidate_doc(
         operator_id=operator_id,
         cofounder_id=cofounder_id,
         slate_run_id=slate_run_id,
         post_url=post.url,
         post_id=post_id,
         author_name=author_name,
-        author_title=None,
-        author_company=None,
+        author_title=author_title,
+        author_company=author_company,
         author_linkedin_url=author_linkedin_url,
         post_text=post_text,
         post_published_at=post_published_at,
@@ -648,6 +1060,10 @@ def _doc_from_apidirect(
         source_classification=source_classification,
         source_channel=source_channel,
     )
+    if author_location:
+        doc["author_location"] = author_location
+        doc["enriched_inline"] = True
+    return doc
 
 
 def _doc_from_exa(
@@ -659,19 +1075,35 @@ def _doc_from_exa(
     source_keyword: str,
     source_classification: str,
     source_channel: str = "keyword_topical",
+    enriched_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # Pre-derive author URL from the LinkedIn post slug when the URL shape
     # allows it. /pulse/ and /feed/update/ URLs return None.
     from app.engine.stages.verification import _author_url_from_post_url
-    return _candidate_doc(
+
+    author_name = post.author
+    author_title: str | None = None
+    author_company: str | None = None
+    author_location: str | None = None
+    if enriched_profile:
+        if enriched_profile.get("name"):
+            author_name = enriched_profile["name"]
+        if enriched_profile.get("headline"):
+            author_title = enriched_profile["headline"]
+        if enriched_profile.get("company"):
+            author_company = enriched_profile["company"]
+        if enriched_profile.get("location"):
+            author_location = enriched_profile["location"]
+
+    doc = _candidate_doc(
         operator_id=operator_id,
         cofounder_id=cofounder_id,
         slate_run_id=slate_run_id,
         post_url=post.url,
         post_id=None,
-        author_name=post.author,
-        author_title=None,
-        author_company=None,
+        author_name=author_name,
+        author_title=author_title,
+        author_company=author_company,
         author_linkedin_url=_author_url_from_post_url(post.url),
         post_text=post.snippet or post.title or "",
         post_published_at=post.published_at,
@@ -680,6 +1112,10 @@ def _doc_from_exa(
         source_classification=source_classification,
         source_channel=source_channel,
     )
+    if author_location:
+        doc["author_location"] = author_location
+        doc["enriched_inline"] = True
+    return doc
 
 
 def _doc_from_inbox(
@@ -889,7 +1325,13 @@ def _run_crustdata_screener(
     date_posted = settings.discovery_crustdata_screener_date_posted.strip() or "past-month"
     inserted = 0
     for query, classification in plan:
-        vendor_kw = _compose_discovery_query(query, operator)[:400].strip()
+        # Crustdata's screener takes a keyword string + a separate AUTHOR_LOCATION
+        # filter in the request body. Suffixing geo/seniority into the keyword
+        # text duplicates the geo filter and collapses recall on Crustdata's
+        # literal-match index — same failure mode as Unipile keyword search.
+        vendor_kw = _compose_discovery_query(
+            query, operator, with_geo=False, with_seniority=False
+        )[:400].strip()
         if not vendor_kw:
             continue
         try:
@@ -1069,16 +1511,18 @@ def discover_for_operator(
     )
 
     inserted = 0
-    # DEMO OVERRIDE: ALL three cross-run dedup layers disabled so every run
-    # surfaces every match — useful for "show the raw data" demos. Restore
-    # by uncommenting the original lines and removing the empty-set fallbacks.
+    # Cross-run dedup layers — re-enabled. The DEMO OVERRIDE that initialized
+    # these as empty sets caused the same post to be inserted multiple times
+    # across top-up rounds within a single slate run (and across slate runs
+    # within the 90-day window), producing duplicate drafted comments for
+    # the same URL.
     #
-    # Original (90-day post-URL dedup pre-seed):
-    # seen_urls: set[str] = _seen_post_urls(db, operator_id)
-    # Original (90-day already-shipped-author dedup pre-seed):
-    # seen_authors_shipped: set[str] = _seen_author_urls(db, operator_id)
-    seen_urls: set[str] = set()
-    seen_authors_shipped: set[str] = set()
+    # ``seen_urls`` is a canonical-URL set so every per-loop ``post.url in
+    # seen_urls`` / ``seen_urls.add(post.url)`` callsite transparently
+    # canonicalizes (strips ``utm_*``, ``rcm`` per-viewer tracking) and
+    # dedupes the same post across vendors and cofounders.
+    seen_urls = _CanonicalUrlSet(_seen_post_urls(db, operator_id))
+    seen_authors_shipped: set[str] = _seen_author_urls(db, operator_id)
     log.info(
         "discovery: pre-seeded dedupe sets — %d seen post URLs, %d shipped authors",
         len(seen_urls),
@@ -1143,9 +1587,11 @@ def discover_for_operator(
         unipile_on = settings.discovery_use_unipile
 
     log.info(
-        "discovery: source order = %s%s%s%s%s",
+        "discovery: source order = %s%s%s%s%s%s",
         "contacts_unipile → " if contacts_on else "",
-        "unipile (PRIMARY) → " if unipile_on else "(unipile off) → ",
+        "unipile_title_search RULE 24 (PRIMARY) → "
+            if unipile_on and settings.discovery_use_title_search else "",
+        "unipile_keyword → " if unipile_on else "(unipile off) → ",
         "crustdata (inbox+screener) → " if crustdata_on else "(crustdata off) → ",
         "apidirect → " if apidirect_on else "(apidirect off) → ",
         "exa" if exa_on else "(exa off)",
@@ -1169,13 +1615,39 @@ def discover_for_operator(
         exa_inserted = 0
         crustdata_inserted = 0
         unipile_inserted = 0
+        title_search_inserted = 0
         contacts_inserted = 0
 
-        # ── SOURCE 1 (PRIMARY): Unipile keyword + seed-author search ──────
-        # Promoted to first position — Unipile gives the best per-candidate
-        # signal (free `/users/{slug}` profile enrichment + dual-path rubric
-        # qualify inside `_run_unipile`) so it should run before the more
-        # expensive / less-signal-rich keyword sources downstream.
+        # ── SOURCE 1 (PRIMARY): RULE 24 title-search PEOPLE channel ───────
+        # Promoted to first position — server-side LOCATION + INDUSTRY +
+        # network_distance filter at Unipile means every returned candidate
+        # already matches geography and industry by construction. Highest
+        # precision source, cheapest qualification. Runs FIRST so it gets
+        # the full profile-fetch budget and discovery wall-clock before the
+        # broader keyword sources execute.
+        if (
+            unipile_on
+            and settings.discovery_use_title_search
+            and cofounder.get("unipile_account_id")
+            and title_industry
+        ):
+            title_search_inserted = _run_unipile_title_search(
+                db,
+                operator=operator,
+                operator_id=operator_id,
+                cofounder_id=cofounder_id,
+                slate_run_id=slate_run_id,
+                account_id=cofounder["unipile_account_id"],
+                title_industry=title_industry,
+                seen_urls=seen_urls,
+                seen_authors_shipped=seen_authors_shipped,
+            )
+            inserted += title_search_inserted
+
+        # ── SOURCE 2: Unipile keyword + seed-author search ─────────────────
+        # Broader recall than RULE 24 — fuzzy keyword match at LinkedIn's
+        # classic search index. Per-candidate enrichment via `/users/{slug}`
+        # + dual-path rubric qualify inside `_run_unipile`.
         if unipile_on:
             account_id = cofounder.get("unipile_account_id")
             if not account_id:
@@ -1216,7 +1688,7 @@ def discover_for_operator(
                 )
                 inserted += unipile_inserted
 
-        # ── SOURCE 2: Crustdata inbox + optional realtime screener ───────────
+        # ── SOURCE 3: Crustdata inbox + optional realtime screener ───────────
         if crustdata_on:
             inbox_n = _drain_crustdata_inbox(
                 db,
@@ -1250,7 +1722,7 @@ def discover_for_operator(
                 screener_n,
             )
 
-        # ── SOURCE 3: apidirect synchronous keyword search ─────────────────
+        # ── SOURCE 4: apidirect synchronous keyword search ─────────────────
         if apidirect_on:
             apidirect_inserted = _run_apidirect(
                 db,
@@ -1262,10 +1734,11 @@ def discover_for_operator(
                 tier_2=tier_2,
                 seen_urls=seen_urls,
                 seen_authors_shipped=seen_authors_shipped,
+                account_id=cofounder.get("unipile_account_id"),
             )
             inserted += apidirect_inserted
 
-        # ── SOURCE 4: Exa LinkedIn-scoped search (high numResults per call) ──
+        # ── SOURCE 5: Exa LinkedIn-scoped search (high numResults per call) ──
         if exa_on:
             exa_inserted = _run_exa(
                 db,
@@ -1279,33 +1752,11 @@ def discover_for_operator(
                 seen_urls=seen_urls,
                 seen_authors_shipped=seen_authors_shipped,
                 start_published_date=exa_after,
+                account_id=cofounder.get("unipile_account_id"),
             )
             inserted += exa_inserted
 
-        # ── SOURCE 4b: RULE 24 title-search PEOPLE channel via Unipile.
-        # Runs only when unipile is on AND the title_search flag is set AND
-        # we have a connected account_id for the cofounder.
-        title_search_inserted = 0
-        if (
-            unipile_on
-            and settings.discovery_use_title_search
-            and cofounder.get("unipile_account_id")
-            and title_industry
-        ):
-            title_search_inserted = _run_unipile_title_search(
-                db,
-                operator=operator,
-                operator_id=operator_id,
-                cofounder_id=cofounder_id,
-                slate_run_id=slate_run_id,
-                account_id=cofounder["unipile_account_id"],
-                title_industry=title_industry,
-                seen_urls=seen_urls,
-                seen_authors_shipped=seen_authors_shipped,
-            )
-            inserted += title_search_inserted
-
-        # ── SOURCE 5: Contact seeds (Unipile direct, gates bypassed) ─────
+        # ── SOURCE 6: Contact seeds (Unipile direct, gates bypassed) ─────
         # Operator-curated list: pull each contact's recent posts straight
         # from Unipile and write them with status="gate_passed" so the
         # allocator + drafter pick them up without running verification or
@@ -1346,6 +1797,48 @@ def discover_for_operator(
     return inserted
 
 
+def _enrich_via_unipile_slug(
+    db: Database,
+    *,
+    operator_id: ObjectId,
+    post_url: str,
+    account_id: str | None,
+    ttl_days: int,
+    fetched_so_far: int,
+    cap: int,
+) -> tuple[dict[str, Any] | None, int]:
+    """Shared helper: extract author slug from a LinkedIn post URL and look
+    up the author's profile via Unipile (cached). Used for APIDirect / Exa
+    candidates that don't carry inline location.
+
+    Returns (profile_or_None, new_fetched_count). Returns (None, fetched_so_far)
+    when the account is unavailable, the slug can't be extracted, or the cap
+    has been reached.
+    """
+    if not account_id or not post_url:
+        return None, fetched_so_far
+    slug = _extract_author_slug_from_post_url(post_url)
+    if not slug:
+        return None, fetched_so_far
+    if fetched_so_far >= cap:
+        # Try cache-only — if cached we won't burn the budget; if not we skip.
+        cached = db.unipile_author_cache.find_one(
+            {"operator_id": operator_id, "public_identifier": slug,
+             "fetched_at": {"$gte": utcnow() - timedelta(days=max(1, ttl_days))}}
+        )
+        return (cached, fetched_so_far) if cached else (None, fetched_so_far)
+    profile, was_fetched = _get_cached_unipile_author_profile_by_slug(
+        db,
+        operator_id=operator_id,
+        slug=slug,
+        account_id=account_id,
+        ttl_days=ttl_days,
+    )
+    if was_fetched:
+        fetched_so_far += 1
+    return profile, fetched_so_far
+
+
 def _run_apidirect(
     db: Database,
     *,
@@ -1357,6 +1850,7 @@ def _run_apidirect(
     tier_2: list[str],
     seen_urls: set[str],
     seen_authors_shipped: set[str],
+    account_id: str | None = None,
 ) -> int:
     """Synchronous keyword search via apidirect. Trips its own circuit on 402;
     we just stop calling it for the rest of the run.
@@ -1385,9 +1879,22 @@ def _run_apidirect(
         return 0
 
     pages = max(1, min(int(settings.discovery_apidirect_max_pages), 5))
+    enrich_on = bool(
+        account_id and settings.discovery_unipile_inline_rubric_enabled
+    )
+    enrich_cap = settings.discovery_unipile_max_profile_fetches_per_run
+    cache_ttl = settings.discovery_unipile_author_cache_ttl_days
+    fetched_for_enrich = 0
+
     inserted = 0
     for query, classification in plan:
-        vendor_q = _compose_discovery_query(query, operator)
+        # APIDirect's /v1/linkedin/posts is a strict text-match index — same
+        # recall-collapse pattern as Unipile classic. We drop the geo +
+        # seniority suffix here too; the LLM ICP gate enforces ICP author
+        # filtering downstream from author metadata.
+        vendor_q = _compose_discovery_query(
+            query, operator, with_geo=False, with_seniority=False
+        )
         try:
             posts = search_linkedin_posts_pages(vendor_q, max_pages=pages)
         except (ApiDirectQuotaExhausted, ApiDirectNotConfigured) as err:
@@ -1413,6 +1920,72 @@ def _run_apidirect(
                     log.warning("discovery: apidirect halted (post details): %s", err)
                     return inserted
 
+            # Enrich author via Unipile profile fetch using the slug embedded
+            # in the LinkedIn post URL — gives us reliable author_location +
+            # headline so the LLM ICP gate doesn't have to infer from post text.
+            enriched_profile: dict[str, Any] | None = None
+            if enrich_on:
+                enriched_profile, fetched_for_enrich = _enrich_via_unipile_slug(
+                    db,
+                    operator_id=operator_id,
+                    post_url=post.url,
+                    account_id=account_id,
+                    ttl_days=cache_ttl,
+                    fetched_so_far=fetched_for_enrich,
+                    cap=enrich_cap,
+                )
+
+            # Drop posts positively identified as company-authored (LinkedIn
+            # /company/ pages, brand-shaped slugs with no human signal, or
+            # enrichment flagging is_company). Posts with thin author data
+            # but no company signal still flow through — the LLM ICP gate
+            # and post-relevance scoring decide whether they're worth slating.
+            if _is_company_authored(post.author, enriched_profile, post.url):
+                log.info(
+                    "│  [DROP/apidirect] %s ← company-authored post (not a human)",
+                    (post.url or "<no-url>")[:90],
+                )
+                continue
+
+            # Inline geo gate (US-targeting operators only). We require
+            # enriched_profile.location to resolve as US via the offline
+            # geonamescache resolver — same gate the keyword Unipile path
+            # applies. Direct-author (RULE 24) and Exa paths already enforce
+            # geo at the source so they bypass this. Posts with no enriched
+            # location pass through (geo can't be evaluated → LLM ICP gate
+            # downstream decides) unless we got a clearly non-US signal.
+            if _operator_targets_us(operator) and enriched_profile:
+                loc = (enriched_profile.get("location") or "").strip()
+                if loc:
+                    us_verdict = is_us_location(loc)
+                    if us_verdict is False:
+                        log.info(
+                            "│  [DROP/apidirect] %s ← author_location not US: %r",
+                            (post.url or "<no-url>")[:90], loc,
+                        )
+                        rejected = _doc_from_apidirect(
+                            post,
+                            operator_id=operator_id,
+                            cofounder_id=cofounder_id,
+                            slate_run_id=slate_run_id,
+                            source_keyword=query,
+                            source_classification=classification,
+                            details=details,
+                            enriched_profile=enriched_profile,
+                        )
+                        rejected["status"] = "rejected_inline"
+                        rejected["drop_reason"] = (
+                            f"inline_geo: author_location not US ({loc!r})"
+                        )
+                        try:
+                            db.candidates.insert_one(rejected)
+                        except Exception as err:
+                            log.warning(
+                                "│  [apidirect] persist rejected_inline failed: %s", err
+                            )
+                        seen_urls.add(post.url)
+                        continue
+
             seen_urls.add(post.url)
             db.candidates.insert_one(
                 _doc_from_apidirect(
@@ -1423,9 +1996,15 @@ def _run_apidirect(
                     source_keyword=query,
                     source_classification=classification,
                     details=details,
+                    enriched_profile=enriched_profile,
                 )
             )
             inserted += 1
+    if enrich_on:
+        log.info(
+            "│  [apidirect-enrich] profile fetches=%d (cap=%d) cache_ttl=%dd",
+            fetched_for_enrich, enrich_cap, cache_ttl,
+        )
     return inserted
 
 
@@ -1442,6 +2021,7 @@ def _run_exa(
     seen_urls: set[str],
     seen_authors_shipped: set[str],
     start_published_date: str | None,
+    account_id: str | None = None,
 ) -> int:
     """Exa LinkedIn-scoped semantic search. One API call per keyword, up to
     ~100 results per call (configurable via EXA_RESULTS_PER_QUERY, capped at 100).
@@ -1474,9 +2054,22 @@ def _run_exa(
         )
         return 0
 
+    enrich_on = bool(
+        account_id and settings.discovery_unipile_inline_rubric_enabled
+    )
+    enrich_cap = settings.discovery_unipile_max_profile_fetches_per_run
+    cache_ttl = settings.discovery_unipile_author_cache_ttl_days
+    fetched_for_enrich = 0
+
     inserted = 0
     for query, classification in plan:
-        vendor_q = _compose_discovery_query(query, operator)
+        # Exa is a neural/semantic search — adding geo + seniority terms to
+        # the query string doesn't help (the embedding handles geography as
+        # a separate concept) and tends to skew results toward government /
+        # job-board content that literally mentions "United States Director".
+        vendor_q = _compose_discovery_query(
+            query, operator, with_geo=False, with_seniority=False
+        )
         try:
             posts = exa_search_linkedin_posts(
                 vendor_q, start_published_date=start_published_date
@@ -1496,6 +2089,50 @@ def _run_exa(
                 continue
             if _is_exhausted(db, operator_id, post.url):
                 continue
+
+            # Same enrichment shape as APIDirect — slug from post URL → Unipile
+            # /users/{slug} → author_location for the LLM ICP gate.
+            enriched_profile: dict[str, Any] | None = None
+            if enrich_on:
+                enriched_profile, fetched_for_enrich = _enrich_via_unipile_slug(
+                    db,
+                    operator_id=operator_id,
+                    post_url=post.url,
+                    account_id=account_id,
+                    ttl_days=cache_ttl,
+                    fetched_so_far=fetched_for_enrich,
+                    cap=enrich_cap,
+                )
+
+            # Drop only posts positively identified as company-authored.
+            # Keep human posts even with thin author metadata — post-relevance
+            # + LLM ICP gates decide quality.
+            if _is_company_authored(post.author, enriched_profile, post.url):
+                log.info(
+                    "│  [DROP/exa] %s ← company-authored post (not a human)",
+                    (post.url or "<no-url>")[:90],
+                )
+                continue
+
+            # Default location for Exa: Exa's API doesn't return a `location`
+            # field, and many Exa-surfaced authors won't be in Unipile's
+            # /users/{slug} resolver (e.g. /pulse/ articles, authors with
+            # unusual slugs). Without a Location string the LLM ICP gate
+            # falls back to inferring geography from post text alone, which
+            # most often scores G=0 → drop. Since Exa's keyword pool is
+            # operator-geo biased anyway, treat Exa results as
+            # operator-primary-geo by default and let the LLM override via
+            # POST-EXPLICIT when the post text clearly indicates otherwise.
+            if not (enriched_profile and (enriched_profile.get("location") or "").strip()):
+                primary_geo = _operator_primary_geography(operator)
+                if primary_geo:
+                    if enriched_profile is None:
+                        enriched_profile = {}
+                    else:
+                        enriched_profile = dict(enriched_profile)
+                    enriched_profile["location"] = primary_geo
+                    enriched_profile["_location_source"] = "exa_default"
+
             seen_urls.add(post.url)
             db.candidates.insert_one(
                 _doc_from_exa(
@@ -1505,9 +2142,15 @@ def _run_exa(
                     slate_run_id=slate_run_id,
                     source_keyword=query,
                     source_classification=classification,
+                    enriched_profile=enriched_profile,
                 )
             )
             inserted += 1
+    if enrich_on:
+        log.info(
+            "│  [exa-enrich] profile fetches=%d (cap=%d) cache_ttl=%dd",
+            fetched_for_enrich, enrich_cap, cache_ttl,
+        )
     return inserted
 
 
@@ -1585,7 +2228,14 @@ def _run_unipile(
         )
         return 0
 
-    post_location_ids = _unipile_post_location_ids_for_operator(account_id, operator)
+    # NOTE: we used to resolve operator geography → Unipile location IDs and
+    # pass them as ``body["location"]`` on the keyword search. Empirically
+    # that field is ignored by LinkedIn's content index (the standalone Unipile
+    # script proved US/UK geoUrn returned identical results; this run proved
+    # the same — 137 non-US authors slipped past a US-only location_ids list).
+    # We no longer call PARAMETERS → location_ids for the keyword path.
+    # Geo for keyword candidates is enforced by the inline rubric (post-fetch
+    # author location match against operator.target_geographies).
     inserted = 0
     # Cap on `/users/{slug}` profile fetches per cofounder run — protects
     # the LinkedIn account from a quota spike on a high-yield keyword pass.
@@ -1595,16 +2245,32 @@ def _run_unipile(
     rubric_drops = {"no_profile": 0, "geo": 0, "rubric": 0}
     for kind, payload, source, classification in plan:
         assert kind == "kw"
+        # KEY FIX: LinkedIn's classic post keyword search is strict text-match.
+        # When `location_ids` is set, the engine already enforces geo
+        # IMPORTANT empirical finding (confirmed in standalone Unipile script
+        # AND in this engine): LinkedIn's /linkedin/search?category=posts
+        # endpoint does NOT enforce the body-level ``location`` field — it's
+        # a soft bias at most, not a hard server-side filter (US-targeted
+        # `location_ids` returns plenty of Cairo / Bengaluru / Toronto
+        # authors). Real geo enforcement on the keyword path happens
+        # post-fetch in the inline rubric (`_qualifies_inline_rubric`)
+        # which substring-matches the enriched author profile location
+        # against the operator's target_geographies + non-US blocklist.
+        # location_ids is left out below — we don't want the false sense
+        # that we're geo-filtering at source, and we save one PARAMETERS
+        # lookup per run by not bothering to resolve it.
+        #
+        # Geo-text suffix on the keyword is also OFF (we send the bare
+        # payload), because LinkedIn's content index is strict text-match
+        # and any extra word collapses recall.
         try:
-            q = (
-                _compose_discovery_query(payload, operator)
-                if source
-                in ("tier_1_kw", "tier_2_kw", "tier_3_kw", "title_industry_kw")
-                else payload
+            log.info(
+                "│  [unipile-kw] query=%r (bare keyword; geo enforced post-fetch by inline rubric, not by server)",
+                payload,
             )
             posts = search_posts_pages(
                 account_id=account_id,
-                query=q,
+                query=payload,
                 max_pages=settings.discovery_unipile_post_max_pages,
                 per_page=settings.discovery_unipile_post_limit,
                 sort_by=settings.discovery_unipile_post_sort_by or None,
@@ -1615,7 +2281,11 @@ def _run_unipile(
                     else None
                 ),
                 author_keywords=settings.discovery_unipile_post_author_filter or None,
-                location_ids=post_location_ids or None,
+                location_ids=None,  # see comment above — body filter doesn't work on content search
+            )
+            log.info(
+                "│  [unipile-kw] result query=%r posts=%d source=%s",
+                payload, len(posts), source,
             )
         except UnipileNotConfigured as err:
             log.warning("discovery: unipile unconfigured, halting: %s", err)
@@ -1704,14 +2374,17 @@ def _run_unipile(
                         and author_score.get("geo", 0) < 1
                     ):
                         rubric_drops["geo"] += 1
+                        reason_key = "inline_geo"
                         reason = "geo_not_in_author_location"
                     elif not enriched_profile and provider_id:
                         # Had a provider_id but enrichment failed/budget
                         # exhausted → can't verify geo → drop.
                         rubric_drops["no_profile"] = rubric_drops.get("no_profile", 0) + 1
+                        reason_key = "inline_no_profile"
                         reason = "no_profile (fetch failed or budget exhausted)"
                     else:
                         rubric_drops["rubric"] += 1
+                        reason_key = "inline_rubric"
                         reason = (
                             f"rubric T={author_score['title']} I={author_score['industry']} "
                             f"G={author_score['geo']} post={post_score} → no path"
@@ -1721,6 +2394,37 @@ def _run_unipile(
                         (post.url or "<no-url>")[:90],
                         reason,
                     )
+                    # Persist the rejected post so the gate-funnel UI can
+                    # surface which Unipile posts fell out at discovery and
+                    # why. Mark with status=rejected_inline + structured
+                    # drop_reason so downstream stages skip it.
+                    rejected_doc = _doc_from_unipile(
+                        post,
+                        operator_id=operator_id,
+                        cofounder_id=cofounder_id,
+                        slate_run_id=slate_run_id,
+                        source=source,
+                        source_keyword=payload,
+                        source_classification=classification,
+                        source_channel=post_source_channel,
+                        enriched_profile=enriched_profile,
+                        inline_rubric={
+                            "author": author_score,
+                            "post_relevance": post_score,
+                            "post_matches": post_matches[:8],
+                            "paths": paths,
+                        },
+                    )
+                    rejected_doc["status"] = "rejected_inline"
+                    rejected_doc["drop_reason"] = f"{reason_key}: {reason}"
+                    try:
+                        db.candidates.insert_one(rejected_doc)
+                    except Exception as err:
+                        log.warning(
+                            "│  [unipile] persist rejected_inline failed: %s", err
+                        )
+                    if post.url:
+                        seen_urls.add(post.url)
                     continue
                 if fetch_budget_remaining <= 0 and use_inline_rubric:
                     log.info(
@@ -1796,15 +2500,42 @@ def _run_unipile_title_search(
     )
     plan = _rotate(fresh_queries, DISCOVERY_TITLE_SEARCH_QUERIES_PER_RUN)
 
+    # Resolve operator's target industries → LinkedIn industry IDs once per
+    # run (cached cross-run). When set, the people-search applies a hard
+    # server-side INDUSTRY filter on top of geo + network distance, so we
+    # only get candidates whose LinkedIn profile is in a target industry.
+    industry_ids = tuple(
+        _resolve_industry_ids_for_operator(
+            db,
+            operator_id=operator_id,
+            operator=operator,
+            account_id=account_id,
+        )
+    )
+    if industry_ids:
+        log.info(
+            "│  [unipile-people] applying server-side INDUSTRY filter ids=%s",
+            list(industry_ids),
+        )
+
     inserted = 0
     for query in plan:
-        vendor_q = _compose_discovery_query(query, operator)
-        # Step 1 — people search (US, 2nd-degree).
+        # Unipile people search enforces US (or UNIPILE_RULE24_LOCATION_IDS) via
+        # geoUrn server-side. Appending geo terms to the literal-text query
+        # kills recall; keep seniority hints (they meaningfully bias toward
+        # decision-makers) but strip geo.
+        vendor_q = _compose_discovery_query(query, operator, with_geo=False)
+        log.info(
+            "│  [unipile-people] query=%r (geo via default geoUrn, not text)",
+            vendor_q,
+        )
+        # Step 1 — people search (US, 2nd-degree, optional INDUSTRY filter).
         try:
             people = search_people(
                 account_id=account_id,
                 query=vendor_q,
                 limit=DISCOVERY_TITLE_SEARCH_PEOPLE_PER_QUERY,
+                industry_ids=industry_ids or None,
             )
         except UnipileNotConfigured as err:
             log.warning("discovery: title_search unipile unconfigured: %s", err)
@@ -1841,25 +2572,43 @@ def _run_unipile_title_search(
                 )
                 continue
 
+            # Build a synthetic "enriched_profile" from the UnipilePerson
+            # fields so the candidate doc gets `author_location` set and the
+            # expensive ICP LLM gate sees explicit Location data instead of
+            # having to infer geography from post text alone. This was the
+            # weak link that gave most RULE 24 candidates G=0.
+            people_profile = {
+                "name": person.name,
+                "headline": person.title,
+                "company": person.company,
+                "location": person.location,
+            }
             for post in posts:
                 if not post.url or post.url in seen_urls:
                     continue
                 if settings.discovery_unipile_skip_company_posts and post.author_is_company:
                     continue
                 seen_urls.add(post.url)
-                db.candidates.insert_one(
-                    _doc_from_unipile(
-                        post,
-                        operator_id=operator_id,
-                        cofounder_id=cofounder_id,
-                        slate_run_id=slate_run_id,
-                        source="unipile_people",
-                        source_keyword=query,
-                        # 2nd-degree US-filtered title hits are tier-1 ICP density.
-                        source_classification="A",
-                        source_channel="title_search",
-                    )
+                doc = _doc_from_unipile(
+                    post,
+                    operator_id=operator_id,
+                    cofounder_id=cofounder_id,
+                    slate_run_id=slate_run_id,
+                    source="unipile_people",
+                    source_keyword=query,
+                    # 2nd-degree US-filtered title hits are tier-1 ICP density.
+                    source_classification="A",
+                    source_channel="title_search",
+                    enriched_profile=people_profile,
                 )
+                # Tag candidates that were filtered server-side via geoUrn (and
+                # optionally INDUSTRY) so the LLM ICP gate auto-credits those
+                # axes at the top rubric tier instead of re-evaluating from
+                # post text. We already know they're US-located and in-industry.
+                doc["geo_verified_at_source"] = True
+                if industry_ids:
+                    doc["industry_verified_at_source"] = True
+                db.candidates.insert_one(doc)
                 inserted += 1
 
     log.info(
@@ -1939,7 +2688,12 @@ def _run_contact_seeds(
         if not query:
             continue
 
-        vendor_query = _compose_discovery_query(query, operator)
+        # Contact-seed queries are already specific (name+title+company);
+        # adding geo+seniority terms over-constrains the literal-match
+        # APIDirect query and tends to drop the seed entirely.
+        vendor_query = _compose_discovery_query(
+            query, operator, with_geo=False, with_seniority=False
+        )
 
         # Track the seed's author URL for dedupe
         seed_author_url = linkedin_url or None

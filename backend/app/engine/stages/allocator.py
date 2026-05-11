@@ -36,6 +36,43 @@ def _candidate_score(c: dict[str, Any]) -> int:
     return int(icp.get("total", 0) or 0)
 
 
+def _candidate_rank(c: dict[str, Any]) -> tuple[int, int, float]:
+    """Composite rank for "best post per author" tie-breaking, lexicographic:
+
+      1) ICP 0-10 score (primary — author-ICP fit)
+      2) engagement signal (reactions + 2× comments, capped) — drives the
+         drafter's "warm-light" advantage; LinkedIn signal-boosts high-
+         engagement posts so commenting there gets more eyeballs
+      3) recency timestamp (newer first) — fresh posts have more remaining
+         engagement velocity
+
+    All three returned as a tuple sortable DESCENDING (higher = better)."""
+    icp_score = _candidate_score(c)
+    reactions = int(c.get("reaction_counter") or c.get("reactions") or 0)
+    comments = int(c.get("comment_counter") or c.get("comments") or 0)
+    engagement = min(reactions + 2 * comments, 100)
+
+    pub = c.get("post_published_at")
+    if pub is None:
+        ts = 0.0
+    elif isinstance(pub, str):
+        from datetime import datetime
+        try:
+            v = pub
+            if v.endswith("Z"):
+                v = v[:-1] + "+00:00"
+            ts = datetime.fromisoformat(v).timestamp()
+        except (TypeError, ValueError):
+            ts = 0.0
+    else:
+        try:
+            ts = pub.timestamp()
+        except Exception:
+            ts = 0.0
+
+    return (icp_score, engagement, ts)
+
+
 def allocate(
     db: Database,
     *,
@@ -58,11 +95,40 @@ def allocate(
     allocated_total = 0
     per_cf_summary: dict[str, dict[str, int]] = {}
 
+    # Cross-cofounder author cap: at most ONE candidate per LinkedIn author
+    # per slate. Earlier runs picked the same author 3× (Eric Arzubi,
+    # Michael Glickman) — each different post but the same person — which
+    # crowded out diversity. Identity key prefers provider URN, falls back
+    # to public profile URL, then author_name.
+    picked_authors: set[str] = set()
+
+    def _author_key(c: dict[str, Any]) -> str | None:
+        for f in ("author_provider_id", "author_linkedin_url", "author_name"):
+            v = c.get(f)
+            if v:
+                return f"{f}:{v}"
+        return None
+
+    skipped_by_author_cap = 0
+
     for cofounder in cofounders:
         cf_id = cofounder["_id"]
         target = int(cofounder.get("daily_volume_target", 20))
-        bucket = sorted(by_cofounder.get(cf_id, []), key=_candidate_score, reverse=True)
-        chosen = bucket[:target]
+        bucket = sorted(by_cofounder.get(cf_id, []), key=_candidate_rank, reverse=True)
+
+        # Walk in score-desc order, take first `target` that haven't already
+        # had another post from the same author allocated.
+        chosen: list[dict[str, Any]] = []
+        for c in bucket:
+            if len(chosen) >= target:
+                break
+            akey = _author_key(c)
+            if akey and akey in picked_authors:
+                skipped_by_author_cap += 1
+                continue
+            if akey:
+                picked_authors.add(akey)
+            chosen.append(c)
 
         type_assignments = _assign_types(len(chosen), quotas)
         for c, comment_type in zip(chosen, type_assignments):
@@ -83,8 +149,16 @@ def allocate(
             "shipped": 0,
             "allocated": len(chosen),
             "available": len(bucket),
+            "skipped_by_author_cap": skipped_by_author_cap,
         }
         allocated_total += len(chosen)
+
+    if skipped_by_author_cap:
+        log.info(
+            "allocator: skipped %d candidate(s) due to per-author cap "
+            "(cap=1 per author per slate)",
+            skipped_by_author_cap,
+        )
 
     db.slate_runs.update_one(
         {"_id": slate_run_id},

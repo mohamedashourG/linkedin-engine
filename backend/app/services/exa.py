@@ -112,10 +112,19 @@ def _normalize_hit(raw: dict[str, Any]) -> ExaPost | None:
         return None
 
     title = str(raw.get("title") or "")
-    text = str(raw.get("text") or "")
+    text = str(raw.get("text") or "").strip()
     highlights = raw.get("highlights") if isinstance(raw.get("highlights"), list) else []
     hl_texts = [str(h).strip() for h in highlights if isinstance(h, str) and h.strip()]
-    snippet = (hl_texts[0] if hl_texts else text)[:1500]
+    # Prefer Exa's full ``text`` over the first highlight excerpt: highlights
+    # are query-matched middle phrases, so when the drafter sees only the
+    # highlight it loses the post's opening context and the comment ends up
+    # responding to a sub-clause instead of the real post.
+    if text:
+        snippet = text[:3000]
+    elif hl_texts:
+        snippet = hl_texts[0][:3000]
+    else:
+        snippet = ""
 
     author = raw.get("author")
     if author is not None:
