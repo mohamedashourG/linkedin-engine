@@ -147,11 +147,25 @@ def _client() -> httpx.Client:
 
 
 def _request_with_429_retry(client: httpx.Client, method: str, path: str, **kwargs: Any) -> httpx.Response:
-    """Run one HTTP call; on 429 retry with exponential backoff (in-process)."""
+    """Run one HTTP call; on 429 retry with exponential backoff (in-process).
+
+    Wraps httpx/httpcore transport errors (connect timeout, read timeout,
+    pool full, DNS, etc.) as ``UnipileError`` so callers' existing
+    ``except UnipileError`` handlers catch them consistently. Without this
+    wrap, a raw ``httpcore.ConnectTimeout`` propagates past discovery's
+    per-query error handlers and kills the entire daily_run."""
     m = method.upper()
     last: httpx.Response | None = None
     for attempt in range(_UNIPILE_429_MAX_ATTEMPTS):
-        last = client.request(m, path, **kwargs)
+        try:
+            last = client.request(m, path, **kwargs)
+        except httpx.HTTPError as err:
+            # Includes ConnectTimeout, ReadTimeout, PoolTimeout, ConnectError,
+            # NetworkError, RemoteProtocolError, etc. Re-raise as the
+            # vendor-typed error so per-call try/except in discovery works.
+            raise UnipileError(
+                f"unipile transport error on {m} {path[:120]}: {err}"
+            ) from err
         if last.status_code != 429:
             return last
         if attempt < _UNIPILE_429_MAX_ATTEMPTS - 1:
@@ -304,6 +318,27 @@ def _parse_unipile_post(raw: dict[str, Any]) -> UnipilePost | None:
         or author.get("profile_url")
         or author.get("url")
     )
+    # Fallback — derive author profile URL from the canonical LinkedIn POST
+    # URL shape `linkedin.com/posts/<author-slug>_<title-slug>-activity-<id>`.
+    # Unipile's classic post-search response doesn't reliably populate the
+    # author URL, but the slug is embedded in `url` here. Without this,
+    # the Crustdata-first enrichment path in discovery has no slug to look
+    # up and routes every author to Unipile's `/users/{slug}` fallback —
+    # defeating the whole point of off-loading enrichment to Crustdata.
+    if not prof_url and url and "/posts/" in url:
+        tail = url.rsplit("/posts/", 1)[1]
+        # Stop at the first underscore (delimiter between author slug and
+        # post-title slug), or at the first /, ?, # if those come first.
+        slug_part = (
+            tail.split("_", 1)[0]
+            .split("/", 1)[0]
+            .split("?", 1)[0]
+            .split("#", 1)[0]
+        )
+        # Slug-shape validation mirrors crustdata_enrich.is_likely_person_slug
+        # so we only synthesize URLs Crustdata would accept downstream.
+        if slug_part and re.match(r"^[a-z0-9][a-z0-9_-]{0,99}$", slug_part, re.I):
+            prof_url = f"https://www.linkedin.com/in/{slug_part}"
     stats = raw.get("social_stats") if isinstance(raw.get("social_stats"), dict) else {}
     reaction_counter = (
         _safe_int(raw.get("reaction_counter"))
@@ -556,6 +591,80 @@ def search_posts_pages(
         "unipile search_posts_pages merged_posts=%d query=%.120s",
         len(merged),
         query,
+    )
+    return merged
+
+
+def search_posts_by_filters(
+    *,
+    account_id: str,
+    location_ids: list[str],
+    content_type: str | list[str] | None = None,
+    date_posted: str | None = "past_month",
+    sort_by: str | None = "date",
+    max_pages: int = 3,
+    per_page: int = 50,
+) -> list[UnipilePost]:
+    """Filter-only ``POST /linkedin/search`` — no keywords, just LinkedIn's
+    server-side filters (location + content_type + date_posted). Returns
+    posts published in the target geographies that match the content-type
+    filter, regardless of keyword.
+
+    This is a different code path on LinkedIn's side from keyword search:
+    when ``keywords`` is omitted, the ``location`` filter is actually
+    respected by the content index (with keywords, it's empirically
+    ignored — see ``_run_unipile`` notes).
+
+    Wire shape mirrors the user-provided curl exactly::
+
+        POST /linkedin/search
+        {
+          "api": "classic",
+          "category": "posts",
+          "location": ["102277331"],
+          "content_type": "documents",
+          "date_posted": "past_month"
+        }
+
+    Cursor-paginated like ``search_posts_pages``. Multiple location IDs
+    are passed in a single call (LinkedIn ORs them server-side).
+    Posts deduped by URL/id across pages.
+    """
+    if settings.unipile_mock or not location_ids:
+        return []
+    cap = max(1, min(int(max_pages), 10))
+    per_page = max(1, min(int(per_page), 50))
+
+    body = _post_search_body(
+        query=None,  # filter-only: no keywords field on the wire
+        sort_by=sort_by,
+        date_posted=date_posted,
+        content_type=content_type,
+        location_ids=location_ids,
+    )
+    seen: set[str] = set()
+    merged: list[UnipilePost] = []
+    cursor: str | None = None
+    for _ in range(cap):
+        page, next_cursor = _search_posts_call(
+            body, account_id=account_id, limit=per_page, cursor=cursor
+        )
+        if not page:
+            break
+        for post in page:
+            key = post.url or post.id
+            if key and key not in seen:
+                seen.add(key)
+                merged.append(post)
+        if not next_cursor:
+            break
+        cursor = str(next_cursor)
+    log.info(
+        "unipile search_posts_by_filters merged_posts=%d locations=%s content_type=%r date_posted=%s",
+        len(merged),
+        ",".join(location_ids[:5]),
+        content_type,
+        date_posted,
     )
     return merged
 

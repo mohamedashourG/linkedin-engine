@@ -43,7 +43,6 @@ from bson import ObjectId
 from pymongo.database import Database
 
 from app.config import settings
-from app.engine import keyword_history
 from app.engine.stages.gates import post_quality
 from app.engine.constants import (
     DISCOVERY_TIER_1_PER_RUN,
@@ -86,6 +85,7 @@ from app.services.unipile import (
     get_user_posts,
     resolve_location_ids_from_text,
     search_people,
+    search_posts_by_filters,
     search_posts_pages,
 )
 from app.services.crustdata import (
@@ -383,7 +383,15 @@ def _is_exhausted(db: Database, operator_id: ObjectId, url: str) -> bool:
         return False
     for key in ("last_seen_discovery_at", "last_engaged_at"):
         ts = doc.get(key)
-        if ts is not None and ts >= cutoff:
+        if ts is None:
+            continue
+        # Older Mongo rows stored datetimes as tz-naive (BSON drops tzinfo).
+        # `cutoff` is tz-aware (from utcnow()). Normalize ts to UTC if naive
+        # so the comparison doesn't raise.
+        if hasattr(ts, "tzinfo") and ts.tzinfo is None:
+            from datetime import timezone as _tz
+            ts = ts.replace(tzinfo=_tz.utc)
+        if ts >= cutoff:
             return True
     return False
 
@@ -654,6 +662,15 @@ def _doc_from_unipile(
         doc["can_post_comments"] = bool(post.can_post_comments)
     if unipile_rubric:
         doc["unipile_rubric"] = unipile_rubric
+        # `inline_icp_qualified` is the single boolean downstream gates
+        # check to relax non_buyer / icp_low drops. True only when the
+        # AUTHOR rubric (title+industry+geo) cleared Path A — i.e., this
+        # person matches the operator's ICP on enriched profile evidence,
+        # not just on post-text keyword hits. Path B (post-relevance only)
+        # is NOT considered ICP-qualified — the gate funnel still applies
+        # in full to those candidates.
+        paths = unipile_rubric.get("paths") or []
+        doc["inline_icp_qualified"] = "A_author" in paths
     return doc
 
 
@@ -1027,6 +1044,7 @@ def _get_cached_unipile_author_profile_by_slug(
         "location": raw.get("location") or "",
         "company": (first_job.get("company") or first_job.get("company_name") or ""),
         "title": (first_job.get("title") or first_job.get("role") or ""),
+        "source": "unipile",
         "fetched_at": now,
     }
     db.unipile_author_cache.update_one(
@@ -1111,6 +1129,7 @@ def _get_cached_unipile_author_profile(
         "location": raw.get("location") or "",
         "company": (first_job.get("company") or first_job.get("company_name") or ""),
         "title": (first_job.get("title") or first_job.get("role") or ""),
+        "source": "unipile",
         "fetched_at": now,
     }
     db.unipile_author_cache.update_one(
@@ -1119,6 +1138,182 @@ def _get_cached_unipile_author_profile(
         upsert=True,
     )
     return doc, True
+
+
+def _lookup_unipile_author_cache(
+    db: Database,
+    *,
+    operator_id: ObjectId,
+    provider_id: str | None,
+    public_identifier: str | None,
+    ttl_days: int,
+) -> dict[str, Any] | None:
+    """Read-only cache probe used by the Crustdata-first enrichment flow.
+
+    Tries the (operator_id, provider_id) key first, then the
+    (operator_id, public_identifier) key. Returns the cached doc if its
+    ``fetched_at`` is within ``ttl_days`` of now, else None.
+
+    No vendor calls. No writes. No budget consumption."""
+    if not (provider_id or public_identifier):
+        return None
+    now = utcnow()
+    cutoff = now - timedelta(days=max(1, ttl_days))
+    if provider_id:
+        hit = db.unipile_author_cache.find_one(
+            {
+                "operator_id": operator_id,
+                "provider_id": provider_id,
+                "fetched_at": {"$gte": cutoff},
+            }
+        )
+        if hit:
+            return hit
+    if public_identifier:
+        hit = db.unipile_author_cache.find_one(
+            {
+                "operator_id": operator_id,
+                "public_identifier": public_identifier,
+                "fetched_at": {"$gte": cutoff},
+            }
+        )
+        if hit:
+            return hit
+    return None
+
+
+def _public_identifier_from_url(url: str | None) -> str | None:
+    """Extract the LinkedIn slug from a ``linkedin.com/in/<slug>`` URL."""
+    if not url or "/in/" not in url:
+        return None
+    slug = url.rsplit("/in/", 1)[-1].rstrip("/")
+    slug = slug.split("?", 1)[0].split("#", 1)[0]
+    return slug or None
+
+
+# LinkedIn provider URNs have a distinctive shape: `ACo...`, `ACw...`, etc.
+# (uppercase "AC" prefix, then 20+ chars of base64-ish identifier with no
+# hyphens). They sometimes leak into URL form as `linkedin.com/in/ACoAA...`
+# which `is_likely_person_slug` lets through — but Crustdata's slug index
+# is NOT URN-aware and will fuzzy-match these to the wrong person. So we
+# detect them locally and exclude before sending to Crustdata.
+_LINKEDIN_URN_SLUG_RE = re.compile(r"^AC[A-Za-z0-9_-]{20,}$")
+
+
+def _looks_like_urn_slug(slug: str | None) -> bool:
+    return bool(slug and _LINKEDIN_URN_SLUG_RE.match(slug))
+
+
+def _enrich_via_crustdata(
+    db: Database,
+    *,
+    operator_id: ObjectId,
+    posts_pending: list[Any],
+) -> dict[str, dict[str, Any]]:
+    """Batch-enrich the unique ``author_profile_url``s on ``posts_pending``
+    via Crustdata Person Enrich, writing successful matches into
+    ``unipile_author_cache`` keyed by (operator_id, public_identifier) with
+    ``source="crustdata"``.
+
+    Returns ``{author_profile_url: profile_dict}`` for the matched subset.
+    Posts whose URL fails ``is_likely_person_slug`` (URN form, brand
+    handles, malformed) are silently absent from the output — caller routes
+    those to Unipile fallback.
+
+    Crustdata circuit trip (401/402/429) raises out of ``enrich_profiles``
+    and is caught here — on circuit-open we return an empty dict so the
+    caller proceeds to Unipile fallback for the entire batch."""
+    from app.services.crustdata_enrich import (
+        enrich_profiles as crustdata_enrich_profiles,
+        is_likely_person_slug,
+        CrustdataEnrichError,
+    )
+
+    # De-duplicate the candidate URL set so a popular author who appears in
+    # multiple posts is only enriched once per query.
+    unique_urls: dict[str, str] = {}  # url -> slug
+    skipped_urn = 0
+    for post in posts_pending:
+        url = (getattr(post, "author_profile_url", "") or "").strip()
+        if not url or url in unique_urls:
+            continue
+        if not is_likely_person_slug(url):
+            continue
+        slug = _public_identifier_from_url(url) or ""
+        if not slug:
+            continue
+        if _looks_like_urn_slug(slug):
+            # Crustdata's slug index isn't URN-aware — it has been observed
+            # to fuzzy-match URN-form slugs to the wrong person. Skip and
+            # let the Unipile fallback path handle these (Unipile's
+            # /users/{provider_id} endpoint resolves URNs natively).
+            skipped_urn += 1
+            continue
+        unique_urls[url] = slug
+    if skipped_urn:
+        log.info(
+            "│  [crustdata-enrich] skipped %d URN-form slug(s) — routing to Unipile fallback",
+            skipped_urn,
+        )
+
+    if not unique_urls:
+        return {}
+
+    # Crustdata's vendor cap is 25; we respect the configured batch_size as
+    # an upper bound but enrich_profiles already batches internally so a
+    # single call is fine.
+    batch_size = min(
+        max(1, settings.discovery_unipile_crustdata_batch_size),
+        25,
+    )
+    out: dict[str, dict[str, Any]] = {}
+    urls = list(unique_urls.keys())
+    now = utcnow()
+    for start in range(0, len(urls), batch_size):
+        batch = urls[start : start + batch_size]
+        try:
+            enriched = crustdata_enrich_profiles(batch)
+        except CrustdataEnrichError as err:
+            log.warning(
+                "│  [crustdata-enrich] batch of %d failed (circuit may be open): %s",
+                len(batch),
+                err,
+            )
+            return out  # Stop trying — caller falls back to Unipile.
+
+        for url in batch:
+            profile = enriched.get(url)
+            if profile is None:
+                continue
+            slug = unique_urls[url]
+            doc = {
+                "operator_id": operator_id,
+                # Crustdata doesn't return a Unipile URN — leave provider_id
+                # null so the (operator_id, public_identifier) index serves
+                # cache lookups for these entries.
+                "provider_id": None,
+                "public_identifier": slug,
+                "name": profile.name or "",
+                "headline": profile.headline or "",
+                "location": profile.location or "",
+                "company": profile.employer_name or "",
+                "title": profile.title or "",
+                "source": "crustdata",
+                "fetched_at": now,
+            }
+            db.unipile_author_cache.update_one(
+                {"operator_id": operator_id, "public_identifier": slug},
+                {"$set": doc},
+                upsert=True,
+            )
+            out[url] = doc
+
+    log.info(
+        "│  [crustdata-enrich] requested=%d matched=%d (3 credits/match)",
+        len(unique_urls),
+        len(out),
+    )
+    return out
 
 
 def _apidirect_optional_details(post_url: str) -> LinkedInPostDetails | None:
@@ -1448,16 +1643,10 @@ def _run_crustdata_screener(
         return 0
     if not settings.crustdata_api_key:
         return 0
-    fresh_t1 = keyword_history.filter_unused(
-        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_1
-    )
-    fresh_t2 = keyword_history.filter_unused(
-        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_2
-    )
     plan: list[tuple[str, str]] = []
-    for kw in _rotate(fresh_t1, DISCOVERY_TIER_1_PER_RUN):
+    for kw in _rotate(tier_1, DISCOVERY_TIER_1_PER_RUN):
         plan.append((kw, "A"))
-    for kw in _rotate(fresh_t2, DISCOVERY_TIER_2_PER_RUN):
+    for kw in _rotate(tier_2, DISCOVERY_TIER_2_PER_RUN):
         plan.append((kw, "B"))
     max_calls = max(0, int(settings.discovery_crustdata_screener_max_keyword_calls))
     plan = plan[:max_calls]
@@ -1511,9 +1700,6 @@ def _run_crustdata_screener(
                 err,
             )
             continue
-        keyword_history.mark_used(
-            db, operator_id=operator_id, source_channel="keyword_topical", query=query
-        )
         for raw in posts:
             post_url = (raw.get("share_url") or "").strip()
             if not post_url or post_url in seen_urls:
@@ -1997,26 +2183,18 @@ def _run_apidirect(
     """Synchronous keyword search via apidirect. Trips its own circuit on 402;
     we just stop calling it for the rest of the run.
 
-    RULE 15: filter the tier pools through the 14-day no-repeat ledger
-    before rotating, then mark each query used after we've called the
-    vendor (idempotent — same query in the same day/run is fine)."""
-    fresh_t1 = keyword_history.filter_unused(
-        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_1
-    )
-    fresh_t2 = keyword_history.filter_unused(
-        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_2
-    )
+    Builds the plan straight from the operator's tier pools — no no-repeat
+    ledger, so the same keyword can run every day."""
     plan: list[tuple[str, str]] = []
-    for kw in _rotate(fresh_t1, DISCOVERY_TIER_1_PER_RUN):
+    for kw in _rotate(tier_1, DISCOVERY_TIER_1_PER_RUN):
         plan.append((kw, "A"))
-    for kw in _rotate(fresh_t2, DISCOVERY_TIER_2_PER_RUN):
+    for kw in _rotate(tier_2, DISCOVERY_TIER_2_PER_RUN):
         plan.append((kw, "B"))
 
     if not plan:
         log.warning(
-            "│  [apidirect]   plan EMPTY — all kws in 14d ledger (tier_1=%d, tier_2=%d, "
-            "fresh_t1=%d, fresh_t2=%d). Lower KEYWORD_HISTORY_LOOKBACK_DAYS or expand the pool.",
-            len(tier_1), len(tier_2), len(fresh_t1), len(fresh_t2),
+            "│  [apidirect]   plan EMPTY — operator has no tier_1/tier_2 keywords (tier_1=%d, tier_2=%d)",
+            len(tier_1), len(tier_2),
         )
         return 0
 
@@ -2054,9 +2232,6 @@ def _run_apidirect(
             log.warning("discovery: apidirect %r failed: %s", vendor_q, err)
             continue
 
-        keyword_history.mark_used(
-            db, operator_id=operator_id, source_channel="keyword_topical", query=query
-        )
         for post in posts:
             if not post.url or post.url in seen_urls:
                 continue
@@ -2182,28 +2357,18 @@ def _run_exa(
     raw posts to survive downstream gates. Trips the circuit on 401/402/429.
 
     RULE 15 14-day no-repeat ledger filters all three tier pools."""
-    fresh_t1 = keyword_history.filter_unused(
-        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_1
-    )
-    fresh_t2 = keyword_history.filter_unused(
-        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_2
-    )
-    fresh_t3 = keyword_history.filter_unused(
-        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_3
-    )
     plan: list[tuple[str, str]] = []
-    for kw in _rotate(fresh_t1, EXA_DISCOVERY_TIER_1_PER_RUN):
+    for kw in _rotate(tier_1, EXA_DISCOVERY_TIER_1_PER_RUN):
         plan.append((kw, "A"))
-    for kw in _rotate(fresh_t2, EXA_DISCOVERY_TIER_2_PER_RUN):
+    for kw in _rotate(tier_2, EXA_DISCOVERY_TIER_2_PER_RUN):
         plan.append((kw, "B"))
-    for kw in _rotate(fresh_t3, EXA_DISCOVERY_TIER_3_PER_RUN):
+    for kw in _rotate(tier_3, EXA_DISCOVERY_TIER_3_PER_RUN):
         plan.append((kw, "B"))
 
     if not plan:
         log.warning(
-            "│  [exa]         plan EMPTY — all kws in ledger (tier_1=%d, tier_2=%d, tier_3=%d, "
-            "fresh_t1=%d, fresh_t2=%d, fresh_t3=%d)",
-            len(tier_1), len(tier_2), len(tier_3), len(fresh_t1), len(fresh_t2), len(fresh_t3),
+            "│  [exa]         plan EMPTY — operator has no tier_1/tier_2/tier_3 keywords (tier_1=%d, tier_2=%d, tier_3=%d)",
+            len(tier_1), len(tier_2), len(tier_3),
         )
         return 0
 
@@ -2242,9 +2407,6 @@ def _run_exa(
             log.warning("discovery: exa %r failed: %s", vendor_q, err)
             continue
 
-        keyword_history.mark_used(
-            db, operator_id=operator_id, source_channel="keyword_topical", query=query
-        )
         for post in posts:
             if not post.url or post.url in seen_urls:
                 continue
@@ -2333,33 +2495,15 @@ def _run_unipile(
     seen_urls: set[str],
     seen_authors_shipped: set[str],
 ) -> int:
-    # RULE 15: filter the topical pools through the 14-day no-repeat ledger.
-    fresh_t1 = keyword_history.filter_unused(
-        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_1
-    )
-    fresh_t2 = keyword_history.filter_unused(
-        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_2
-    )
-    fresh_t3 = keyword_history.filter_unused(
-        db, operator_id=operator_id, source_channel="keyword_topical", queries=tier_3
-    )
-    # RULE 15-EXT: same 14-day rule on a separate channel so a query that
-    # appears in BOTH pools (rare but possible, e.g. "VP Sales biotech")
-    # tracks per-channel.
-    fresh_ti = keyword_history.filter_unused(
-        db,
-        operator_id=operator_id,
-        source_channel="keyword_title_industry",
-        queries=title_industry,
-    )
+    # No no-repeat ledger — the operator's tier pools feed the plan directly.
     plan: list[tuple[str, str, str, str]] = []
-    for kw in _rotate(fresh_t1, DISCOVERY_TIER_1_PER_RUN):
+    for kw in _rotate(tier_1, DISCOVERY_TIER_1_PER_RUN):
         plan.append(("kw", kw, "tier_1_kw", "A"))
-    for kw in _rotate(fresh_t2, DISCOVERY_TIER_2_PER_RUN):
+    for kw in _rotate(tier_2, DISCOVERY_TIER_2_PER_RUN):
         plan.append(("kw", kw, "tier_2_kw", "B"))
-    for kw in _rotate(fresh_t3, DISCOVERY_TIER_3_PER_RUN):
+    for kw in _rotate(tier_3, DISCOVERY_TIER_3_PER_RUN):
         plan.append(("kw", kw, "tier_3_kw", "B"))
-    for kw in _rotate(fresh_ti, DISCOVERY_TITLE_INDUSTRY_PER_RUN):
+    for kw in _rotate(title_industry, DISCOVERY_TITLE_INDUSTRY_PER_RUN):
         plan.append(("kw", kw, "title_industry_kw", "A"))
     for seed in seeds:
         seed_source = (
@@ -2381,13 +2525,9 @@ def _run_unipile(
 
     if not plan:
         log.warning(
-            "│  [unipile]     plan EMPTY — all kws in ledger (kw_topical: t1=%d/%d t2=%d/%d t3=%d/%d, "
-            "title_industry: %d/%d, seeds=%d)",
-            len(fresh_t1), len(tier_1),
-            len(fresh_t2), len(tier_2),
-            len(fresh_t3), len(tier_3),
-            len(fresh_ti), len(title_industry),
-            len(seeds),
+            "│  [unipile]     plan EMPTY — operator has no tier_1/tier_2/tier_3/title_industry keywords and no seeds "
+            "(t1=%d t2=%d t3=%d ti=%d seeds=%d)",
+            len(tier_1), len(tier_2), len(tier_3), len(title_industry), len(seeds),
         )
         return 0
 
@@ -2404,6 +2544,69 @@ def _run_unipile(
     cache_ttl = settings.discovery_unipile_author_cache_ttl_days
     use_inline_rubric = settings.discovery_unipile_inline_rubric_enabled
     rubric_drops = {"no_profile": 0, "geo": 0, "rubric": 0}
+    # Crustdata-first enrichment strategy + Unipile fallback budget.
+    # See `_enrich_via_crustdata` and the 4-pass flow in the per-query loop
+    # below.
+    enrichment_strategy = settings.discovery_unipile_enrichment_strategy
+    crustdata_enabled = enrichment_strategy in ("crustdata_first", "crustdata_only")
+    unipile_fallback_allowed = enrichment_strategy in ("crustdata_first", "unipile_only")
+    unipile_fallback_remaining = (
+        settings.discovery_unipile_fallback_max_fetches_per_run
+        if enrichment_strategy == "crustdata_first"
+        else None  # unipile_only has no per-strategy cap (slate budget still applies)
+    )
+    enrichment_counters = {
+        "cache_hit": 0,
+        "crustdata_matched": 0,
+        "unipile_fallback": 0,
+        "no_profile": 0,
+    }
+
+    # ── Filter-only sub-pass injection ──────────────────────────────────
+    # Sends `POST /linkedin/search` with location + content_type +
+    # date_posted but NO keywords. Different code path on LinkedIn's side:
+    # the `location` filter IS respected when keywords are omitted (it's
+    # only ignored when combined with a keyword query). Wired as a
+    # synthetic plan entry so the existing PASS 1-4 pipeline picks up the
+    # posts without duplication.
+    prefetched_posts_by_source: dict[str, list[UnipilePost]] = {}
+    if settings.discovery_unipile_filter_only_enabled and account_id:
+        fo_locations = _unipile_post_location_ids_for_operator(account_id, operator)
+        if fo_locations:
+            fo_content_type = (
+                settings.discovery_unipile_filter_only_content_type.strip() or None
+            )
+            fo_date_posted = (
+                settings.discovery_unipile_filter_only_date_posted.strip() or None
+            )
+            log.info(
+                "│  [unipile-filter] location_ids=%s content_type=%r date_posted=%s",
+                ",".join(fo_locations[:5]), fo_content_type, fo_date_posted,
+            )
+            try:
+                fo_posts = search_posts_by_filters(
+                    account_id=account_id,
+                    location_ids=fo_locations,
+                    content_type=fo_content_type,
+                    date_posted=fo_date_posted,
+                    max_pages=settings.discovery_unipile_filter_only_max_pages,
+                    per_page=settings.discovery_unipile_filter_only_per_page,
+                )
+            except UnipileNotConfigured as err:
+                log.warning("discovery: unipile filter-only unconfigured: %s", err)
+                fo_posts = []
+            except UnipileError as err:
+                log.warning("discovery: unipile filter-only failed: %s", err)
+                fo_posts = []
+            log.info("│  [unipile-filter] posts=%d", len(fo_posts))
+            if fo_posts:
+                prefetched_posts_by_source["filter_only_kw"] = fo_posts
+                plan.append(("kw", "filter_only", "filter_only_kw", "A"))
+        else:
+            log.info(
+                "│  [unipile-filter] skipped — no location_ids resolved for operator"
+            )
+
     t_kw = time.monotonic()
     for kind, payload, source, classification in plan:
         assert kind == "kw"
@@ -2433,51 +2636,46 @@ def _run_unipile(
         # Geo-text suffix on the keyword is also OFF (we send the bare
         # payload), because LinkedIn's content index is strict text-match
         # and any extra word collapses recall.
-        try:
+        # Filter-only synthetic plan entries inject pre-fetched posts via
+        # the prefetched_posts_by_source dict (built before the loop).
+        if source in prefetched_posts_by_source:
+            posts = prefetched_posts_by_source[source]
             log.info(
-                "│  [unipile-kw] query=%r (bare keyword; geo enforced post-fetch by inline rubric, not by server)",
-                payload,
+                "│  [unipile-filter] using prefetched posts=%d source=%s",
+                len(posts), source,
             )
-            posts = search_posts_pages(
-                account_id=account_id,
-                query=payload,
-                max_pages=settings.discovery_unipile_post_max_pages,
-                per_page=settings.discovery_unipile_post_limit,
-                sort_by=settings.discovery_unipile_post_sort_by or None,
-                date_posted=settings.discovery_unipile_post_date_window or None,
-                content_type=(
-                    settings.discovery_unipile_post_content_type.strip()
-                    if settings.discovery_unipile_post_content_type.strip()
-                    else None
-                ),
-                author_keywords=settings.discovery_unipile_post_author_filter or None,
-                location_ids=None,  # see comment above — body filter doesn't work on content search
-            )
-            log.info(
-                "│  [unipile-kw] result query=%r posts=%d source=%s",
-                payload, len(posts), source,
-            )
-        except UnipileNotConfigured as err:
-            log.warning("discovery: unipile unconfigured, halting: %s", err)
-            return inserted
-        except UnipileError as err:
-            log.warning("discovery: unipile kw failed for %r: %s", payload, err)
-            continue
+        else:
+            try:
+                log.info(
+                    "│  [unipile-kw] query=%r (bare keyword; geo enforced post-fetch by inline rubric, not by server)",
+                    payload,
+                )
+                posts = search_posts_pages(
+                    account_id=account_id,
+                    query=payload,
+                    max_pages=settings.discovery_unipile_post_max_pages,
+                    per_page=settings.discovery_unipile_post_limit,
+                    sort_by=settings.discovery_unipile_post_sort_by or None,
+                    date_posted=settings.discovery_unipile_post_date_window or None,
+                    content_type=(
+                        settings.discovery_unipile_post_content_type.strip()
+                        if settings.discovery_unipile_post_content_type.strip()
+                        else None
+                    ),
+                    author_keywords=settings.discovery_unipile_post_author_filter or None,
+                    location_ids=None,  # see comment above — body filter doesn't work on content search
+                )
+                log.info(
+                    "│  [unipile-kw] result query=%r posts=%d source=%s",
+                    payload, len(posts), source,
+                )
+            except UnipileNotConfigured as err:
+                log.warning("discovery: unipile unconfigured, halting: %s", err)
+                return inserted
+            except UnipileError as err:
+                log.warning("discovery: unipile kw failed for %r: %s", payload, err)
+                continue
 
-        if source in ("tier_1_kw", "tier_2_kw", "tier_3_kw"):
-            keyword_history.mark_used(
-                db,
-                operator_id=operator_id,
-                source_channel="keyword_topical",
-                query=payload,
-            )
-        elif source == "title_industry_kw":
-            keyword_history.mark_used(
-                db,
-                operator_id=operator_id,
-                source_channel="keyword_title_industry",
-                query=payload,
-            )
         # Tag content-search hits with source_channel for downstream routing.
         if source in ("tier_1_kw", "tier_2_kw", "tier_3_kw"):
             post_source_channel = "keyword_topical"
@@ -2486,6 +2684,11 @@ def _run_unipile(
         else:
             post_source_channel = ""
 
+        # ── PASS 1: pre-filter posts + cache lookup ──────────────────────
+        # Build the list of posts that survive the cheap dedup/skip checks,
+        # along with each post's cached profile (None if a miss). Cache hits
+        # never trigger vendor calls.
+        viable: list[tuple[UnipilePost, dict[str, Any] | None]] = []
         for post in posts:
             if not post.url or post.url in seen_urls:
                 continue
@@ -2496,17 +2699,62 @@ def _run_unipile(
                 continue
             if _is_exhausted(db, operator_id, author_url or post.url):
                 continue
+            slug_from_url = _public_identifier_from_url(author_url)
+            cached = _lookup_unipile_author_cache(
+                db,
+                operator_id=operator_id,
+                provider_id=post.author_provider_id or None,
+                public_identifier=slug_from_url,
+                ttl_days=cache_ttl,
+            )
+            if cached is not None:
+                enrichment_counters["cache_hit"] += 1
+            viable.append((post, cached))
 
-            enriched_profile: dict[str, Any] | None = None
-            rubric_snapshot: dict[str, Any] | None = None
+        # ── PASS 2: Crustdata batch enrichment for cache misses ─────────
+        # Only attempted when strategy ∈ {crustdata_first, crustdata_only}.
+        # `_enrich_via_crustdata` filters out URN-form slugs internally so
+        # we don't waste credits on guaranteed-miss URLs.
+        if use_inline_rubric and crustdata_enabled:
+            pending_for_crustdata = [post for post, prof in viable if prof is None]
+            if pending_for_crustdata:
+                cd_results = _enrich_via_crustdata(
+                    db,
+                    operator_id=operator_id,
+                    posts_pending=pending_for_crustdata,
+                )
+                if cd_results:
+                    enrichment_counters["crustdata_matched"] += len(cd_results)
+                    # Re-map viable's profile slot for each post that matched.
+                    new_viable: list[tuple[UnipilePost, dict[str, Any] | None]] = []
+                    for post, prof in viable:
+                        if prof is None:
+                            url = post.author_profile_url or ""
+                            prof = cd_results.get(url)
+                        new_viable.append((post, prof))
+                    viable = new_viable
 
-            if use_inline_rubric:
-                # Step 1: enrich author via cached /users/{slug} (free Unipile
-                # endpoint). Cache hits don't count against the slate fetch budget;
-                # misses consume one slot atomically on ``slate_runs``.
+        # ── PASS 3: Unipile fallback for still-unenriched posts ─────────
+        # Skipped entirely under strategy="crustdata_only". Capped per slate
+        # by `discovery_unipile_fallback_max_fetches_per_run` under
+        # strategy="crustdata_first"; uncapped (but still bound by the
+        # atomic slate fetch budget) under strategy="unipile_only".
+        if use_inline_rubric and unipile_fallback_allowed:
+            new_viable = []
+            for post, prof in viable:
+                if prof is not None:
+                    new_viable.append((post, prof))
+                    continue
+                if (
+                    unipile_fallback_remaining is not None
+                    and unipile_fallback_remaining <= 0
+                ):
+                    new_viable.append((post, None))
+                    continue
                 provider_id = post.author_provider_id or ""
+                fetched = None
                 if provider_id:
-                    cached_or_fresh, _was_fetched = _get_cached_unipile_author_profile(
+                    fetched, was_fetched = _get_cached_unipile_author_profile(
                         db,
                         operator_id=operator_id,
                         provider_id=provider_id,
@@ -2514,7 +2762,23 @@ def _run_unipile(
                         ttl_days=cache_ttl,
                         slate_run_id=slate_run_id,
                     )
-                    enriched_profile = cached_or_fresh
+                    if was_fetched and unipile_fallback_remaining is not None:
+                        unipile_fallback_remaining -= 1
+                    if fetched is not None:
+                        enrichment_counters["unipile_fallback"] += 1
+                new_viable.append((post, fetched))
+            viable = new_viable
+
+        # ── PASS 4: score + qualify + insert/drop ───────────────────────
+        # The rubric / drop / insert behaviour matches the prior per-post
+        # implementation byte-for-byte; only the source of `enriched_profile`
+        # has changed.
+        for post, enriched_profile in viable:
+            rubric_snapshot: dict[str, Any] | None = None
+
+            if use_inline_rubric:
+                if enriched_profile is None:
+                    enrichment_counters["no_profile"] += 1
                 # Step 2: score author + post against the operator's ICP fields.
                 author_score = _score_unipile_author_against_operator(
                     enriched_profile or {}, operator
@@ -2545,12 +2809,17 @@ def _run_unipile(
                         rubric_drops["geo"] += 1
                         reason_key = "inline_geo"
                         reason = "geo_not_in_author_location"
-                    elif not enriched_profile and provider_id:
-                        # Had a provider_id but enrichment failed/budget
-                        # exhausted → can't verify geo → drop.
+                    elif not enriched_profile:
+                        # Enrichment couldn't be obtained from any source:
+                        # Crustdata miss, Unipile fallback exhausted /
+                        # disabled, or no provider_id+slug pair to look up.
                         rubric_drops["no_profile"] = rubric_drops.get("no_profile", 0) + 1
                         reason_key = "inline_no_profile"
-                        reason = "no_profile (fetch failed or budget exhausted)"
+                        reason = (
+                            "no_profile (crustdata miss + unipile fallback "
+                            "unavailable; strategy="
+                            f"{enrichment_strategy})"
+                        )
                     else:
                         rubric_drops["rubric"] += 1
                         reason_key = "inline_rubric"
@@ -2624,6 +2893,17 @@ def _run_unipile(
             rubric_drops.get("no_profile", 0),
             rubric_drops.get("rubric", 0),
         )
+        log.info(
+            "│  [unipile-enrich] strategy=%s sources: cache_hit=%d "
+            "crustdata_matched=%d unipile_fallback=%d no_profile=%d "
+            "(fallback budget remaining: %s)",
+            enrichment_strategy,
+            enrichment_counters["cache_hit"],
+            enrichment_counters["crustdata_matched"],
+            enrichment_counters["unipile_fallback"],
+            enrichment_counters["no_profile"],
+            unipile_fallback_remaining if unipile_fallback_remaining is not None else "n/a",
+        )
     return inserted
 
 
@@ -2654,13 +2934,7 @@ def _run_unipile_title_search(
     if not title_industry or not account_id:
         return 0
 
-    fresh_queries = keyword_history.filter_unused(
-        db,
-        operator_id=operator_id,
-        source_channel="title_search",
-        queries=title_industry,
-    )
-    plan = _rotate(fresh_queries, DISCOVERY_TITLE_SEARCH_QUERIES_PER_RUN)
+    plan = _rotate(title_industry, DISCOVERY_TITLE_SEARCH_QUERIES_PER_RUN)
 
     # Resolve operator's target industries → LinkedIn industry IDs once per
     # run (cached cross-run). When set, the people-search applies a hard
@@ -2714,13 +2988,6 @@ def _run_unipile_title_search(
         except UnipileError as err:
             log.warning("discovery: title_search %r failed: %s", query, err)
             continue
-
-        keyword_history.mark_used(
-            db,
-            operator_id=operator_id,
-            source_channel="title_search",
-            query=query,
-        )
 
         # Step 2 — for each person, walk recent activity.
         for person in people:

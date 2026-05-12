@@ -461,7 +461,19 @@ def _evaluate_cheap_gates(
     except Exception as err:
         return "error_non_buyer", {"err": str(err)}
     if nb.drop:
-        return "non_buyer", {"reason": nb.reason, "gate_results": {"non_buyer": nb.model_dump()}}
+        # Spare the candidate if the inline Unipile rubric already qualified
+        # the author as ICP (title + industry + geo all matched). The non_buyer
+        # gate judges author-as-buyer from post text alone, which routinely
+        # misclassifies clear-ICP execs whose post happens to read as
+        # commentary/op-ed rather than as buyer language. The rubric is the
+        # source of truth for "is this person in ICP"; keep them.
+        if c.get("inline_icp_qualified") and settings.gates_non_buyer_spare_inline_icp:
+            log.info(
+                "│  [non_buyer/spared] icp-qualified author kept despite verdict: %s",
+                (nb.reason or "")[:120],
+            )
+        else:
+            return "non_buyer", {"reason": nb.reason, "gate_results": {"non_buyer": nb.model_dump()}}
 
     try:
         pq = post_quality.evaluate(post_text=post_text)
@@ -506,6 +518,28 @@ def _evaluate_expensive_gates(
             "reason": ar.reason,
             "gate_results": {**prior, "analyst": ar.model_dump()},
         }
+
+    # Skip the LLM icp_scoring gate entirely for inline-ICP-qualified
+    # candidates. The inline Unipile rubric (title+industry+geo) is the
+    # source of truth for "is this person in ICP" — re-judging via an
+    # LLM call wastes money AND has been observed to drop clear-ICP
+    # authors whose post text doesn't surface ICP keywords. Pass through
+    # with a synthetic gate_results entry so downstream stages still see
+    # the candidate cleared the ICP gate.
+    if c.get("inline_icp_qualified") and settings.gates_icp_scoring_spare_inline_icp:
+        log.info(
+            "│  [icp/spared] inline-icp-qualified author passes without LLM ICP scoring"
+        )
+        merged = {
+            **prior,
+            "analyst": ar.model_dump(),
+            "icp": {
+                "spared_inline_icp": True,
+                "score_0_10": None,
+                "reason": "inline_icp_qualified — icp_scoring skipped",
+            },
+        }
+        return "passed", {"gate_results": merged}
 
     lv_raw = c.get("author_title_levels")
     title_levels = lv_raw if isinstance(lv_raw, list) else None

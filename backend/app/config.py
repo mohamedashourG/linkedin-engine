@@ -113,6 +113,24 @@ class Settings(BaseSettings):
     # When true (default), drop LinkedIn company-authored posts from Unipile
     # keyword and title-search activity paths (person buyers only).
     discovery_unipile_skip_company_posts: bool = True
+    # Filter-only Unipile post search — sends body with location +
+    # content_type + date_posted but NO keywords. Different code path on
+    # LinkedIn's side: the location filter is actually respected here
+    # (unlike with keywords, where it's empirically ignored). Runs as a
+    # sub-source inside _run_unipile after the keyword loop. Each pass
+    # goes through the same Crustdata-first enrichment + rubric pipeline.
+    discovery_unipile_filter_only_enabled: bool = True
+    # date_posted for the filter-only pass. Valid: "", "past_day",
+    # "past_week", "past_month".
+    discovery_unipile_filter_only_date_posted: str = "past_month"
+    # content_type for the filter-only pass. Common values: "documents"
+    # (long-form thought-leadership), "images", "videos", "articles".
+    # Empty string omits the field entirely (any post type).
+    discovery_unipile_filter_only_content_type: str = "documents"
+    # Cursor-pagination depth for the filter-only pass.
+    discovery_unipile_filter_only_max_pages: int = 3
+    # Results per page for the filter-only pass (Unipile caps at 50).
+    discovery_unipile_filter_only_per_page: int = 50
     # Inline author enrichment + per-operator rubric inside _run_unipile.
     # Reference: unipile_hybrid_sweep.py (hybrid_sweep + Client 2 scripts).
     # When enabled, every post returned by Unipile keyword search is:
@@ -147,17 +165,51 @@ class Settings(BaseSettings):
     discovery_wall_clock_cap_seconds_crustdata_screener: int = 0
     # Days a cached profile is reused before refetching.
     discovery_unipile_author_cache_ttl_days: int = 14
-    # 14-day no-repeat ledger for keywords (RULE 15) is too aggressive for
-    # tenants with small keyword pools (~10-20 kws): they exhaust after one
-    # run and sit idle for two weeks. 3 days lets a small pool cycle weekly
-    # while still preventing same-day repeats. Override per-tenant via
-    # KEYWORD_HISTORY_LOOKBACK_DAYS. Ignored when discovery_keyword_history_enabled
-    # is false.
-    keyword_history_lookback_days: int = 3
-    # When false (default), the same keyword may run on every pass: filter_unused
-    # returns the full list and mark_used is a no-op. Set true to re-enable the
-    # RULE 15 / RULE 24 per-operator, per-channel no-repeat ledger in Mongo.
-    discovery_keyword_history_enabled: bool = False
+    # Author enrichment strategy inside _run_unipile.
+    #   "crustdata_first" (default) — batch-call Crustdata per Unipile keyword
+    #       query; only fall back to Unipile /users/{slug} for authors
+    #       Crustdata couldn't match (or whose URL form isn't slug-friendly).
+    #       Eliminates the bulk of LinkedIn-account API calls.
+    #   "unipile_only" — original behaviour: every miss goes straight to
+    #       Unipile (preserves max coverage, max LinkedIn-account usage).
+    #   "crustdata_only" — Crustdata only; drop posts Crustdata can't match.
+    #       Maximum LinkedIn-account safety, may drop ~10-20% of candidates.
+    discovery_unipile_enrichment_strategy: Literal[
+        "crustdata_first", "unipile_only", "crustdata_only"
+    ] = "crustdata_first"
+    # Per-slate cap on the Unipile fallback path when
+    # discovery_unipile_enrichment_strategy="crustdata_first". The existing
+    # discovery_unipile_max_profile_fetches_per_run setting still serves as a
+    # hard ceiling on the slate_runs.fetch_budget_remaining counter; this
+    # fallback cap is checked in addition for the Crustdata-first flow so
+    # the LinkedIn-account call budget stays small even on high-yield runs.
+    discovery_unipile_fallback_max_fetches_per_run: int = 50
+    # Override of the vendor Crustdata batch size (server hard-caps at 25).
+    # Lower values amortize cost over more requests in case of slowness.
+    discovery_unipile_crustdata_batch_size: int = 25
+
+    # ── Gate relaxation for ICP-qualified candidates ───────────────────
+    # When a Unipile candidate cleared the inline rubric's Path A (author
+    # title + industry + geo all matched the operator's ICP fields), the
+    # downstream LLM gates are tuned to be more lenient — the rubric is
+    # treated as the source of truth for "is this person in ICP", and the
+    # gates' job is just to judge POST QUALITY, not whether the author is
+    # the right buyer (we already know they are).
+    #
+    # non_buyer gate: when True (default), `non_buyer` drops are SPARED
+    # for inline-ICP-qualified candidates — the verdict is logged on the
+    # candidate doc for visibility but doesn't filter them out. The rest
+    # of the cheap gate funnel (post_quality) still applies normally.
+    gates_non_buyer_spare_inline_icp: bool = True
+    # icp_scoring gate: when True (default), the LLM ICP scoring step is
+    # SKIPPED entirely for inline-ICP-qualified candidates — they pass
+    # the gate without an LLM call (saves cost, prevents the gate from
+    # re-judging an author the inline rubric already cleared as ICP).
+    # The candidate's gate_results.icp records `{spared_inline_icp: True,
+    # score_0_10: None}` so the UI can show the gate was skipped on
+    # purpose, not failed. Set False to revert to LLM scoring with full
+    # threshold for everyone (legacy behaviour).
+    gates_icp_scoring_spare_inline_icp: bool = True
     # Posts older than this are dropped at verification — keeps the slate
     # fresh and avoids wasting enrichment credits on stale content.
     # Candidates with no published_at are kept (we don't penalize missing

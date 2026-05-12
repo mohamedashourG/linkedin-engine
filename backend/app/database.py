@@ -50,13 +50,6 @@ async def _ensure_indexes() -> None:
         [("operator_id", 1), ("status", 1), ("expires_at", 1)]
     )
     await db.eod_logs.create_index([("operator_id", 1), ("log_date", -1)])
-    # RULE 15 — per-query no-repeat ledger. Unique on (operator, channel, query)
-    # so upserts behave; TTL on expires_at so the collection stays bounded.
-    await db.keyword_history.create_index(
-        [("operator_id", 1), ("source_channel", 1), ("query", 1)],
-        unique=True,
-    )
-    await db.keyword_history.create_index("expires_at", expireAfterSeconds=0)
     await db.our_comments.create_index(
         [("comment_id", 1)], unique=True, sparse=True
     )
