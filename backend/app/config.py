@@ -304,6 +304,14 @@ class Settings(BaseSettings):
     # graceful — discovery continues without the extra context. Cached 30d
     # in apidirect_company_cache so repeat companies cost zero.
     apidirect_fetch_company_details: bool = True
+    # Drafter retry loop: when the validator rejects a comment, re-draft
+    # with a different reframe formula AND feed the validator's reason back
+    # into the prompt so the model can correct. Caps the loop so a poison
+    # candidate can't burn unbounded LLM cost. Default 3 = up to 3 attempts
+    # total (initial + 2 retries). Per-candidate cost ceiling: 3× drafter
+    # call (~$0.05-0.10 worst case). Validator failure was the worst kind
+    # of drop because the candidate had already paid full gate cost.
+    drafter_max_attempts: int = 3
     # When true, auto-queue reply-backs from reply_drafter (high risk — default off).
     engine_auto_send_public_reply_back: bool = False
 

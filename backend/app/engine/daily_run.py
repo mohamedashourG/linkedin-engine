@@ -745,43 +745,116 @@ def _draft_one(
     icp_score = int(((c.get("gate_results") or {}).get("icp") or {}).get("total") or 0)
     comment_type = c.get("comment_type") or "A"
 
-    formula = drafter.pick_reframe_formula(comment_type, exclude=exclude_formulas)
-    try:
-        comment_text, formula_used = drafter.draft_comment(
-            cofounder_name=cofounder.get("display_name") or "",
-            cofounder_tone=tone,
-            cofounder_examples=examples,
-            post_text=c.get("post_text") or "",
-            author_name=c.get("author_name"),
-            author_title=c.get("author_title"),
-            author_company=c.get("author_company"),
-            icp_score=icp_score,
-            comment_type=comment_type,
-            source_classification=c.get("source_classification") or "A",
-            reframe_formula=formula,
+    # Drafter retry loop. A validator rejection means OUR COMMENT was bad —
+    # not the post. Re-draft with a different reframe formula AND feed the
+    # validator's reason back into the system prompt so the model can
+    # correct (e.g., "used em-dash" → next attempt avoids dashes; "exceeded
+    # 5 sentences" → next attempt is more concise).
+    #
+    # Caps at settings.drafter_max_attempts (default 3) to prevent a poison
+    # candidate from burning unbounded LLM cost. Each retry uses a fresh
+    # formula from the type's pool, excluding ones already tried AND any
+    # slate-level over-represented formulas passed in by the rebalancer.
+    max_attempts = max(1, int(settings.drafter_max_attempts))
+    tried_formulas: list[str] = list(exclude_formulas or [])
+    prior_feedback: str | None = None
+    last_failure_reason: str | None = None
+    attempts_record: list[dict[str, Any]] = []
+
+    for attempt_idx in range(max_attempts):
+        formula = drafter.pick_reframe_formula(comment_type, exclude=tried_formulas)
+        try:
+            comment_text, formula_used = drafter.draft_comment(
+                cofounder_name=cofounder.get("display_name") or "",
+                cofounder_tone=tone,
+                cofounder_examples=examples,
+                post_text=c.get("post_text") or "",
+                author_name=c.get("author_name"),
+                author_title=c.get("author_title"),
+                author_company=c.get("author_company"),
+                icp_score=icp_score,
+                comment_type=comment_type,
+                source_classification=c.get("source_classification") or "A",
+                reframe_formula=formula,
+                prior_validator_feedback=prior_feedback,
+            )
+        except Exception as err:
+            log.warning(
+                "drafter call failed candidate=%s attempt=%d/%d: %s",
+                c["_id"], attempt_idx + 1, max_attempts, err,
+            )
+            attempts_record.append({
+                "attempt": attempt_idx + 1,
+                "formula": formula,
+                "outcome": "drafter_error",
+                "reason": str(err)[:300],
+            })
+            last_failure_reason = f"drafter_error: {err}"
+            tried_formulas.append(formula)
+            prior_feedback = None  # transport error — no validator feedback
+            continue
+
+        v = validator.validate_comment(comment_text, comment_type)
+        if v.ok:
+            db.candidates.update_one(
+                {"_id": c["_id"]},
+                {
+                    "$set": {
+                        "status": "drafted",
+                        "comment_text": comment_text,
+                        "reframe_formula": formula_used,
+                        "drafter_attempts": attempt_idx + 1,
+                        "drafter_attempts_log": attempts_record + [{
+                            "attempt": attempt_idx + 1,
+                            "formula": formula_used,
+                            "outcome": "passed",
+                            "reason": None,
+                        }],
+                        "updated_at": utcnow(),
+                    }
+                },
+            )
+            if attempts_record:
+                log.info(
+                    "│  [drafter/retry-ok] candidate=%s passed on attempt %d after %s",
+                    c["_id"], attempt_idx + 1,
+                    "; ".join(
+                        f"{a['attempt']}:{a['outcome']}({(a['reason'] or '')[:60]})"
+                        for a in attempts_record
+                    ),
+                )
+            return {"comment_text": comment_text, "reframe_formula": formula_used}
+
+        # Validator rejected — record, prime the next attempt with the
+        # rejection reason, and try a different formula.
+        log.info(
+            "│  [drafter/validator-reject] candidate=%s attempt=%d/%d reason=%s",
+            c["_id"], attempt_idx + 1, max_attempts, (v.reason or "")[:120],
         )
-    except Exception as err:
-        log.warning("drafter failed for candidate=%s: %s", c["_id"], err)
-        _drop(db, c, f"drafter_error: {err}")
-        return None
+        attempts_record.append({
+            "attempt": attempt_idx + 1,
+            "formula": formula_used,
+            "outcome": "validator_reject",
+            "reason": (v.reason or "")[:300],
+        })
+        last_failure_reason = v.reason
+        tried_formulas.append(formula_used)
+        prior_feedback = v.reason  # feed back to next attempt's prompt
 
-    result = validator.validate_comment(comment_text, comment_type)
-    if not result.ok:
-        _drop(db, c, f"validator: {result.reason}")
-        return None
-
+    # All attempts exhausted — drop the candidate with the last failure.
     db.candidates.update_one(
         {"_id": c["_id"]},
-        {
-            "$set": {
-                "status": "drafted",
-                "comment_text": comment_text,
-                "reframe_formula": formula_used,
-                "updated_at": utcnow(),
-            }
-        },
+        {"$set": {
+            "drafter_attempts": max_attempts,
+            "drafter_attempts_log": attempts_record,
+        }},
     )
-    return {"comment_text": comment_text, "reframe_formula": formula_used}
+    _drop(
+        db,
+        c,
+        f"validator_retries_exhausted: {max_attempts} attempts, last={last_failure_reason}",
+    )
+    return None
 
 
 def _rebalance_reframe_overrep(

@@ -180,11 +180,31 @@ MSL strategy lives or dies on whether the scientific insight ever changes a bran
 Use this reframe formula in sentence 1: {assigned_reframe_formula}
 
 Replace X / Y / Z with the actual nouns from the post. The formula is the structural skeleton, not the literal words.
-
+{prior_failure_block}
 # YOUR TASK
 
 Draft ONE comment, Type {comment_type}, on the post above, in {cofounder_name}'s voice. Follow every rule. Match the exemplars structurally. Use the assigned reframe formula in sentence 1.
 """
+
+
+def _format_prior_failure(prior_validator_feedback: str | None) -> str:
+    """Build a corrective block inserted before the task instructions when
+    the previous draft attempt was rejected by the validator. Telling the
+    model the specific failure reason ("contained em-dash", "exceeded
+    sentence cap", "banned opener `Great point`") makes retries
+    converge much faster than blind re-draws — without it, the model
+    tends to repeat the same mistake."""
+    if not prior_validator_feedback:
+        return ""
+    reason = str(prior_validator_feedback).strip()[:400]
+    if not reason:
+        return ""
+    return (
+        "\n# PREVIOUS ATTEMPT REJECTED — DO NOT REPEAT\n\n"
+        f"Your previous attempt was rejected with this reason:\n  {reason!r}\n\n"
+        "Generate a fresh comment that AVOIDS THIS SPECIFIC ISSUE. "
+        "All other rules above still apply.\n"
+    )
 
 
 def _format_examples(examples: list[dict]) -> str:
@@ -224,11 +244,17 @@ def draft_comment(
     comment_type: str,
     source_classification: str,
     reframe_formula: str | None = None,
+    prior_validator_feedback: str | None = None,
 ) -> tuple[str, str]:
     """
     Returns (comment_text, reframe_formula_used). The caller persists
     `reframe_formula_used` so the slate-level rebalancer can detect over-
     representation later.
+
+    ``prior_validator_feedback`` is set on retry attempts after a validator
+    rejection. When present, the system prompt grows a corrective block
+    that quotes the rejection reason and instructs the model to avoid it.
+    Caller is responsible for the retry loop + formula rotation.
     """
     min_s, max_s = SENTENCE_COUNT_BY_TYPE.get(comment_type, (3, 5))
     close_pattern = TYPE_CLOSE_PATTERNS.get(comment_type, "")
@@ -249,6 +275,7 @@ def draft_comment(
         max_sentences=max_s,
         type_close_pattern_for_this_comment=close_pattern,
         assigned_reframe_formula=formula,
+        prior_failure_block=_format_prior_failure(prior_validator_feedback),
     )
 
     result = parse_structured_sync(
