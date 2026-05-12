@@ -2,9 +2,11 @@
 
 Hi —
 
-Pushing the current state of the engine. Below is everything we noted as
-"to fix" or "next-up" during today's Edge-run audit, in priority order. Full
-context lives in two committed markdown docs at the repo root:
+Just pushed the current state of the engine to `main` —
+commit `a267ddb` on `github.com/mohamedashourG/linkedin-engine`. Below is
+everything we noted as "to fix" or "next-up" during today's Edge-run audit,
+in priority order. Full context lives in two committed markdown docs at
+the repo root:
 
 - `linkedin-engine/LESSONS_TO_FIX.md` — bugs and design issues surfaced by
   the Edge run analysis (slate `6a01fba66c4cb8852a0a9097`)

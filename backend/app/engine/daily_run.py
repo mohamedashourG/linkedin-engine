@@ -552,6 +552,19 @@ def _evaluate_expensive_gates(
             author_company=c.get("author_company"),
             author_location=c.get("author_location"),
             author_title_levels=title_levels,
+            # Structured company facts from APIDirect /v1/linkedin/company
+            # (when enrichment succeeded at discovery time). The LLM treats
+            # these as EXPLICIT signals — higher confidence than inferring
+            # from the headline alone. Industry classification here is the
+            # LinkedIn taxonomy field (e.g. "Hospitals and Health Care")
+            # which matches the operator's target_industries rubric far
+            # better than a substring match on the company NAME.
+            author_company_industry=c.get("author_company_industry"),
+            author_company_description=c.get("author_company_description"),
+            author_company_employee_range=c.get("author_company_employee_range"),
+            author_company_employees=c.get("author_company_employees"),
+            author_company_founded_year=c.get("author_company_founded_year"),
+            author_company_specialities=c.get("author_company_specialities"),
             icp_rubric=rubric,
             # When the candidate came from a source that filtered geo or
             # industry server-side (RULE 24 people-search with geoUrn /

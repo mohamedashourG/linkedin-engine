@@ -260,6 +260,56 @@ def _operator_geo_terms(operator: dict[str, Any]) -> list[str]:
     return uniq[:15]
 
 
+# Generic company-type tokens used to expand `target_titles` × company-type
+# into title_industry queries when the operator's curated pool doesn't cover
+# the long tail (small practices, founder-led orgs, specialty clinics).
+# Kept short and ICP-agnostic — operator's actual industry preferences are
+# enforced server-side via the LinkedIn INDUSTRY filter on people-search.
+_GENERIC_COMPANY_TYPE_TOKENS: tuple[str, ...] = (
+    "hospital",
+    "health system",
+    "medical group",
+    "medical practice",
+    "physician group",
+    "specialty clinic",
+    "FQHC",
+    "ambulatory",
+)
+
+
+def _expand_title_industry_queries(
+    operator: dict[str, Any], *, max_queries: int = 320
+) -> list[str]:
+    """Cross-product expander: ``target_titles × _GENERIC_COMPANY_TYPE_TOKENS``.
+
+    Used to supplement the curated ``title_industry`` pool so RULE 24 catches
+    the long tail of small-practice / founder-CEO / specialty-clinic variants
+    that the hand-curated list misses (e.g., ``"CEO medical practice"``,
+    ``"CEO physician group"`` — both essential for catching independent-
+    physician CEOs like cardiology practice owners).
+
+    Outer loop is COMPANY TYPE so every title gets at least one query per
+    company-type token before any title gets a second one; this guarantees
+    even short-pool coverage when ``max_queries`` truncates. The discovery
+    loop's ``_rotate`` then samples ``DISCOVERY_TITLE_SEARCH_QUERIES_PER_RUN``
+    queries randomly per run, so over repeated runs we cycle through the
+    full expansion."""
+    ext = operator.get("product_extracted") or {}
+    titles = ext.get("target_titles") or []
+    if not isinstance(titles, list):
+        return []
+    titles_clean = [t.strip() for t in titles if isinstance(t, str) and t.strip()]
+    if not titles_clean:
+        return []
+    out: list[str] = []
+    for ind in _GENERIC_COMPANY_TYPE_TOKENS:
+        for title in titles_clean:
+            out.append(f"{title} {ind}")
+            if len(out) >= max_queries:
+                return out
+    return out
+
+
 def _seniority_hints_from_titles(operator: dict[str, Any]) -> str:
     """Short phrase of seniority tokens mined from target job titles."""
     ext = operator.get("product_extracted") or {}
@@ -650,6 +700,23 @@ def _doc_from_unipile(
         loc = ep.get("location") or ""
         if loc:
             doc["author_location"] = loc
+        # Surface structured company-level fields (APIDirect + Crustdata)
+        # onto the candidate doc so the LLM ICP gate and the UI can read
+        # them without re-fetching the author cache. All optional — graceful
+        # absence when company enrichment failed or wasn't attempted.
+        for src_key, dst_key in (
+            ("company", "author_company"),
+            ("employer_description", "author_company_about"),
+            ("company_industry", "author_company_industry"),
+            ("company_description", "author_company_description"),
+            ("company_employee_range", "author_company_employee_range"),
+            ("company_employees", "author_company_employees"),
+            ("company_founded_year", "author_company_founded_year"),
+            ("company_specialities", "author_company_specialities"),
+        ):
+            v = ep.get(src_key)
+            if v is not None and v != "" and v != []:
+                doc[dst_key] = v
     if getattr(post, "reaction_counter", None) is not None:
         doc["reaction_counter"] = int(post.reaction_counter or 0)
     if getattr(post, "comment_counter", None) is not None:
@@ -662,15 +729,15 @@ def _doc_from_unipile(
         doc["can_post_comments"] = bool(post.can_post_comments)
     if unipile_rubric:
         doc["unipile_rubric"] = unipile_rubric
-        # `inline_icp_qualified` is the single boolean downstream gates
-        # check to relax non_buyer / icp_low drops. True only when the
-        # AUTHOR rubric (title+industry+geo) cleared Path A — i.e., this
-        # person matches the operator's ICP on enriched profile evidence,
-        # not just on post-text keyword hits. Path B (post-relevance only)
-        # is NOT considered ICP-qualified — the gate funnel still applies
-        # in full to those candidates.
-        paths = unipile_rubric.get("paths") or []
-        doc["inline_icp_qualified"] = "A_author" in paths
+    # `inline_icp_qualified` is set ONLY by source-verified paths (RULE 24
+    # people-search with server-side LOCATION + INDUSTRY + degree filter,
+    # contact_seed direct lookups). Keyword-search candidates — even those
+    # that cleared Path A on the substring rubric — DO NOT get this flag:
+    # the substring rubric is a recall-keeper for routing to gates, not a
+    # proof of ICP. Keyword candidates must still pass the LLM `non_buyer`
+    # and `icp_scoring` gates so we can verify "is this actually a buyer,
+    # and does the author's title/industry/stage really match the rubric?"
+    # without relying on substring evidence alone.
     return doc
 
 
@@ -728,7 +795,19 @@ def _score_unipile_author_against_operator(
     headline = (profile.get("headline") or "").lower()
     location = (profile.get("location") or "").lower()
     company = (profile.get("company") or "").lower()
-    blob = (headline + " | " + company).strip(" |")
+    # Industry scoring blob — combines every field that can contain industry
+    # keywords:
+    #   - headline + company name (weak signal, often misses)
+    #   - employer_description: Crustdata "company about" blurb
+    #   - company_industry: APIDirect /v1/linkedin/company structured field
+    #     (e.g., "Hospitals and Health Care") — strongest signal when present
+    #   - company_description: APIDirect company description (richer than
+    #     Crustdata's employer_description on average)
+    employer_desc = (profile.get("employer_description") or "").lower()
+    company_industry = (profile.get("company_industry") or "").lower()
+    company_description = (profile.get("company_description") or "").lower()
+    blob_parts = [headline, company, employer_desc, company_industry, company_description]
+    blob = " | ".join(p for p in blob_parts if p).strip(" |")
 
     title_pts = 5 if any(_rubric_substring_match(headline, t) for t in titles) else 0
     industry_pts = 3 if any(_rubric_substring_match(blob, i) for i in industries) else 0
@@ -1204,6 +1283,105 @@ def _looks_like_urn_slug(slug: str | None) -> bool:
     return bool(slug and _LINKEDIN_URN_SLUG_RE.match(slug))
 
 
+_COMPANY_CACHE_TTL_DAYS = 30
+
+
+def _get_cached_company_details(
+    db: Database,
+    *,
+    operator_id: ObjectId,
+    company_linkedin_id: str,
+    company_url: str,
+) -> dict[str, Any] | None:
+    """Look up or fetch APIDirect company details, cached cross-run in
+    ``apidirect_company_cache`` (TTL ~30d — industry doesn't change often).
+
+    Returns a dict with structured industry / employee count / description /
+    specialties, or ``None`` on any failure (404, 502 upstream, timeout,
+    quota exhausted, transport error). Failure is silent so callers never
+    block on company enrichment."""
+    if not company_linkedin_id:
+        return None
+    cache_key = str(company_linkedin_id).strip()
+    if not cache_key:
+        return None
+    coll = getattr(db, "apidirect_company_cache", None)
+    if coll is None:
+        return None
+    cached = coll.find_one({"_id": cache_key})
+    cutoff = utcnow() - timedelta(days=_COMPANY_CACHE_TTL_DAYS)
+    if cached and cached.get("fetched_at") and cached["fetched_at"] >= cutoff:
+        if cached.get("not_found"):
+            return None
+        return {
+            "industry": cached.get("industry"),
+            "description": cached.get("description"),
+            "employee_range": cached.get("employee_range"),
+            "employees": int(cached.get("employees") or 0),
+            "founded_year": cached.get("founded_year"),
+            "specialities": cached.get("specialities") or [],
+            "name": cached.get("name"),
+            "website": cached.get("website"),
+        }
+    try:
+        from app.services.apidirect import (
+            get_linkedin_company_details,
+            ApiDirectQuotaExhausted,
+            ApiDirectNotConfigured,
+        )
+        details = get_linkedin_company_details(company_url)
+    except ApiDirectQuotaExhausted:
+        # Quota tripped — let circuit breaker stop subsequent calls for the
+        # rest of the run. Cache the miss with a short TTL so we don't
+        # immediately retry on the next candidate.
+        coll.update_one(
+            {"_id": cache_key},
+            {"$set": {"_id": cache_key, "not_found": True, "fetched_at": utcnow()}},
+            upsert=True,
+        )
+        return None
+    except (ApiDirectNotConfigured, Exception) as err:
+        log.warning(
+            "│  [apidirect-company] fetch failed key=%s err=%s",
+            cache_key[:60], err,
+        )
+        return None
+    if details is None:
+        coll.update_one(
+            {"_id": cache_key},
+            {"$set": {"_id": cache_key, "not_found": True, "fetched_at": utcnow()}},
+            upsert=True,
+        )
+        return None
+    doc = {
+        "_id": cache_key,
+        "name": details.name,
+        "company_id": details.company_id,
+        "industry": details.industry,
+        "description": details.description,
+        "website": details.website,
+        "followers": details.followers,
+        "employees": details.employees,
+        "employee_range": details.employee_range,
+        "founded_year": details.founded_year,
+        "specialities": details.specialities,
+        "headquarters": details.headquarters,
+        "fetched_at": utcnow(),
+        "not_found": False,
+    }
+    coll.update_one({"_id": cache_key}, {"$set": doc}, upsert=True)
+    return {
+        "industry": details.industry,
+        "description": details.description,
+        "employee_range": details.employee_range,
+        "employees": details.employees,
+        "founded_year": details.founded_year,
+        "specialities": details.specialities,
+        "name": details.name,
+        "website": details.website,
+    }
+
+
 def _enrich_via_crustdata(
     db: Database,
     *,
@@ -1286,6 +1464,23 @@ def _enrich_via_crustdata(
             if profile is None:
                 continue
             slug = unique_urls[url]
+            # Structured company-level enrichment via APIDirect — gated by
+            # config so operators can disable for cost. Failure is silent;
+            # the rubric and LLM ICP scoring proceed with what they have.
+            company_details: dict[str, Any] | None = None
+            if (
+                settings.apidirect_fetch_company_details
+                and profile.employer_linkedin_id
+            ):
+                company_url = (
+                    f"https://www.linkedin.com/company/{profile.employer_linkedin_id}"
+                )
+                company_details = _get_cached_company_details(
+                    db,
+                    operator_id=operator_id,
+                    company_linkedin_id=profile.employer_linkedin_id,
+                    company_url=company_url,
+                )
             doc = {
                 "operator_id": operator_id,
                 # Crustdata doesn't return a Unipile URN — leave provider_id
@@ -1298,6 +1493,25 @@ def _enrich_via_crustdata(
                 "location": profile.location or "",
                 "company": profile.employer_name or "",
                 "title": profile.title or "",
+                # Crustdata-only structured fields: employer's LinkedIn "about"
+                # blurb (often mentions the industry vertical in plain English)
+                # and the employer's LinkedIn company ID (used as the cache
+                # key for the apidirect_company_cache lookup below).
+                "employer_description": profile.employer_description or "",
+                "employer_linkedin_id": profile.employer_linkedin_id or "",
+                # APIDirect /v1/linkedin/company — structured industry +
+                # employee count + description. Used directly by the inline
+                # industry rubric AND passed to the LLM ICP scoring gate
+                # so the LLM can reason about company stage / size / sector
+                # with structured data instead of inferring from headlines.
+                # All fields are nullable — graceful degradation when the
+                # APIDirect call fails or company has no LinkedIn page.
+                "company_industry": (company_details or {}).get("industry"),
+                "company_description": (company_details or {}).get("description"),
+                "company_employee_range": (company_details or {}).get("employee_range"),
+                "company_employees": (company_details or {}).get("employees"),
+                "company_founded_year": (company_details or {}).get("founded_year"),
+                "company_specialities": (company_details or {}).get("specialities") or [],
                 "source": "crustdata",
                 "fetched_at": now,
             }
@@ -1834,13 +2048,35 @@ def discover_for_operator(
     # RULE 15-EXT — title-plus-industry pool. Source priority:
     #   1. configs/<client>/keyword_pools.json:title_industry  (curated per-tenant)
     #   2. operator.product_extracted.title_industry            (back-compat)
-    # Empty pool is fine — the unipile path skips the title-industry plan.
+    # PLUS: programmatic cross-product expansion (target_titles × generic
+    # company-type tokens) appended after the curated entries. The curated
+    # list keeps operator-controlled priority queries first; the expander
+    # covers the long tail (small-practice CEOs, specialty clinic founders,
+    # etc.) that hand-curation misses.
     cfg = client_config.for_operator(operator)
-    title_industry: list[str] = (
+    curated_ti: list[str] = (
         cfg.keyword_pools.get("title_industry")
         or extracted.get("title_industry")
         or []
     )
+    expanded_ti = _expand_title_industry_queries(operator)
+    seen_ti: set[str] = set()
+    title_industry: list[str] = []
+    for q in list(curated_ti) + list(expanded_ti):
+        if not isinstance(q, str):
+            continue
+        key = q.strip().lower()
+        if not key or key in seen_ti:
+            continue
+        seen_ti.add(key)
+        title_industry.append(q.strip())
+    if title_industry:
+        log.info(
+            "discovery: title_industry pool = %d (curated=%d, expanded=%d)",
+            len(title_industry),
+            len(curated_ti),
+            len(expanded_ti),
+        )
 
     seeds = list(
         db.discovery_seeds.find(
@@ -3046,6 +3282,16 @@ def _run_unipile_title_search(
                 doc["geo_verified_at_source"] = True
                 if industry_ids:
                     doc["industry_verified_at_source"] = True
+                # RULE 24 candidates are ICP-proven by construction (server-side
+                # LOCATION + INDUSTRY + network_distance + title-keyword match
+                # all enforced by LinkedIn). Tag inline_icp_qualified so the
+                # downstream cheap/expensive gates skip non_buyer + icp_scoring
+                # (post_quality and analyst_reportage still run — they judge
+                # POST content, not author ICP fit). Saves ~$0.02/candidate of
+                # redundant LLM ICP scoring AND prevents non_buyer from
+                # misclassifying clear-ICP execs whose post happens to read as
+                # commentary rather than buyer language.
+                doc["inline_icp_qualified"] = True
                 db.candidates.insert_one(doc)
                 _discovery_record_insert(db, doc)
                 inserted += 1

@@ -96,6 +96,12 @@ def evaluate(
     author_company: str | None = None,
     author_location: str | None = None,
     author_title_levels: list[str] | None = None,
+    author_company_industry: str | None = None,
+    author_company_description: str | None = None,
+    author_company_employee_range: str | None = None,
+    author_company_employees: int | None = None,
+    author_company_founded_year: int | None = None,
+    author_company_specialities: list[str] | None = None,
     icp_rubric: dict[str, Any],
     geo_verified_at_source: bool = False,
     industry_verified_at_source: bool = False,
@@ -112,6 +118,13 @@ def evaluate(
 
     Same for ``industry_verified_at_source`` — when the people-search applied
     the INDUSTRY filter, all returned candidates are guaranteed in-industry.
+
+    ``author_company_*`` fields come from APIDirect /v1/linkedin/company when
+    enrichment ran. They provide structured industry classification (vs
+    inferring from a company name), employee count for stage scoring, and
+    specialties/description for richer industry signals. All optional —
+    when the structured fetch failed the LLM falls back to inferring from
+    the headline + post text as before.
     """
     rubric_text = _format_rubric(icp_rubric)
     author_block: list[str] = []
@@ -128,6 +141,24 @@ def evaluate(
             "Seniority / title levels (enrichment): "
             + ", ".join(str(x) for x in author_title_levels if x)
         )
+    # Structured company facts — when present, the LLM should weight them
+    # higher than what it infers from the headline alone (EXPLICIT tier per
+    # the system prompt's evidence priority).
+    if author_company_industry:
+        author_block.append(f"Company industry (LinkedIn-structured): {author_company_industry}")
+    if author_company_employee_range:
+        author_block.append(f"Company size (employee range): {author_company_employee_range}")
+    elif author_company_employees:
+        author_block.append(f"Company size (employees): {author_company_employees}")
+    if author_company_founded_year:
+        author_block.append(f"Company founded: {author_company_founded_year}")
+    if author_company_specialities:
+        specs = ", ".join(str(x) for x in author_company_specialities[:8] if x)
+        if specs:
+            author_block.append(f"Company specialties: {specs}")
+    if author_company_description:
+        desc = author_company_description[:300]
+        author_block.append(f"Company description: {desc}")
     if not author_block:
         author_block.append("(no enriched data available — infer from post)")
 

@@ -149,6 +149,70 @@ class LinkedInPostDetails:
         )
 
 
+@dataclass(frozen=True)
+class LinkedInCompanyDetails:
+    """Response shape for GET /v1/linkedin/company.
+
+    Provides structured industry classification, employee count, description,
+    and specialties — the fields the Crustdata person endpoint doesn't
+    surface. Used to score author-company fit against operator
+    target_industries without relying on substring-matching the company name.
+
+    Per APIDirect docs: $0.006 per request, 50 free monthly requests."""
+
+    url: str
+    name: str | None
+    company_id: int | None
+    description: str | None
+    industry: str | None
+    website: str | None
+    followers: int
+    employees: int
+    employee_range: str | None
+    founded_year: int | None
+    specialities: list[str]
+    headquarters: dict[str, Any] | None
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> "LinkedInCompanyDetails":
+        def _str(v: Any) -> str | None:
+            return v.strip() if isinstance(v, str) and v.strip() else None
+
+        def _int(v: Any) -> int:
+            if isinstance(v, bool):
+                return 0
+            if isinstance(v, int):
+                return max(0, v)
+            if isinstance(v, float):
+                return max(0, int(v))
+            if isinstance(v, str) and v.strip().isdigit():
+                return int(v.strip())
+            return 0
+
+        cid_raw = raw.get("company_id")
+        cid = cid_raw if isinstance(cid_raw, int) else None
+        fy_raw = raw.get("founded_year")
+        fy = fy_raw if isinstance(fy_raw, int) else None
+        spec = raw.get("specialities") or raw.get("specialties") or []
+        spec_list = [str(s).strip() for s in spec if isinstance(s, str) and s.strip()] if isinstance(spec, list) else []
+        hq = raw.get("headquarters")
+        hq_dict = hq if isinstance(hq, dict) else None
+        return cls(
+            url=_str(raw.get("url")) or "",
+            name=_str(raw.get("name")),
+            company_id=cid,
+            description=_str(raw.get("description")),
+            industry=_str(raw.get("industry")),
+            website=_str(raw.get("website")),
+            followers=_int(raw.get("followers")),
+            employees=_int(raw.get("employees")),
+            employee_range=_str(raw.get("employee_range")),
+            founded_year=fy,
+            specialities=spec_list,
+            headquarters=hq_dict,
+        )
+
+
 def _parse_iso(value: Any) -> datetime | None:
     if not value or not isinstance(value, str):
         return None
@@ -304,6 +368,70 @@ def get_linkedin_post_details(url: str) -> LinkedInPostDetails | None:
         return LinkedInPostDetails.from_api(raw)
     except (KeyError, TypeError) as err:
         log.warning("apidirect post details parse skipped: %s url=%s", err, url[:120])
+        return None
+
+
+def get_linkedin_company_details(url: str) -> LinkedInCompanyDetails | None:
+    """GET /v1/linkedin/company — structured industry, employee count,
+    description, specialties for a LinkedIn company page.
+
+    Returns ``None`` on **any** failure (404, 502 upstream, transport error,
+    invalid JSON, malformed parser input). The caller treats absence as
+    "no extra company context available" and proceeds without it — never
+    blocks the discovery pipeline on company enrichment.
+
+    Raises ``ApiDirectQuotaExhausted`` on 402 so the slate-wide circuit
+    breaker can trip and skip subsequent calls for the rest of the run.
+    Per docs: $0.006/call, 50 free monthly requests."""
+    url = (url or "").strip()
+    if not url:
+        return None
+    if settings.apidirect_mock:
+        return None
+    _check_circuit()
+
+    with _concurrency:
+        try:
+            with _client() as client:
+                resp = client.get("/v1/linkedin/company", params={"url": url[:500]})
+        except httpx.RequestError as err:
+            log.warning("apidirect company transport error: %s url=%s", err, url[:120])
+            return None
+
+    if resp.status_code == 402:
+        _trip_circuit()
+        raise ApiDirectQuotaExhausted(
+            f"apidirect 402 quota exhausted: {resp.text[:300]}"
+        )
+    if resp.status_code == 401:
+        log.warning("apidirect company 401 auth failure url=%s", url[:120])
+        return None
+    if resp.status_code == 429:
+        log.warning("apidirect company 429 rate limit url=%s", url[:120])
+        return None
+    if resp.status_code == 404:
+        log.info("apidirect company 404 (not found) url=%s", url[:120])
+        return None
+    if resp.status_code >= 400:
+        log.warning(
+            "apidirect company %s url=%s body=%s",
+            resp.status_code,
+            url[:120],
+            resp.text[:200],
+        )
+        return None
+
+    try:
+        raw = resp.json()
+    except ValueError:
+        log.warning("apidirect company invalid JSON url=%s", url[:120])
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return LinkedInCompanyDetails.from_api(raw)
+    except (KeyError, TypeError) as err:
+        log.warning("apidirect company parse skipped: %s url=%s", err, url[:120])
         return None
 
 
