@@ -57,3 +57,16 @@ async def _ensure_indexes() -> None:
         unique=True,
     )
     await db.keyword_history.create_index("expires_at", expireAfterSeconds=0)
+    await db.our_comments.create_index(
+        [("comment_id", 1)], unique=True, sparse=True
+    )
+    await db.our_comments.create_index(
+        [("candidate_id", 1), ("parent_comment_id", 1)], unique=True
+    )
+    await db.our_comments.create_index([("operator_id", 1), ("posted_at", -1)])
+    await db.comment_engagement_snapshots.create_index(
+        [("comment_id", 1), ("polled_at", -1)]
+    )
+    await db.parent_post_snapshots.create_index(
+        [("parent_post_url", 1), ("polled_at", -1)]
+    )

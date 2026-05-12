@@ -102,6 +102,23 @@ def verify_candidates(
     #     geos = _operator_geo_terms(operator)
 
     for c in raw:
+        if c.get("can_post_comments") is False:
+            log.info(
+                "│  [DROP/verify] %s  ←  comments_disabled_on_post",
+                (c.get("post_url") or "<no-url>")[:90],
+            )
+            db.candidates.update_one(
+                {"_id": c["_id"]},
+                {
+                    "$set": {
+                        "status": "rejected_url_mismatch",
+                        "drop_reason": "comments_disabled: author disabled comments on post",
+                        "updated_at": utcnow(),
+                    }
+                },
+            )
+            rejected += 1
+            continue
         snippet: str = (c.get("post_text") or "").strip()
         url: str = c.get("post_url") or ""
         min_len = (

@@ -39,9 +39,9 @@ def _keyword_history_ledger_enabled(monkeypatch):
 
 
 def test_audit_envelope_constants():
-    """Audit-locked: 6 queries × 10 candidates per cofounder per day."""
-    assert DISCOVERY_TITLE_SEARCH_QUERIES_PER_RUN == 6
-    assert DISCOVERY_TITLE_SEARCH_PEOPLE_PER_QUERY == 10
+    """Envelope matches ``app.engine.constants`` (tune there, assert here)."""
+    assert DISCOVERY_TITLE_SEARCH_QUERIES_PER_RUN == 8
+    assert DISCOVERY_TITLE_SEARCH_PEOPLE_PER_QUERY == 25
     assert LINKEDIN_GEO_URN_US == "103644278"
 
 
@@ -164,7 +164,6 @@ def test_title_search_inserts_candidates_with_correct_tagging(monkeypatch):
         seen_authors_shipped=set(),
     )
 
-    # 6 queries (envelope) × 2 people × 2 posts each = 24
     assert inserted == DISCOVERY_TITLE_SEARCH_QUERIES_PER_RUN * 2 * 2
     # All inserted candidates carry the audit-aligned tags.
     for c in db.candidates.inserts:

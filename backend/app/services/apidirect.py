@@ -94,6 +94,10 @@ class LinkedInPostDetails:
     published_at: datetime | None
     urn: str | None
     is_repost: bool | None
+    likes: int = 0
+    comments: int = 0
+    shares: int = 0
+    reactions_by_type: dict[str, int] | None = None
 
     @classmethod
     def from_api(cls, raw: dict[str, Any]) -> "LinkedInPostDetails":
@@ -111,6 +115,24 @@ class LinkedInPostDetails:
         url = u.strip() if isinstance(u, str) and u.strip() else ""
         urn_raw = raw.get("urn")
         urn = urn_raw.strip() if isinstance(urn_raw, str) and urn_raw.strip() else None
+        likes = 0
+        comments = 0
+        shares = 0
+        react_map: dict[str, int] | None = None
+        if settings.apidirect_fetch_reaction_breakdown:
+            likes = int(raw.get("likes") or raw.get("num_likes") or 0)
+            comments = int(raw.get("comments") or raw.get("num_comments") or 0)
+            shares = int(raw.get("shares") or raw.get("num_shares") or 0)
+            rb = raw.get("reactions_by_type") or raw.get("reactions")
+            if isinstance(rb, dict):
+                react_map = {}
+                for k, v in rb.items():
+                    if isinstance(v, (int, float)):
+                        react_map[str(k)] = int(v)
+                    elif isinstance(v, str) and v.strip().isdigit():
+                        react_map[str(k)] = int(v.strip())
+                if not react_map:
+                    react_map = None
         return cls(
             url=url,
             text=text,
@@ -120,6 +142,10 @@ class LinkedInPostDetails:
             published_at=_parse_iso(raw.get("date")),
             urn=urn,
             is_repost=is_repost,
+            likes=likes,
+            comments=comments,
+            shares=shares,
+            reactions_by_type=react_map,
         )
 
 

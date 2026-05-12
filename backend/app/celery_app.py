@@ -36,11 +36,10 @@ celery_app.conf.update(
     enable_utc=True,
     task_track_started=True,
     broker_connection_retry_on_startup=True,
-    # Daily run is the longest task — gates can take ~15 min sequentially on
-    # 700+ candidates. With ThreadPool parallelization that drops to ~2 min,
-    # but we keep generous headroom for slow upstream APIs (Azure, Unipile).
-    task_time_limit=1800,
-    task_soft_time_limit=1500,
+    # Default caps for short tasks (dispatch, outbox, poll_replies). Pipeline tasks
+    # override with settings.celery_pipeline_* on the task decorator.
+    task_time_limit=settings.celery_task_time_limit_s,
+    task_soft_time_limit=settings.celery_task_soft_time_limit_s,
     worker_prefetch_multiplier=1,
 )
 
@@ -55,6 +54,10 @@ celery_app.conf.beat_schedule = {
     "poll-replies-every-2h": {
         "task": "engine.poll_replies",
         "schedule": crontab(minute=0, hour="*/2"),
+    },
+    "process-comment-outbox-every-minute": {
+        "task": "engine.process_outbox",
+        "schedule": crontab(minute="*"),
     },
     "dispatch-nightly-runs-every-minute": {
         "task": "engine.dispatch_nightly_runs",
@@ -114,7 +117,11 @@ def dispatch_daily_runs() -> dict:
     return {"dispatched": dispatched}
 
 
-@celery_app.task(name="engine.daily_run")
+@celery_app.task(
+    name="engine.daily_run",
+    soft_time_limit=settings.celery_pipeline_soft_time_limit_s,
+    time_limit=settings.celery_pipeline_time_limit_s,
+)
 def daily_run(operator_id: str) -> dict:
     """
     Run the full discovery → verification → 4 gates → allocator → drafter →
@@ -144,7 +151,23 @@ def poll_replies() -> dict:
         client.close()
 
 
-@celery_app.task(name="engine.nightly_run")
+@celery_app.task(name="engine.process_outbox")
+def process_outbox() -> dict:
+    """Drain queued LinkedIn comments (Unipile write path)."""
+    from app.engine.outbox import process_outbox as drain_outbox
+
+    client, db = _sync_db()
+    try:
+        return drain_outbox(db, batch_size=20)
+    finally:
+        client.close()
+
+
+@celery_app.task(
+    name="engine.nightly_run",
+    soft_time_limit=settings.celery_pipeline_soft_time_limit_s,
+    time_limit=settings.celery_pipeline_time_limit_s,
+)
 def nightly_run(operator_id: str) -> dict:
     """Run the nightly batch for one operator (EOD stage advancement +
     exhaustion ledger + harvester + STALL detection)."""

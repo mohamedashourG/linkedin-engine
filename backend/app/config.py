@@ -1,7 +1,7 @@
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     mongodb_db: str = "linkedin_engine"
 
     redis_url: str = "redis://localhost:6379/0"
+
+    # Celery worker task limits (seconds). Hard limit must exceed soft limit.
+    # Global defaults apply to beat dispatchers, outbox drain, poll_replies, etc.
+    celery_task_soft_time_limit_s: int = Field(default=1500, ge=1)
+    celery_task_time_limit_s: int = Field(default=1800, ge=2)
+    # daily_run / nightly_run can exceed a single discovery+gates cycle; keep higher.
+    celery_pipeline_soft_time_limit_s: int = Field(default=3600, ge=1)
+    celery_pipeline_time_limit_s: int = Field(default=3900, ge=2)
 
     jwt_secret: str = "change-me-in-prod"
     jwt_algorithm: str = "HS256"
@@ -123,11 +131,20 @@ class Settings(BaseSettings):
     # (when the operator has target_geographies set). Disables only the
     # geo gate; the rubric thresholds still apply.
     discovery_unipile_inline_require_geo: bool = True
-    # Cap on /users/{slug} profile fetches per cofounder per run (cache
-    # hits don't count). Protects the LinkedIn account from per-keyword
-    # spike. Reference scripts use 80; we default to 100 to keep ICPs with
-    # bigger keyword pools fully covered.
-    discovery_unipile_max_profile_fetches_per_run: int = 100
+    # Cap on /users/{slug} profile fetches per **slate run** (shared atomically
+    # across Unipile keyword, APIDirect enrich, Exa enrich). Cache hits do not
+    # consume budget.
+    discovery_unipile_max_profile_fetches_per_run: int = 1500
+    # When true, discovery skips authors/posts recently touched (see
+    # exhaustion_ledger.last_seen_discovery_at / last_engaged_at).
+    discovery_exhaustion_ledger_enabled: bool = True
+    # Per-source wall-clock caps (seconds). 0 = unlimited. Stops long keyword
+    # sweeps from starving other discovery sources in the same run.
+    discovery_wall_clock_cap_seconds_unipile_keyword: int = 0
+    discovery_wall_clock_cap_seconds_apidirect: int = 0
+    discovery_wall_clock_cap_seconds_exa: int = 0
+    discovery_wall_clock_cap_seconds_crustdata_inbox: int = 0
+    discovery_wall_clock_cap_seconds_crustdata_screener: int = 0
     # Days a cached profile is reused before refetching.
     discovery_unipile_author_cache_ttl_days: int = 14
     # 14-day no-repeat ledger for keywords (RULE 15) is too aggressive for
@@ -221,9 +238,31 @@ class Settings(BaseSettings):
     # set true in prod only while debugging; false suppresses even in dev.
     crustdata_log_full_webhook_payload: bool = False
 
+    # Comment lifecycle: when user marks a candidate shipped in the UI,
+    # enqueue a LinkedIn comment post via outbox (Celery drain).
+    comment_outbox_on_ship_enabled: bool = True
+    # Max initial comments queued+sent per cofounder per UTC day (LinkedIn safety).
+    cofounder_daily_initial_comment_quota: int = 50
+    # Optional APIDirect: fetch per-emoji reaction breakdown on post details.
+    apidirect_fetch_reaction_breakdown: bool = False
+    # When true, auto-queue reply-backs from reply_drafter (high risk — default off).
+    engine_auto_send_public_reply_back: bool = False
+
     cookie_secure: bool = False
     cookie_samesite: Literal["lax", "strict", "none"] = "lax"
     cookie_domain: str | None = None
+
+    @model_validator(mode="after")
+    def _celery_time_limits_order(self) -> Self:
+        if self.celery_task_time_limit_s <= self.celery_task_soft_time_limit_s:
+            raise ValueError(
+                "celery_task_time_limit_s must be greater than celery_task_soft_time_limit_s"
+            )
+        if self.celery_pipeline_time_limit_s <= self.celery_pipeline_soft_time_limit_s:
+            raise ValueError(
+                "celery_pipeline_time_limit_s must be greater than celery_pipeline_soft_time_limit_s"
+            )
+        return self
 
 
 @lru_cache

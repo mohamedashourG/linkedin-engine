@@ -61,6 +61,8 @@ class UnipileComment:
     author_public_identifier: str | None
     author_profile_url: str | None
     published_at: datetime | None
+    reaction_count: int = 0
+    reply_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,20 @@ class UnipilePost:
     # headline / location / company beyond what the search payload returns.
     # None when the search response omitted the author id entirely.
     author_provider_id: str | None = None
+    reaction_counter: int = 0
+    comment_counter: int = 0
+    repost_counter: int = 0
+    is_repost: bool = False
+    can_post_comments: bool = True
+    has_poll: bool = False
+    poll_total_votes: int = 0
+
+
+@dataclass(frozen=True)
+class UnipileCommentPostResult:
+    comment_id: str
+    posted_at: datetime | None
+    raw: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -241,6 +257,18 @@ def _infer_author_is_company(author: dict[str, Any], profile_url: str | None) ->
     return False
 
 
+def _safe_int(v: Any) -> int:
+    if v is None or isinstance(v, bool):
+        return 0
+    if isinstance(v, int):
+        return max(0, v)
+    if isinstance(v, float):
+        return max(0, int(v))
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
+    return 0
+
+
 def _parse_unipile_post(raw: dict[str, Any]) -> UnipilePost | None:
     """
     Unipile's LinkedIn post payload nests the author under different keys
@@ -276,6 +304,39 @@ def _parse_unipile_post(raw: dict[str, Any]) -> UnipilePost | None:
         or author.get("profile_url")
         or author.get("url")
     )
+    stats = raw.get("social_stats") if isinstance(raw.get("social_stats"), dict) else {}
+    reaction_counter = (
+        _safe_int(raw.get("reaction_counter"))
+        or _safe_int(raw.get("num_reactions"))
+        or _safe_int(raw.get("reactions_count"))
+        or _safe_int(stats.get("reaction_counter"))
+        or _safe_int(stats.get("reactions_count"))
+    )
+    comment_counter = (
+        _safe_int(raw.get("comment_counter"))
+        or _safe_int(raw.get("num_comments"))
+        or _safe_int(raw.get("comments_count"))
+        or _safe_int(stats.get("comment_counter"))
+        or _safe_int(stats.get("comments_count"))
+    )
+    repost_counter = (
+        _safe_int(raw.get("repost_counter"))
+        or _safe_int(raw.get("num_shares"))
+        or _safe_int(raw.get("reposts_count"))
+        or _safe_int(stats.get("repost_counter"))
+        or _safe_int(stats.get("reposts_count"))
+    )
+    ir = raw.get("is_repost")
+    if ir is None:
+        ir = raw.get("reshared")
+    is_repost = bool(ir) if isinstance(ir, (bool, int)) else False
+    perms = raw.get("permissions")
+    can_post_comments = True
+    if isinstance(perms, dict) and "can_post_comments" in perms:
+        can_post_comments = bool(perms.get("can_post_comments"))
+    poll = raw.get("poll")
+    has_poll = isinstance(poll, dict) and bool(poll)
+    poll_total_votes = _safe_int((poll or {}).get("total_votes")) if has_poll else 0
     return UnipilePost(
         id=str(raw.get("id") or raw.get("social_id") or raw.get("urn") or ""),
         url=url or "",
@@ -301,6 +362,13 @@ def _parse_unipile_post(raw: dict[str, Any]) -> UnipilePost | None:
             str(author.get("id") or author.get("provider_id") or author.get("urn") or "").strip()
             or None
         ),
+        reaction_counter=reaction_counter,
+        comment_counter=comment_counter,
+        repost_counter=repost_counter,
+        is_repost=is_repost,
+        can_post_comments=can_post_comments,
+        has_poll=has_poll,
+        poll_total_votes=poll_total_votes,
     )
 
 
@@ -1023,9 +1091,51 @@ def get_post_comments(*, account_id: str, post_url: str) -> list[UnipileComment]
                 author_public_identifier=author.get("public_identifier"),
                 author_profile_url=author.get("public_profile_url"),
                 published_at=_parse_iso(raw.get("date") or raw.get("published_at")),
+                reaction_count=_safe_int(raw.get("reaction_counter") or raw.get("num_reactions")),
+                reply_count=_safe_int(raw.get("reply_counter") or raw.get("num_replies")),
             )
         )
     return out
+
+
+def post_comment(
+    *,
+    account_id: str,
+    post_url: str,
+    text: str,
+    parent_comment_id: str | None = None,
+) -> UnipileCommentPostResult:
+    """POST a top-level or threaded comment on a LinkedIn post via Unipile."""
+    if not account_id:
+        raise UnipileError("post_comment: account_id required")
+    if settings.unipile_mock:
+        now = datetime.now(timezone.utc)
+        return UnipileCommentPostResult(
+            comment_id=f"urn:li:comment:(MOCK:{hash(text) % 10_000_000})",
+            posted_at=now,
+            raw={"mock": True, "text": text[:200]},
+        )
+    post_id = extract_post_id_from_url(post_url)
+    if not post_id:
+        raise UnipileError("post_comment: could not parse post id from URL")
+    body: dict[str, Any] = {"text": text[:8000]}
+    if parent_comment_id:
+        body["comment_id"] = parent_comment_id
+    with _client() as client:
+        resp = _request_with_429_retry(
+            client,
+            "POST",
+            f"/posts/{post_id}/comments",
+            params={"account_id": account_id},
+            json=body,
+        )
+    payload = _check_resp(resp, "post_comment")
+    cid = str(payload.get("id") or payload.get("comment_id") or payload.get("urn") or "")
+    return UnipileCommentPostResult(
+        comment_id=cid,
+        posted_at=_parse_iso(payload.get("date") or payload.get("created_at")),
+        raw=payload,
+    )
 
 
 # ---------------------------------------------------------------- outreach

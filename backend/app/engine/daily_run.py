@@ -18,6 +18,7 @@ import logging
 from datetime import date as date_type, datetime, time, timezone
 from typing import Any
 
+from billiard.exceptions import SoftTimeLimitExceeded
 from bson import ObjectId
 from pymongo.database import Database
 
@@ -237,6 +238,18 @@ def run_for_operator(db: Database, operator_id: ObjectId) -> dict[str, Any]:
 
         _audit(db, operator_id, slate_run_id, "stage_complete", "gates", {**gate_counts, "verified_total": verified_total})
 
+        db.slate_runs.update_one(
+            {"_id": slate_run_id},
+            {"$set": {"total_verified": verified_total}},
+        )
+        gated_n = db.candidates.count_documents(
+            {"slate_run_id": slate_run_id, "status": "gate_passed"}
+        )
+        db.slate_runs.update_one(
+            {"_id": slate_run_id},
+            {"$set": {"total_gated": gated_n}},
+        )
+
         # 4. Allocation
         t = utcnow()
         _set_stage(db, slate_run_id, "allocator", started_at=t, note="picking top survivors per cofounder")
@@ -253,6 +266,16 @@ def run_for_operator(db: Database, operator_id: ObjectId) -> dict[str, Any]:
         drafted_count = _run_drafter(db, slate_run_id=slate_run_id, cofounders=cofounders)
         log.info("│  [drafter]     %d drafted, validators all pass  (%.1fs)", drafted_count, (utcnow() - t).total_seconds())
         _audit(db, operator_id, slate_run_id, "stage_complete", "drafter", {"drafted": drafted_count})
+        drafted_in_pipeline = db.candidates.count_documents(
+            {
+                "slate_run_id": slate_run_id,
+                "status": {"$in": ["drafted", "slated", "shipped", "dropped_by_user"]},
+            }
+        )
+        db.slate_runs.update_one(
+            {"_id": slate_run_id},
+            {"$set": {"total_drafted": drafted_in_pipeline}},
+        )
 
         # 6. RULE 23 (optional bypass: settings.skip_rule_23 / SKIP_RULE_23)
         t = utcnow()
@@ -313,6 +336,34 @@ def run_for_operator(db: Database, operator_id: ObjectId) -> dict[str, Any]:
             "layer": err.layer,
             "details": err.details,
         }
+    except SoftTimeLimitExceeded:
+        log.warning(
+            "└── daily_run Celery soft time limit  operator=%s  slate=%s",
+            operator_id,
+            slate_run_id,
+        )
+        _set_stage(db, slate_run_id, "aborted", note="celery_soft_time_limit")
+        _audit(
+            db,
+            operator_id,
+            slate_run_id,
+            "stage_error",
+            "pipeline",
+            {"error": "SoftTimeLimitExceeded", "kind": "celery_soft_time_limit"},
+            severity="error",
+        )
+        db.slate_runs.update_one(
+            {"_id": slate_run_id},
+            {
+                "$set": {
+                    "status": "force_aborted",
+                    "force_abort_reason": "celery_soft_time_limit",
+                    "current_stage": "aborted",
+                    "updated_at": utcnow(),
+                }
+            },
+        )
+        raise
     except Exception as err:
         log.exception("└── daily_run unexpected failure")
         _audit(db, operator_id, slate_run_id, "stage_error", "pipeline", {"error": str(err)}, severity="error")
@@ -335,7 +386,9 @@ def _open_slate_run(db: Database, operator_id: ObjectId) -> ObjectId:
         "total_gated": 0,
         "total_drafted": 0,
         "total_slated": 0,
+        "fetch_budget_remaining": settings.discovery_unipile_max_profile_fetches_per_run,
         "per_cofounder_counts": {},
+        "per_source_counts": {},
         "rule_23_validations": [],
         "hmac_token": None,
         "email_sent": False,

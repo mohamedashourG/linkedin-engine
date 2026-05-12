@@ -48,6 +48,14 @@ export default function AnalyticsPage() {
     queryKey: ["analytics-by-score", range],
     queryFn: () => analyticsApi.byScore(range),
   });
+  const commentSummaryQ = useQuery({
+    queryKey: ["analytics-comment-summary", range],
+    queryFn: () => analyticsApi.operatorCommentSummary(range),
+  });
+  const ourCommentsQ = useQuery({
+    queryKey: ["analytics-our-comments", range],
+    queryFn: () => analyticsApi.comments(range),
+  });
 
   const byTypeRows = (byTypeQ.data?.rows ?? []).map((r) => ({
     label: TYPE_LABELS[r.type] ?? r.type,
@@ -70,6 +78,78 @@ export default function AnalyticsPage() {
       </div>
 
       <GateFunnel />
+
+      <div className="grid gap-4 md:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Outbound comments</CardTitle>
+            <CardDescription>
+              Queued/sent via outbox + replies detected, last {range}. LinkedIn does
+              not expose impression counts on third-party comments.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2 text-sm">
+            {!commentSummaryQ.data ? (
+              <Loader />
+            ) : (
+              <ul className="space-y-1 text-muted-foreground">
+                <li>
+                  Sent (tracked):{" "}
+                  <span className="font-medium text-foreground">
+                    {commentSummaryQ.data.comments_sent}
+                  </span>
+                </li>
+                <li>
+                  Replies detected:{" "}
+                  <span className="font-medium text-foreground">
+                    {commentSummaryQ.data.replies_detected}
+                  </span>
+                </li>
+                <li>
+                  Avg reactions / comment:{" "}
+                  <span className="font-medium text-foreground">
+                    {commentSummaryQ.data.avg_reactions}
+                  </span>
+                </li>
+              </ul>
+            )}
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Recent comment queue</CardTitle>
+            <CardDescription>Latest rows from our_comments ledger.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {!ourCommentsQ.data ? (
+              <Loader />
+            ) : ourCommentsQ.data.items.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No queued or sent comments yet.</p>
+            ) : (
+              <div className="max-h-64 overflow-auto text-xs">
+                <table className="w-full border-collapse">
+                  <thead>
+                    <tr className="text-left text-muted-foreground border-b">
+                      <th className="py-1 pr-2">Status</th>
+                      <th className="py-1 pr-2">Rx</th>
+                      <th className="py-1">Preview</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ourCommentsQ.data.items.map((row) => (
+                      <tr key={row.id} className="border-b border-border/60">
+                        <td className="py-1 pr-2 whitespace-nowrap">{row.status}</td>
+                        <td className="py-1 pr-2">{row.latest_reaction_count}</td>
+                        <td className="py-1 line-clamp-2">{row.text}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
 
       <Card>
         <CardHeader>

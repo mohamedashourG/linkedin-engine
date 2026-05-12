@@ -78,6 +78,30 @@ export type GateFunnelScope =
   | { kind: "run"; slateRunId?: string } // omit slateRunId = latest run
   | { kind: "aggregate"; range: Range };
 
+export type OurCommentRow = {
+  id: string;
+  comment_id: string | null;
+  parent_post_url: string;
+  status: string;
+  text: string;
+  posted_at: string | null;
+  latest_reaction_count: number;
+  latest_reply_count: number;
+  candidate_id: string;
+};
+
+export type CommentsListResponse = {
+  range: Range;
+  items: OurCommentRow[];
+};
+
+export type OperatorCommentSummary = {
+  range: Range;
+  comments_sent: number;
+  replies_detected: number;
+  avg_reactions: number;
+};
+
 export const analyticsApi = {
   overview: (range: Range = "30d") =>
     api.get<Overview>(`/api/analytics/overview?range=${range}`),
@@ -100,4 +124,10 @@ export const analyticsApi = {
       qs ? `/api/analytics/gate-funnel?${qs}` : `/api/analytics/gate-funnel`,
     );
   },
+  comments: (range: Range = "30d") =>
+    api.get<CommentsListResponse>(`/api/analytics/comments?range=${range}`),
+  operatorCommentSummary: (range: Range = "30d") =>
+    api.get<OperatorCommentSummary>(
+      `/api/analytics/operator-summary?range=${range}`,
+    ),
 };

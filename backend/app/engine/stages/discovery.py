@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import random
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -366,18 +367,132 @@ def _rotate(values: list[str], n: int) -> list[str]:
     return pool[: max(0, n)]
 
 
-def _is_exhausted(db: Database, operator_id: ObjectId, author_url: str) -> bool:
-    # DEMO OVERRIDE: exhaustion ledger check disabled so previously-engaged
-    # authors resurface as candidates. RESTORE BY REMOVING this early return.
+def _is_exhausted(db: Database, operator_id: ObjectId, url: str) -> bool:
+    """True when this URL (author profile or canonical post URL) was touched
+    recently in the exhaustion ledger (discovery insert or nightly shipped)."""
+    if not settings.discovery_exhaustion_ledger_enabled:
+        return False
+    if not url:
+        return False
+    coll = getattr(db, "exhaustion_ledger", None)
+    if coll is None:
+        return False
+    cutoff = utcnow() - timedelta(days=EXHAUSTION_LOOKBACK_DAYS)
+    doc = coll.find_one({"operator_id": operator_id, "linkedin_url": url})
+    if not doc:
+        return False
+    for key in ("last_seen_discovery_at", "last_engaged_at"):
+        ts = doc.get(key)
+        if ts is not None and ts >= cutoff:
+            return True
     return False
-    # Original:
-    # if not author_url:
-    #     return False
-    # cutoff = utcnow() - timedelta(days=EXHAUSTION_LOOKBACK_DAYS)
-    # doc = db.exhaustion_ledger.find_one(
-    #     {"operator_id": operator_id, "linkedin_url": author_url}
-    # )
-    # return bool(doc and doc.get("last_engaged_at") and doc["last_engaged_at"] >= cutoff)
+
+
+def _sanitize_per_source_key(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_]+", "_", (s or "unknown").strip())[:64] or "unknown"
+
+
+def _discovery_record_insert(db: Database, doc: dict[str, Any]) -> None:
+    """Increment slate run discovery counters + touch exhaustion ledger."""
+    slate_run_id = doc.get("slate_run_id")
+    operator_id = doc.get("operator_id")
+    if slate_run_id is None or operator_id is None:
+        return
+    slate_runs = getattr(db, "slate_runs", None)
+    if slate_runs is not None:
+        inc: dict[str, Any] = {"total_discovered": 1}
+        src = doc.get("source")
+        if src:
+            inc[f"per_source_counts.src_{_sanitize_per_source_key(str(src))}"] = 1
+        ch = doc.get("source_channel")
+        if ch:
+            inc[f"per_source_counts.ch_{_sanitize_per_source_key(str(ch))}"] = 1
+        slate_runs.update_one({"_id": slate_run_id}, {"$inc": inc})
+    if not settings.discovery_exhaustion_ledger_enabled:
+        return
+    now = utcnow()
+    expires = now + timedelta(days=EXHAUSTION_LOOKBACK_DAYS)
+    urls: list[str] = []
+    au = doc.get("author_linkedin_url")
+    if isinstance(au, str) and au.strip():
+        urls.append(au.strip())
+    pu = doc.get("post_url")
+    if isinstance(pu, str) and pu.strip():
+        urls.append(_canonical_post_url(pu))
+    ledger = getattr(db, "exhaustion_ledger", None)
+    if ledger is None:
+        return
+    for u in urls:
+        if not u:
+            continue
+        ledger.update_one(
+            {"operator_id": operator_id, "linkedin_url": u},
+            {
+                "$set": {
+                    "last_seen_discovery_at": now,
+                    "expires_at": expires,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {
+                    "operator_id": operator_id,
+                    "linkedin_url": u,
+                    "engagement_count": 0,
+                    "created_at": now,
+                },
+            },
+            upsert=True,
+        )
+
+
+def _ensure_slate_profile_fetch_budget(db: Database, slate_run_id: ObjectId) -> None:
+    """Backfill fetch_budget_remaining for slate docs created before the field existed."""
+    sr = getattr(db, "slate_runs", None)
+    if sr is None:
+        return
+    cap = settings.discovery_unipile_max_profile_fetches_per_run
+    sr.update_one(
+        {"_id": slate_run_id, "fetch_budget_remaining": {"$exists": False}},
+        {"$set": {"fetch_budget_remaining": cap}},
+    )
+
+
+def _try_consume_profile_fetch_budget(
+    db: Database, slate_run_id: ObjectId | None,
+) -> bool:
+    """Atomically consume one profile-fetch slot for this slate run. No-op True when
+    slate_run_id is None (tests). Returns False when budget is exhausted."""
+    if slate_run_id is None:
+        return True
+    sr = getattr(db, "slate_runs", None)
+    if sr is None:
+        return True
+    _ensure_slate_profile_fetch_budget(db, slate_run_id)
+    res = sr.find_one_and_update(
+        {"_id": slate_run_id, "fetch_budget_remaining": {"$gt": 0}},
+        {"$inc": {"fetch_budget_remaining": -1}},
+    )
+    return res is not None
+
+
+def _profile_fetch_budget_remaining(
+    db: Database, slate_run_id: ObjectId | None,
+) -> int | None:
+    if slate_run_id is None:
+        return None
+    sr = getattr(db, "slate_runs", None)
+    if sr is None:
+        return None
+    _ensure_slate_profile_fetch_budget(db, slate_run_id)
+    doc = sr.find_one({"_id": slate_run_id}, {"fetch_budget_remaining": 1})
+    if not doc:
+        return None
+    return int(doc.get("fetch_budget_remaining") or 0)
+
+
+def _discovery_wall_clock_exceeded(t0: float, max_seconds: int) -> bool:
+    if max_seconds <= 0:
+        return False
+    return (time.monotonic() - t0) >= float(max_seconds)
 
 
 def _seen_post_urls(db: Database, operator_id: ObjectId) -> set[str]:
@@ -491,14 +606,14 @@ def _doc_from_unipile(
     source_classification: str,
     source_channel: str = "",
     enriched_profile: dict[str, Any] | None = None,
-    inline_rubric: dict[str, Any] | None = None,
+    unipile_rubric: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a candidate doc from a Unipile search post.
 
     When ``enriched_profile`` is supplied (output of ``_get_cached_author_profile``),
     its headline / company / location override what the search payload returned —
     those fields are much more reliable from the `/users/{slug}` endpoint than
-    from the search snippet. ``inline_rubric`` carries the author/post scores
+    from the search snippet. ``unipile_rubric`` carries the author/post scores
     that qualified the candidate so downstream stages (and the UI) can show
     the reasoning.
 
@@ -527,8 +642,18 @@ def _doc_from_unipile(
         loc = ep.get("location") or ""
         if loc:
             doc["author_location"] = loc
-    if inline_rubric:
-        doc["unipile_rubric"] = inline_rubric
+    if getattr(post, "reaction_counter", None) is not None:
+        doc["reaction_counter"] = int(post.reaction_counter or 0)
+    if getattr(post, "comment_counter", None) is not None:
+        doc["comment_counter"] = int(post.comment_counter or 0)
+    if getattr(post, "repost_counter", None) is not None:
+        doc["repost_counter"] = int(post.repost_counter or 0)
+    if getattr(post, "is_repost", None) is not None:
+        doc["is_repost"] = bool(post.is_repost)
+    if getattr(post, "can_post_comments", None) is not None:
+        doc["can_post_comments"] = bool(post.can_post_comments)
+    if unipile_rubric:
+        doc["unipile_rubric"] = unipile_rubric
     return doc
 
 
@@ -843,6 +968,7 @@ def _get_cached_unipile_author_profile_by_slug(
     slug: str,
     account_id: str,
     ttl_days: int,
+    slate_run_id: ObjectId | None = None,
 ) -> tuple[dict[str, Any] | None, bool]:
     """Slug-keyed variant for vendors that give us a LinkedIn post URL but
     no provider_id (APIDirect, Exa).
@@ -870,6 +996,11 @@ def _get_cached_unipile_author_profile_by_slug(
     )
     if cached:
         return cached, False
+
+    if slate_run_id is not None and not _try_consume_profile_fetch_budget(
+        db, slate_run_id
+    ):
+        return None, False
 
     try:
         raw = unipile_resolve_profile(account_id=account_id, public_identifier_or_url=slug)
@@ -913,6 +1044,7 @@ def _get_cached_unipile_author_profile(
     provider_id: str,
     account_id: str,
     ttl_days: int,
+    slate_run_id: ObjectId | None = None,
 ) -> tuple[dict[str, Any] | None, bool]:
     """Return ``(profile, was_fetched)`` for the given provider_id, using
     ``unipile_author_cache`` keyed by ``(operator_id, provider_id)``.
@@ -942,6 +1074,11 @@ def _get_cached_unipile_author_profile(
     )
     if cached:
         return cached, False
+
+    if slate_run_id is not None and not _try_consume_profile_fetch_budget(
+        db, slate_run_id
+    ):
+        return None, False
 
     try:
         raw = unipile_resolve_profile(
@@ -1232,7 +1369,16 @@ def _drain_crustdata_inbox(
     skipped_dup = 0
     skipped_author = 0
     skipped_exhausted = 0
+    t_inbox = time.monotonic()
     for row in cursor:
+        if _discovery_wall_clock_exceeded(
+            t_inbox, settings.discovery_wall_clock_cap_seconds_crustdata_inbox
+        ):
+            log.info(
+                "discovery: crustdata_inbox wall-clock cap (%ds) — stopping drain",
+                settings.discovery_wall_clock_cap_seconds_crustdata_inbox,
+            )
+            break
         scanned += 1
         post_url = row.get("post_url") or ""
         if not post_url or post_url in seen_urls:
@@ -1258,14 +1404,14 @@ def _drain_crustdata_inbox(
             )
             continue
         seen_urls.add(post_url)
-        db.candidates.insert_one(
-            _doc_from_inbox(
-                row,
-                operator_id=operator_id,
-                cofounder_id=cofounder_id,
-                slate_run_id=slate_run_id,
-            )
+        inbox_doc = _doc_from_inbox(
+            row,
+            operator_id=operator_id,
+            cofounder_id=cofounder_id,
+            slate_run_id=slate_run_id,
         )
+        db.candidates.insert_one(inbox_doc)
+        _discovery_record_insert(db, inbox_doc)
         db.crustdata_inbox.update_one(
             {"_id": row["_id"]},
             {"$set": {"consumed": True, "consumed_at": utcnow(), "consumed_reason": "inserted"}},
@@ -1324,7 +1470,16 @@ def _run_crustdata_screener(
     limit_kw = max(1, min(int(settings.discovery_crustdata_screener_limit_per_keyword), 50))
     date_posted = settings.discovery_crustdata_screener_date_posted.strip() or "past-month"
     inserted = 0
+    t_scr = time.monotonic()
     for query, classification in plan:
+        if _discovery_wall_clock_exceeded(
+            t_scr, settings.discovery_wall_clock_cap_seconds_crustdata_screener
+        ):
+            log.info(
+                "discovery: crustdata_screener wall-clock cap (%ds) — stopping",
+                settings.discovery_wall_clock_cap_seconds_crustdata_screener,
+            )
+            break
         # Crustdata's screener takes a keyword string + a separate AUTHOR_LOCATION
         # filter in the request body. Suffixing geo/seniority into the keyword
         # text duplicates the geo filter and collapses recall on Crustdata's
@@ -1369,16 +1524,16 @@ def _run_crustdata_screener(
             if _is_exhausted(db, operator_id, author_url or post_url):
                 continue
             seen_urls.add(post_url)
-            db.candidates.insert_one(
-                _doc_from_crustdata_screener(
-                    raw,
-                    operator_id=operator_id,
-                    cofounder_id=cofounder_id,
-                    slate_run_id=slate_run_id,
-                    source_keyword=query,
-                    source_classification=classification,
-                )
+            cd_doc = _doc_from_crustdata_screener(
+                raw,
+                operator_id=operator_id,
+                cofounder_id=cofounder_id,
+                slate_run_id=slate_run_id,
+                source_keyword=query,
+                source_classification=classification,
             )
+            db.candidates.insert_one(cd_doc)
+            _discovery_record_insert(db, cd_doc)
             inserted += 1
     log.info(
         "discovery: crustdata_screener cofounder=%s inserted=%d keyword_calls=%d",
@@ -1483,6 +1638,7 @@ def discover_for_operator(
     not POST Crustdata simulation watches repeatedly in one slate run.
     """
     operator_id: ObjectId = operator["_id"]
+    _ensure_slate_profile_fetch_budget(db, slate_run_id)
     extracted = operator.get("product_extracted") or {}
     keywords = (extracted.get("suggested_keywords") or {}) if extracted else {}
     tier_1 = keywords.get("tier_1") or []
@@ -1804,39 +1960,25 @@ def _enrich_via_unipile_slug(
     post_url: str,
     account_id: str | None,
     ttl_days: int,
-    fetched_so_far: int,
-    cap: int,
-) -> tuple[dict[str, Any] | None, int]:
-    """Shared helper: extract author slug from a LinkedIn post URL and look
-    up the author's profile via Unipile (cached). Used for APIDirect / Exa
-    candidates that don't carry inline location.
-
-    Returns (profile_or_None, new_fetched_count). Returns (None, fetched_so_far)
-    when the account is unavailable, the slug can't be extracted, or the cap
-    has been reached.
-    """
+    slate_run_id: ObjectId | None = None,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Extract author slug from post URL → Unipile profile (cached). Profile
+    fetch budget is enforced atomically on the slate run when ``slate_run_id``
+    is set."""
     if not account_id or not post_url:
-        return None, fetched_so_far
+        return None, False
     slug = _extract_author_slug_from_post_url(post_url)
     if not slug:
-        return None, fetched_so_far
-    if fetched_so_far >= cap:
-        # Try cache-only — if cached we won't burn the budget; if not we skip.
-        cached = db.unipile_author_cache.find_one(
-            {"operator_id": operator_id, "public_identifier": slug,
-             "fetched_at": {"$gte": utcnow() - timedelta(days=max(1, ttl_days))}}
-        )
-        return (cached, fetched_so_far) if cached else (None, fetched_so_far)
+        return None, False
     profile, was_fetched = _get_cached_unipile_author_profile_by_slug(
         db,
         operator_id=operator_id,
         slug=slug,
         account_id=account_id,
         ttl_days=ttl_days,
+        slate_run_id=slate_run_id,
     )
-    if was_fetched:
-        fetched_so_far += 1
-    return profile, fetched_so_far
+    return profile, was_fetched
 
 
 def _run_apidirect(
@@ -1882,12 +2024,20 @@ def _run_apidirect(
     enrich_on = bool(
         account_id and settings.discovery_unipile_inline_rubric_enabled
     )
-    enrich_cap = settings.discovery_unipile_max_profile_fetches_per_run
     cache_ttl = settings.discovery_unipile_author_cache_ttl_days
-    fetched_for_enrich = 0
+    enriched_fetch_count = 0
+    t_ap = time.monotonic()
 
     inserted = 0
     for query, classification in plan:
+        if _discovery_wall_clock_exceeded(
+            t_ap, settings.discovery_wall_clock_cap_seconds_apidirect
+        ):
+            log.info(
+                "│  [apidirect]   wall-clock cap (%ds) — stopping",
+                settings.discovery_wall_clock_cap_seconds_apidirect,
+            )
+            break
         # APIDirect's /v1/linkedin/posts is a strict text-match index — same
         # recall-collapse pattern as Unipile classic. We drop the geo +
         # seniority suffix here too; the LLM ICP gate enforces ICP author
@@ -1925,15 +2075,16 @@ def _run_apidirect(
             # headline so the LLM ICP gate doesn't have to infer from post text.
             enriched_profile: dict[str, Any] | None = None
             if enrich_on:
-                enriched_profile, fetched_for_enrich = _enrich_via_unipile_slug(
+                enriched_profile, wf = _enrich_via_unipile_slug(
                     db,
                     operator_id=operator_id,
                     post_url=post.url,
                     account_id=account_id,
                     ttl_days=cache_ttl,
-                    fetched_so_far=fetched_for_enrich,
-                    cap=enrich_cap,
+                    slate_run_id=slate_run_id,
                 )
+                if wf:
+                    enriched_fetch_count += 1
 
             # Drop posts positively identified as company-authored (LinkedIn
             # /company/ pages, brand-shaped slugs with no human signal, or
@@ -1979,6 +2130,7 @@ def _run_apidirect(
                         )
                         try:
                             db.candidates.insert_one(rejected)
+                            _discovery_record_insert(db, rejected)
                         except Exception as err:
                             log.warning(
                                 "│  [apidirect] persist rejected_inline failed: %s", err
@@ -1987,23 +2139,24 @@ def _run_apidirect(
                         continue
 
             seen_urls.add(post.url)
-            db.candidates.insert_one(
-                _doc_from_apidirect(
-                    post,
-                    operator_id=operator_id,
-                    cofounder_id=cofounder_id,
-                    slate_run_id=slate_run_id,
-                    source_keyword=query,
-                    source_classification=classification,
-                    details=details,
-                    enriched_profile=enriched_profile,
-                )
+            ap_doc = _doc_from_apidirect(
+                post,
+                operator_id=operator_id,
+                cofounder_id=cofounder_id,
+                slate_run_id=slate_run_id,
+                source_keyword=query,
+                source_classification=classification,
+                details=details,
+                enriched_profile=enriched_profile,
             )
+            db.candidates.insert_one(ap_doc)
+            _discovery_record_insert(db, ap_doc)
             inserted += 1
     if enrich_on:
         log.info(
-            "│  [apidirect-enrich] profile fetches=%d (cap=%d) cache_ttl=%dd",
-            fetched_for_enrich, enrich_cap, cache_ttl,
+            "│  [apidirect-enrich] profile fetches=%d cache_ttl=%dd",
+            enriched_fetch_count,
+            cache_ttl,
         )
     return inserted
 
@@ -2057,12 +2210,20 @@ def _run_exa(
     enrich_on = bool(
         account_id and settings.discovery_unipile_inline_rubric_enabled
     )
-    enrich_cap = settings.discovery_unipile_max_profile_fetches_per_run
     cache_ttl = settings.discovery_unipile_author_cache_ttl_days
-    fetched_for_enrich = 0
+    enriched_fetch_count = 0
+    t_ex = time.monotonic()
 
     inserted = 0
     for query, classification in plan:
+        if _discovery_wall_clock_exceeded(
+            t_ex, settings.discovery_wall_clock_cap_seconds_exa
+        ):
+            log.info(
+                "│  [exa]         wall-clock cap (%ds) — stopping",
+                settings.discovery_wall_clock_cap_seconds_exa,
+            )
+            break
         # Exa is a neural/semantic search — adding geo + seniority terms to
         # the query string doesn't help (the embedding handles geography as
         # a separate concept) and tends to skew results toward government /
@@ -2094,15 +2255,16 @@ def _run_exa(
             # /users/{slug} → author_location for the LLM ICP gate.
             enriched_profile: dict[str, Any] | None = None
             if enrich_on:
-                enriched_profile, fetched_for_enrich = _enrich_via_unipile_slug(
+                enriched_profile, wf = _enrich_via_unipile_slug(
                     db,
                     operator_id=operator_id,
                     post_url=post.url,
                     account_id=account_id,
                     ttl_days=cache_ttl,
-                    fetched_so_far=fetched_for_enrich,
-                    cap=enrich_cap,
+                    slate_run_id=slate_run_id,
                 )
+                if wf:
+                    enriched_fetch_count += 1
 
             # Drop only posts positively identified as company-authored.
             # Keep human posts even with thin author metadata — post-relevance
@@ -2134,22 +2296,23 @@ def _run_exa(
                     enriched_profile["_location_source"] = "exa_default"
 
             seen_urls.add(post.url)
-            db.candidates.insert_one(
-                _doc_from_exa(
-                    post,
-                    operator_id=operator_id,
-                    cofounder_id=cofounder_id,
-                    slate_run_id=slate_run_id,
-                    source_keyword=query,
-                    source_classification=classification,
-                    enriched_profile=enriched_profile,
-                )
+            exa_doc = _doc_from_exa(
+                post,
+                operator_id=operator_id,
+                cofounder_id=cofounder_id,
+                slate_run_id=slate_run_id,
+                source_keyword=query,
+                source_classification=classification,
+                enriched_profile=enriched_profile,
             )
+            db.candidates.insert_one(exa_doc)
+            _discovery_record_insert(db, exa_doc)
             inserted += 1
     if enrich_on:
         log.info(
-            "│  [exa-enrich] profile fetches=%d (cap=%d) cache_ttl=%dd",
-            fetched_for_enrich, enrich_cap, cache_ttl,
+            "│  [exa-enrich] profile fetches=%d cache_ttl=%dd",
+            enriched_fetch_count,
+            cache_ttl,
         )
     return inserted
 
@@ -2237,14 +2400,21 @@ def _run_unipile(
     # Geo for keyword candidates is enforced by the inline rubric (post-fetch
     # author location match against operator.target_geographies).
     inserted = 0
-    # Cap on `/users/{slug}` profile fetches per cofounder run — protects
-    # the LinkedIn account from a quota spike on a high-yield keyword pass.
-    fetch_budget_remaining = settings.discovery_unipile_max_profile_fetches_per_run
+    # Profile fetches share an atomic per-slate budget (``slate_runs.fetch_budget_remaining``).
     cache_ttl = settings.discovery_unipile_author_cache_ttl_days
     use_inline_rubric = settings.discovery_unipile_inline_rubric_enabled
     rubric_drops = {"no_profile": 0, "geo": 0, "rubric": 0}
+    t_kw = time.monotonic()
     for kind, payload, source, classification in plan:
         assert kind == "kw"
+        if _discovery_wall_clock_exceeded(
+            t_kw, settings.discovery_wall_clock_cap_seconds_unipile_keyword
+        ):
+            log.info(
+                "│  [unipile-kw]  wall-clock cap (%ds) — stopping keyword source",
+                settings.discovery_wall_clock_cap_seconds_unipile_keyword,
+            )
+            break
         # KEY FIX: LinkedIn's classic post keyword search is strict text-match.
         # When `location_ids` is set, the engine already enforces geo
         # IMPORTANT empirical finding (confirmed in standalone Unipile script
@@ -2328,23 +2498,22 @@ def _run_unipile(
                 continue
 
             enriched_profile: dict[str, Any] | None = None
-            inline_rubric: dict[str, Any] | None = None
+            rubric_snapshot: dict[str, Any] | None = None
 
             if use_inline_rubric:
                 # Step 1: enrich author via cached /users/{slug} (free Unipile
-                # endpoint). Cache hits don't count against the per-run fetch
-                # budget; misses do.
+                # endpoint). Cache hits don't count against the slate fetch budget;
+                # misses consume one slot atomically on ``slate_runs``.
                 provider_id = post.author_provider_id or ""
                 if provider_id:
-                    cached_or_fresh, was_fetched = _get_cached_unipile_author_profile(
+                    cached_or_fresh, _was_fetched = _get_cached_unipile_author_profile(
                         db,
                         operator_id=operator_id,
                         provider_id=provider_id,
                         account_id=account_id,
                         ttl_days=cache_ttl,
+                        slate_run_id=slate_run_id,
                     )
-                    if was_fetched:
-                        fetch_budget_remaining -= 1
                     enriched_profile = cached_or_fresh
                 # Step 2: score author + post against the operator's ICP fields.
                 author_score = _score_unipile_author_against_operator(
@@ -2360,7 +2529,7 @@ def _run_unipile(
                     post_relevance=post_score,
                     operator=operator,
                 )
-                inline_rubric = {
+                rubric_snapshot = {
                     "author": author_score,
                     "post_relevance": post_score,
                     "post_matches": post_matches[:8],
@@ -2408,17 +2577,13 @@ def _run_unipile(
                         source_classification=classification,
                         source_channel=post_source_channel,
                         enriched_profile=enriched_profile,
-                        inline_rubric={
-                            "author": author_score,
-                            "post_relevance": post_score,
-                            "post_matches": post_matches[:8],
-                            "paths": paths,
-                        },
+                        unipile_rubric=rubric_snapshot,
                     )
                     rejected_doc["status"] = "rejected_inline"
                     rejected_doc["drop_reason"] = f"{reason_key}: {reason}"
                     try:
                         db.candidates.insert_one(rejected_doc)
+                        _discovery_record_insert(db, rejected_doc)
                     except Exception as err:
                         log.warning(
                             "│  [unipile] persist rejected_inline failed: %s", err
@@ -2426,33 +2591,30 @@ def _run_unipile(
                     if post.url:
                         seen_urls.add(post.url)
                     continue
-                if fetch_budget_remaining <= 0 and use_inline_rubric:
+                rem = _profile_fetch_budget_remaining(db, slate_run_id)
+                if rem is not None and rem <= 0 and use_inline_rubric:
                     log.info(
                         "│  [unipile]     profile-fetch budget exhausted "
-                        "(%d/run); remaining posts use search-payload data only",
+                        "(%d/slate); remaining posts use search-payload data only",
                         settings.discovery_unipile_max_profile_fetches_per_run,
                     )
-                    # Don't stop the loop — just stop enriching. Subsequent
-                    # posts will fall through to the search-payload path
-                    # below (author score will be 0 for title/industry, geo
-                    # may still match if search included location info).
                     use_inline_rubric = False
 
             seen_urls.add(post.url)
-            db.candidates.insert_one(
-                _doc_from_unipile(
-                    post,
-                    operator_id=operator_id,
-                    cofounder_id=cofounder_id,
-                    slate_run_id=slate_run_id,
-                    source=source,
-                    source_keyword=payload,
-                    source_classification=classification,
-                    source_channel=post_source_channel,
-                    enriched_profile=enriched_profile,
-                    inline_rubric=inline_rubric,
-                )
+            raw_doc = _doc_from_unipile(
+                post,
+                operator_id=operator_id,
+                cofounder_id=cofounder_id,
+                slate_run_id=slate_run_id,
+                source=source,
+                source_keyword=payload,
+                source_classification=classification,
+                source_channel=post_source_channel,
+                enriched_profile=enriched_profile,
+                unipile_rubric=rubric_snapshot,
             )
+            db.candidates.insert_one(raw_doc)
+            _discovery_record_insert(db, raw_doc)
             inserted += 1
 
     if settings.discovery_unipile_inline_rubric_enabled:
@@ -2519,7 +2681,16 @@ def _run_unipile_title_search(
         )
 
     inserted = 0
+    t_ts = time.monotonic()
     for query in plan:
+        if _discovery_wall_clock_exceeded(
+            t_ts, settings.discovery_wall_clock_cap_seconds_unipile_keyword
+        ):
+            log.info(
+                "│  [unipile-people] wall-clock cap (%ds) — stopping title_search",
+                settings.discovery_wall_clock_cap_seconds_unipile_keyword,
+            )
+            break
         # Unipile people search enforces US (or UNIPILE_RULE24_LOCATION_IDS) via
         # geoUrn server-side. Appending geo terms to the literal-text query
         # kills recall; keep seniority hints (they meaningfully bias toward
@@ -2609,6 +2780,7 @@ def _run_unipile_title_search(
                 if industry_ids:
                     doc["industry_verified_at_source"] = True
                 db.candidates.insert_one(doc)
+                _discovery_record_insert(db, doc)
                 inserted += 1
 
     log.info(
@@ -2749,24 +2921,24 @@ def _run_contact_seeds(
                     post_uid = details.urn if details and details.urn else None
 
                     seen_urls.add(post.url)
-                    db.candidates.insert_one(
-                        _candidate_doc(
-                            operator_id=operator_id,
-                            cofounder_id=cofounder_id,
-                            slate_run_id=slate_run_id,
-                            post_url=post.url,
-                            post_id=post_uid,
-                            author_name=author_nm,
-                            author_title=title or None,
-                            author_company=company or None,
-                            author_linkedin_url=author_u,
-                            post_text=body or (post.snippet or post.title or ""),
-                            post_published_at=pub_at,
-                            source="contact_seed",
-                            source_keyword=query,
-                            source_classification="A",
-                        )
+                    cs_doc = _candidate_doc(
+                        operator_id=operator_id,
+                        cofounder_id=cofounder_id,
+                        slate_run_id=slate_run_id,
+                        post_url=post.url,
+                        post_id=post_uid,
+                        author_name=author_nm,
+                        author_title=title or None,
+                        author_company=company or None,
+                        author_linkedin_url=author_u,
+                        post_text=body or (post.snippet or post.title or ""),
+                        post_published_at=pub_at,
+                        source="contact_seed",
+                        source_keyword=query,
+                        source_classification="A",
                     )
+                    db.candidates.insert_one(cs_doc)
+                    _discovery_record_insert(db, cs_doc)
                     inserted += 1
 
         # ── Exa search ────────────────────────────────────────────────────
@@ -2794,24 +2966,24 @@ def _run_contact_seeds(
                     body = _contact_seed_post_text(
                         post, name=name, title=title, company=company
                     )
-                    db.candidates.insert_one(
-                        _candidate_doc(
-                            operator_id=operator_id,
-                            cofounder_id=cofounder_id,
-                            slate_run_id=slate_run_id,
-                            post_url=post.url,
-                            post_id=None,
-                            author_name=post.author or name,
-                            author_title=title or None,
-                            author_company=company or None,
-                            author_linkedin_url=author_url,
-                            post_text=body or (post.snippet or post.title or ""),
-                            post_published_at=post.published_at,
-                            source="contact_seed",
-                            source_keyword=query,
-                            source_classification="A",
-                        )
+                    cs2 = _candidate_doc(
+                        operator_id=operator_id,
+                        cofounder_id=cofounder_id,
+                        slate_run_id=slate_run_id,
+                        post_url=post.url,
+                        post_id=None,
+                        author_name=post.author or name,
+                        author_title=title or None,
+                        author_company=company or None,
+                        author_linkedin_url=author_url,
+                        post_text=body or (post.snippet or post.title or ""),
+                        post_published_at=post.published_at,
+                        source="contact_seed",
+                        source_keyword=query,
+                        source_classification="A",
                     )
+                    db.candidates.insert_one(cs2)
+                    _discovery_record_insert(db, cs2)
                     inserted += 1
 
     log.info(
@@ -2991,6 +3163,7 @@ def _run_contact_seeds_unipile(
                 "analyst": {"verdict": "not_analyst", "synthetic": True},
             }
             db.candidates.insert_one(doc)
+            _discovery_record_insert(db, doc)
             inserted += 1
 
     log.info(

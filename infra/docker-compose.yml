@@ -46,6 +46,8 @@ services:
       redis:
         condition: service_healthy
 
+  # After changing backend/requirements.txt, rebuild so site-packages matches the bind mount:
+  #   docker compose -f infra/docker-compose.yml build --no-cache worker beat backend
   worker:
     build:
       context: ../backend

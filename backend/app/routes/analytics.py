@@ -7,11 +7,11 @@ operator.
 """
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Annotated, Any, Literal
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel
 
@@ -354,6 +354,10 @@ _REASON_META: dict[str, dict[str, str]] = {
         "label": "Rubric below threshold",
         "description": "Author title + industry + post keywords all scored too low to qualify on either path.",
     },
+    "comments_disabled": {
+        "label": "Comments disabled",
+        "description": "LinkedIn post has comments turned off — cannot engage.",
+    },
     "rejected_url_mismatch": {
         "label": "Verification rejected",
         "description": "Post too old, snippet empty/thin, or post URL didn't resolve. Filtered before any LLM cost.",
@@ -416,6 +420,7 @@ _REASON_TO_STAGE = {
     "inline_geo": "discovery",
     "inline_no_profile": "discovery",
     "inline_rubric": "discovery",
+    "comments_disabled": "verification",
     "rejected_url_mismatch": "verification",
     "non_buyer": "cheap_gates",
     "post_quality": "cheap_gates",
@@ -587,7 +592,7 @@ async def gate_funnel(
 
     drops: list[GateDropGroup] = []
     order = ["inline_geo", "inline_no_profile", "inline_rubric",
-             "rejected_url_mismatch", "non_buyer", "post_quality",
+             "comments_disabled", "rejected_url_mismatch", "non_buyer", "post_quality",
              "analyst", "icp_low", "drafter_error", "validator",
              "drafter_no_cofounder", "gate_error_unexpected",
              "error_non_buyer", "error_quality", "error_analyst",
@@ -634,3 +639,189 @@ async def gate_funnel(
         stages=stages,
         drops=drops,
     )
+
+
+# ---------------------------------------------------------------- comment lifecycle
+
+
+class OurCommentRow(BaseModel):
+    id: str
+    comment_id: str | None
+    parent_post_url: str
+    status: str
+    text: str
+    posted_at: datetime | None
+    latest_reaction_count: int
+    latest_reply_count: int
+    candidate_id: str
+
+
+class CommentsListResponse(BaseModel):
+    range: str
+    items: list[OurCommentRow]
+
+
+@router.get("/comments", response_model=CommentsListResponse)
+async def list_our_comments(
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+    range: Annotated[Literal["7d", "30d", "90d"], Query()] = "30d",
+) -> CommentsListResponse:
+    operator_id: ObjectId = user["_id"]
+    cutoff = _cutoff(range)
+    cursor = db.our_comments.find(
+        {"operator_id": operator_id, "created_at": {"$gte": cutoff}}
+    ).sort("created_at", -1).limit(200)
+    items: list[OurCommentRow] = []
+    async for row in cursor:
+        items.append(
+            OurCommentRow(
+                id=str(row["_id"]),
+                comment_id=row.get("comment_id"),
+                parent_post_url=row.get("parent_post_url") or "",
+                status=str(row.get("status") or ""),
+                text=(row.get("text") or "")[:2000],
+                posted_at=row.get("posted_at"),
+                latest_reaction_count=int(row.get("latest_reaction_count") or 0),
+                latest_reply_count=int(row.get("latest_reply_count") or 0),
+                candidate_id=str(row.get("candidate_id") or ""),
+            )
+        )
+    return CommentsListResponse(range=range, items=items)
+
+
+class CommentTimeseriesPoint(BaseModel):
+    polled_at: datetime
+    reaction_count: int
+    reply_count: int
+
+
+class CommentTimeseriesResponse(BaseModel):
+    comment_id: str
+    points: list[CommentTimeseriesPoint]
+
+
+@router.get("/comments/{comment_id}/timeseries", response_model=CommentTimeseriesResponse)
+async def comment_timeseries(
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+    comment_id: str,
+) -> CommentTimeseriesResponse:
+    operator_id: ObjectId = user["_id"]
+    oc = await db.our_comments.find_one(
+        {"operator_id": operator_id, "comment_id": comment_id}
+    )
+    if not oc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Comment not found")
+    pts: list[CommentTimeseriesPoint] = []
+    cursor = db.comment_engagement_snapshots.find({"comment_id": comment_id}).sort(
+        "polled_at", 1
+    ).limit(500)
+    async for s in cursor:
+        pts.append(
+            CommentTimeseriesPoint(
+                polled_at=s["polled_at"],
+                reaction_count=int(s.get("reaction_count") or 0),
+                reply_count=int(s.get("reply_count") or 0),
+            )
+        )
+    return CommentTimeseriesResponse(comment_id=comment_id, points=pts)
+
+
+class OperatorCommentSummary(BaseModel):
+    range: str
+    comments_sent: int
+    replies_detected: int
+    avg_reactions: float
+
+
+@router.get("/operator-summary", response_model=OperatorCommentSummary)
+async def operator_comment_summary(
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+    range: Annotated[Literal["7d", "30d", "90d"], Query()] = "30d",
+) -> OperatorCommentSummary:
+    operator_id: ObjectId = user["_id"]
+    cutoff = _cutoff(range)
+    sent = await db.our_comments.count_documents(
+        {
+            "operator_id": operator_id,
+            "status": "sent",
+            "posted_at": {"$gte": cutoff},
+        }
+    )
+    replies_n = await db.replies.count_documents(
+        {"operator_id": operator_id, "detected_at": {"$gte": cutoff}}
+    )
+    pipeline = [
+        {
+            "$match": {
+                "operator_id": operator_id,
+                "status": "sent",
+                "posted_at": {"$gte": cutoff},
+            }
+        },
+        {"$group": {"_id": None, "avg": {"$avg": "$latest_reaction_count"}}},
+    ]
+    agg = await db.our_comments.aggregate(pipeline).to_list(length=1)
+    avg_r = float(agg[0]["avg"]) if agg and agg[0].get("avg") is not None else 0.0
+    return OperatorCommentSummary(
+        range=range,
+        comments_sent=sent,
+        replies_detected=replies_n,
+        avg_reactions=round(avg_r, 3),
+    )
+
+
+class PostThreadMessage(BaseModel):
+    kind: str
+    at: datetime | None
+    text: str
+    author: str | None = None
+
+
+class PostThreadResponse(BaseModel):
+    candidate_id: str
+    messages: list[PostThreadMessage]
+
+
+@router.get("/post-thread/{candidate_id}", response_model=PostThreadResponse)
+async def post_thread(
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+    candidate_id: str,
+) -> PostThreadResponse:
+    if not ObjectId.is_valid(candidate_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid candidate id")
+    oid = ObjectId(candidate_id)
+    c = await db.candidates.find_one({"_id": oid, "operator_id": user["_id"]})
+    if not c:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Candidate not found")
+    msgs: list[PostThreadMessage] = []
+    msgs.append(
+        PostThreadMessage(
+            kind="post",
+            at=c.get("post_published_at"),
+            text=(c.get("post_text") or "")[:4000],
+            author=c.get("author_name"),
+        )
+    )
+    if c.get("comment_text"):
+        msgs.append(
+            PostThreadMessage(
+                kind="our_draft",
+                at=c.get("updated_at"),
+                text=c.get("comment_text") or "",
+                author=None,
+            )
+        )
+    async for r in db.replies.find({"candidate_id": oid}).sort("detected_at", 1):
+        msgs.append(
+            PostThreadMessage(
+                kind="reply",
+                at=r.get("detected_at"),
+                text=r.get("reply_text") or "",
+                author=r.get("reply_author_name"),
+            )
+        )
+    return PostThreadResponse(candidate_id=candidate_id, messages=msgs)

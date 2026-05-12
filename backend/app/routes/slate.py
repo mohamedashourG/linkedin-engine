@@ -9,12 +9,15 @@ from typing import Annotated, Any, Literal
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from pymongo import MongoClient
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
 
 from app.auth.deps import CurrentUser
 from app.celery_app import daily_run as daily_run_task
+from app.config import settings
 from app.database import get_db
+from app.engine import outbox
 from app.models.common import utcnow
 from app.routes.slate_pipeline import compute_pipeline_breakdown
 
@@ -253,6 +256,47 @@ async def candidate_action(
             candidate_id=result["_id"],
             advance_stage_to="S2",
         )
+
+    if (
+        payload.action == "shipped"
+        and settings.comment_outbox_on_ship_enabled
+        and result.get("comment_text")
+        and result.get("post_url")
+        and result.get("cofounder_id")
+        and result.get("slate_run_id")
+    ):
+        text = str(result.get("comment_text") or "").strip()
+        post_url = str(result.get("post_url") or "").strip()
+        if text and post_url:
+            sync_client = MongoClient(settings.mongodb_uri)
+            try:
+                sdb = sync_client[settings.mongodb_db]
+                cof = sdb.cofounders.find_one({"_id": result["cofounder_id"]})
+                acc = (cof or {}).get("unipile_account_id") or ""
+                if acc:
+                    outbox.enqueue_comment(
+                        sdb,
+                        operator_id=user["_id"],
+                        cofounder_id=result["cofounder_id"],
+                        unipile_account_id=acc,
+                        candidate_id=result["_id"],
+                        slate_run_id=result["slate_run_id"],
+                        parent_post_url=post_url,
+                        parent_post_id=result.get("post_id"),
+                        parent_post_author_provider_id=None,
+                        text=text,
+                        parent_post_reaction_count_at_send=int(
+                            result.get("reaction_counter") or 0
+                        ),
+                        parent_post_comment_count_at_send=int(
+                            result.get("comment_counter") or 0
+                        ),
+                        parent_post_repost_count_at_send=int(
+                            result.get("repost_counter") or 0
+                        ),
+                    )
+            finally:
+                sync_client.close()
     return {"ok": "true"}
 
 

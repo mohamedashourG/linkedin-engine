@@ -108,6 +108,12 @@ def _set_lead_stage(
 
 
 def _update_exhaustion_ledger(db: Database, operator_id: ObjectId) -> int:
+    """Upsert ``exhaustion_ledger`` from **shipped** candidates today (EOD path).
+
+    Discovery-time touches use ``last_seen_discovery_at`` via
+    ``discovery._discovery_record_insert`` — see that helper for cross-run
+    dedupe when runs abort before ship.
+    """
     today_start = datetime.combine(
         date_type.today(), time.min, tzinfo=timezone.utc
     )
