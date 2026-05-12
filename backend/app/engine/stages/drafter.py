@@ -224,11 +224,18 @@ def draft_comment(
     comment_type: str,
     source_classification: str,
     reframe_formula: str | None = None,
+    feedback_hint: str | None = None,
 ) -> tuple[str, str]:
     """
     Returns (comment_text, reframe_formula_used). The caller persists
     `reframe_formula_used` so the slate-level rebalancer can detect over-
     representation later.
+
+    ``feedback_hint`` is an optional hard instruction appended to the
+    system prompt when retrying after a validator failure. It tells the
+    LLM exactly what to avoid this time (e.g., ``"buzzword:'leverage'"``
+    or ``"no_specific_number_or_cohort"``) so the next draft passes
+    validation. See ``_draft_one`` in daily_run.py for the retry loop.
     """
     min_s, max_s = SENTENCE_COUNT_BY_TYPE.get(comment_type, (3, 5))
     close_pattern = TYPE_CLOSE_PATTERNS.get(comment_type, "")
@@ -251,6 +258,9 @@ def draft_comment(
         assigned_reframe_formula=formula,
     )
 
+    if feedback_hint:
+        system = system + "\n\n" + _format_feedback_block(feedback_hint)
+
     result = parse_structured_sync(
         model_tier="primary",
         system=system,
@@ -258,3 +268,76 @@ def draft_comment(
         schema=_Draft,
     )
     return result.comment.strip(), formula
+
+
+def _format_feedback_block(reason: str) -> str:
+    """Translate a validator failure reason into a hard instruction the
+    drafter LLM can act on. The reason strings come from
+    ``stages/validator.py`` and look like ``"buzzword:'leverage'"`` or
+    ``"no_specific_number_or_cohort"`` — we expand each one into a clear
+    do-not-do directive for the system prompt."""
+    r = reason or ""
+    parts: list[str] = [
+        "CRITICAL: your previous draft FAILED validation. You MUST fix the",
+        f"specific issue below in your next draft. Failure reason: {r!r}.",
+        "",
+    ]
+    rlow = r.lower()
+    if rlow.startswith("buzzword:"):
+        # Extract the offending token from the rest of the string
+        # (everything after the colon, often quoted).
+        bad = r.split(":", 1)[1].strip().strip("'\"").strip()
+        parts.append(
+            f"DO NOT use the word \"{bad}\" anywhere in your draft. Pick "
+            "concrete language instead. Other banned buzzwords to avoid: "
+            "\"leverage\", \"synergy\", \"value-add\", \"best-in-class\", "
+            "\"thought-leader\", \"game-changer\", \"paradigm shift\"."
+        )
+    elif rlow.startswith("no_specific_number_or_cohort"):
+        parts.append(
+            "Your reply MUST include ONE concrete anchor: a specific number "
+            "(percentage, time, count) OR a named cohort (e.g., \"VPs of "
+            "Engineering at Series B SaaS\", \"hospitals over 200 beds\", "
+            "\"RCM directors with 5+ EHR migrations\"). Vague references "
+            "like \"many teams\" or \"a lot of folks\" do NOT count."
+        )
+    elif rlow.startswith("banned_opener:"):
+        bad = r.split(":", 1)[1].strip().strip("'\"").strip()
+        parts.append(
+            f"DO NOT start your comment with \"{bad}\". Open differently — "
+            "ideally jump straight into the substantive observation."
+        )
+    elif rlow.startswith("banned_token:"):
+        bad = r.split(":", 1)[1].strip().strip("'\"").strip()
+        parts.append(
+            f"DO NOT use the token \"{bad}\" anywhere in your draft. Often "
+            "this is an em-dash (—), en-dash (–), ellipsis (…), or "
+            "AI-tell phrase. Use plain punctuation instead."
+        )
+    elif rlow.startswith("sentence_count_below_floor"):
+        parts.append(
+            "Your previous draft was too SHORT (sentence count below the "
+            "required floor). Add at least one more substantive sentence "
+            "with a concrete observation or follow-up — without padding."
+        )
+    elif rlow.startswith("sentence_count_above_ceiling"):
+        parts.append(
+            "Your previous draft was too LONG (sentence count above the "
+            "ceiling). Tighten — keep only the strongest sentences."
+        )
+    elif rlow.startswith("too_short"):
+        parts.append(
+            "Your previous draft was too short in characters. Add a "
+            "concrete observation, but stay within the sentence range."
+        )
+    elif rlow.startswith("too_long"):
+        parts.append(
+            "Your previous draft was too long in characters. Tighten "
+            "ruthlessly while keeping the strongest specific anchor."
+        )
+    else:
+        parts.append(
+            "Re-read the rules above carefully and produce a draft that "
+            "complies with every constraint."
+        )
+    return "\n".join(parts)

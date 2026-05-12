@@ -85,7 +85,6 @@ from app.services.unipile import (
     get_user_posts,
     resolve_location_ids_from_text,
     search_people,
-    search_posts_by_filters,
     search_posts_pages,
 )
 from app.services.crustdata import (
@@ -744,8 +743,12 @@ def _score_unipile_author_against_operator(
     return {
         "title": title_pts,
         "industry": industry_pts,
+        # `geo` is surfaced for the geo-required gate (read separately in
+        # `_qualifies_inline_rubric`) but NOT added to `total` — the inline
+        # ICP score is title + industry only. Geo qualifies/disqualifies
+        # binarily; it doesn't earn points.
         "geo": geo_pts,
-        "total": title_pts + industry_pts + geo_pts,
+        "total": title_pts + industry_pts,
     }
 
 
@@ -2562,51 +2565,6 @@ def _run_unipile(
         "no_profile": 0,
     }
 
-    # ── Filter-only sub-pass injection ──────────────────────────────────
-    # Sends `POST /linkedin/search` with location + content_type +
-    # date_posted but NO keywords. Different code path on LinkedIn's side:
-    # the `location` filter IS respected when keywords are omitted (it's
-    # only ignored when combined with a keyword query). Wired as a
-    # synthetic plan entry so the existing PASS 1-4 pipeline picks up the
-    # posts without duplication.
-    prefetched_posts_by_source: dict[str, list[UnipilePost]] = {}
-    if settings.discovery_unipile_filter_only_enabled and account_id:
-        fo_locations = _unipile_post_location_ids_for_operator(account_id, operator)
-        if fo_locations:
-            fo_content_type = (
-                settings.discovery_unipile_filter_only_content_type.strip() or None
-            )
-            fo_date_posted = (
-                settings.discovery_unipile_filter_only_date_posted.strip() or None
-            )
-            log.info(
-                "│  [unipile-filter] location_ids=%s content_type=%r date_posted=%s",
-                ",".join(fo_locations[:5]), fo_content_type, fo_date_posted,
-            )
-            try:
-                fo_posts = search_posts_by_filters(
-                    account_id=account_id,
-                    location_ids=fo_locations,
-                    content_type=fo_content_type,
-                    date_posted=fo_date_posted,
-                    max_pages=settings.discovery_unipile_filter_only_max_pages,
-                    per_page=settings.discovery_unipile_filter_only_per_page,
-                )
-            except UnipileNotConfigured as err:
-                log.warning("discovery: unipile filter-only unconfigured: %s", err)
-                fo_posts = []
-            except UnipileError as err:
-                log.warning("discovery: unipile filter-only failed: %s", err)
-                fo_posts = []
-            log.info("│  [unipile-filter] posts=%d", len(fo_posts))
-            if fo_posts:
-                prefetched_posts_by_source["filter_only_kw"] = fo_posts
-                plan.append(("kw", "filter_only", "filter_only_kw", "A"))
-        else:
-            log.info(
-                "│  [unipile-filter] skipped — no location_ids resolved for operator"
-            )
-
     t_kw = time.monotonic()
     for kind, payload, source, classification in plan:
         assert kind == "kw"
@@ -2636,45 +2594,36 @@ def _run_unipile(
         # Geo-text suffix on the keyword is also OFF (we send the bare
         # payload), because LinkedIn's content index is strict text-match
         # and any extra word collapses recall.
-        # Filter-only synthetic plan entries inject pre-fetched posts via
-        # the prefetched_posts_by_source dict (built before the loop).
-        if source in prefetched_posts_by_source:
-            posts = prefetched_posts_by_source[source]
+        try:
             log.info(
-                "│  [unipile-filter] using prefetched posts=%d source=%s",
-                len(posts), source,
+                "│  [unipile-kw] query=%r (bare keyword; geo enforced post-fetch by inline rubric, not by server)",
+                payload,
             )
-        else:
-            try:
-                log.info(
-                    "│  [unipile-kw] query=%r (bare keyword; geo enforced post-fetch by inline rubric, not by server)",
-                    payload,
-                )
-                posts = search_posts_pages(
-                    account_id=account_id,
-                    query=payload,
-                    max_pages=settings.discovery_unipile_post_max_pages,
-                    per_page=settings.discovery_unipile_post_limit,
-                    sort_by=settings.discovery_unipile_post_sort_by or None,
-                    date_posted=settings.discovery_unipile_post_date_window or None,
-                    content_type=(
-                        settings.discovery_unipile_post_content_type.strip()
-                        if settings.discovery_unipile_post_content_type.strip()
-                        else None
-                    ),
-                    author_keywords=settings.discovery_unipile_post_author_filter or None,
-                    location_ids=None,  # see comment above — body filter doesn't work on content search
-                )
-                log.info(
-                    "│  [unipile-kw] result query=%r posts=%d source=%s",
-                    payload, len(posts), source,
-                )
-            except UnipileNotConfigured as err:
-                log.warning("discovery: unipile unconfigured, halting: %s", err)
-                return inserted
-            except UnipileError as err:
-                log.warning("discovery: unipile kw failed for %r: %s", payload, err)
-                continue
+            posts = search_posts_pages(
+                account_id=account_id,
+                query=payload,
+                max_pages=settings.discovery_unipile_post_max_pages,
+                per_page=settings.discovery_unipile_post_limit,
+                sort_by=settings.discovery_unipile_post_sort_by or None,
+                date_posted=settings.discovery_unipile_post_date_window or None,
+                content_type=(
+                    settings.discovery_unipile_post_content_type.strip()
+                    if settings.discovery_unipile_post_content_type.strip()
+                    else None
+                ),
+                author_keywords=settings.discovery_unipile_post_author_filter or None,
+                location_ids=None,  # see comment above — body filter doesn't work on content search
+            )
+            log.info(
+                "│  [unipile-kw] result query=%r posts=%d source=%s",
+                payload, len(posts), source,
+            )
+        except UnipileNotConfigured as err:
+            log.warning("discovery: unipile unconfigured, halting: %s", err)
+            return inserted
+        except UnipileError as err:
+            log.warning("discovery: unipile kw failed for %r: %s", payload, err)
+            continue
 
         # Tag content-search hits with source_channel for downstream routing.
         if source in ("tier_1_kw", "tier_2_kw", "tier_3_kw"):

@@ -113,24 +113,6 @@ class Settings(BaseSettings):
     # When true (default), drop LinkedIn company-authored posts from Unipile
     # keyword and title-search activity paths (person buyers only).
     discovery_unipile_skip_company_posts: bool = True
-    # Filter-only Unipile post search — sends body with location +
-    # content_type + date_posted but NO keywords. Different code path on
-    # LinkedIn's side: the location filter is actually respected here
-    # (unlike with keywords, where it's empirically ignored). Runs as a
-    # sub-source inside _run_unipile after the keyword loop. Each pass
-    # goes through the same Crustdata-first enrichment + rubric pipeline.
-    discovery_unipile_filter_only_enabled: bool = True
-    # date_posted for the filter-only pass. Valid: "", "past_day",
-    # "past_week", "past_month".
-    discovery_unipile_filter_only_date_posted: str = "past_month"
-    # content_type for the filter-only pass. Common values: "documents"
-    # (long-form thought-leadership), "images", "videos", "articles".
-    # Empty string omits the field entirely (any post type).
-    discovery_unipile_filter_only_content_type: str = "documents"
-    # Cursor-pagination depth for the filter-only pass.
-    discovery_unipile_filter_only_max_pages: int = 3
-    # Results per page for the filter-only pass (Unipile caps at 50).
-    discovery_unipile_filter_only_per_page: int = 50
     # Inline author enrichment + per-operator rubric inside _run_unipile.
     # Reference: unipile_hybrid_sweep.py (hybrid_sweep + Client 2 scripts).
     # When enabled, every post returned by Unipile keyword search is:
@@ -187,6 +169,24 @@ class Settings(BaseSettings):
     # Override of the vendor Crustdata batch size (server hard-caps at 25).
     # Lower values amortize cost over more requests in case of slowness.
     discovery_unipile_crustdata_batch_size: int = 25
+
+    # Allocator over-allocation multiplier. The allocator picks
+    # `daily_volume_target × multiplier` candidates per cofounder so the
+    # operator has extras to review before shipping. Default 2.0 = ship
+    # 20 when target=10. Clamped to >= 1.0 at read-time. Rule 23's "floor"
+    # check (≥ 70% of target shipped) keeps its base-target meaning so
+    # over-allocation doesn't silently inflate the floor.
+    allocator_target_multiplier: float = 2.0
+
+    # When the drafter's first attempt produces a comment that fails the
+    # validator (banned buzzword, missing specificity, wrong sentence
+    # count, etc.), retry up to N times. Each retry passes the prior
+    # failure reason back into the LLM as a hard "do not do X" directive
+    # so the next draft knows what to fix. Default 3 (1 initial + up to
+    # 2 feedback-guided retries). Caps drafter LLM cost in the worst case
+    # at N × per-candidate; best case is 1 call (passes first try). All
+    # attempts use the primary tier (gpt-5.4) — see drafter.draft_comment.
+    drafter_validator_feedback_retries: int = 3
 
     # ── Gate relaxation for ICP-qualified candidates ───────────────────
     # When a Unipile candidate cleared the inline rubric's Path A (author

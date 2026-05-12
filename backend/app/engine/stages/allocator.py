@@ -20,6 +20,7 @@ from typing import Any
 from bson import ObjectId
 from pymongo.database import Database
 
+from app.config import settings
 from app.engine.constants import COMMENT_TYPE_QUOTAS_DEFAULT
 from app.models.common import utcnow
 
@@ -113,7 +114,18 @@ def allocate(
 
     for cofounder in cofounders:
         cf_id = cofounder["_id"]
-        target = int(cofounder.get("daily_volume_target", 20))
+        base_target = int(cofounder.get("daily_volume_target", 20))
+        # Over-allocate: pick `base_target × multiplier` candidates so the
+        # operator has extras to review. Rule 23's "floor" check still uses
+        # `base_target × 0.7` below (not effective), so the alert "shipped
+        # less than 70% of target" keeps its original meaning.
+        mult = max(1.0, float(settings.allocator_target_multiplier))
+        target = int(base_target * mult)
+        if mult > 1.0:
+            log.info(
+                "allocator: cofounder=%s base_target=%d × %.2f = effective=%d",
+                cf_id, base_target, mult, target,
+            )
         bucket = sorted(by_cofounder.get(cf_id, []), key=_candidate_rank, reverse=True)
 
         # Walk in score-desc order, take first `target` that haven't already
@@ -144,7 +156,12 @@ def allocate(
             )
 
         per_cf_summary[str(cf_id)] = {
-            "floor": int(target * 0.7),
+            # Floor is anchored on the BASE target so Rule 23's "ship at
+            # least 70% of target" alert keeps its original meaning even
+            # when over-allocation is on.
+            "floor": int(base_target * 0.7),
+            "base_target": base_target,
+            "effective_target": target,
             "drafted": 0,
             "shipped": 0,
             "allocated": len(chosen),

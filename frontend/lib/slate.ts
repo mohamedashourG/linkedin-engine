@@ -79,6 +79,54 @@ export type SlateTodayResponse = {
   pipeline: PipelineBreakdown | null;
 };
 
+// ── Past-runs viewer types ──────────────────────────────────────────────
+
+export type RunListItem = {
+  id: string;
+  run_date: string;
+  status: "building" | "sealed" | "force_aborted";
+  sealed_at: string | null;
+  created_at: string;
+  runtime_seconds: number | null;
+  total_discovered: number;
+  total_verified: number;
+  total_gated: number;
+  total_drafted: number;
+  total_slated: number;
+  email_sent: boolean;
+  force_abort_reason: string | null;
+};
+
+export type RunsListResponse = {
+  runs: RunListItem[];
+  next_before: string | null;
+};
+
+export type SourceStatusBucket = {
+  source: string;
+  status: string;
+  count: number;
+};
+
+export type DropReasonBucket = {
+  reason: string;
+  count: number;
+};
+
+export type RunDetailResponse = {
+  slate_run: SlateRun;
+  runtime_seconds: number | null;
+  total_discovered: number;
+  total_verified: number;
+  total_gated: number;
+  total_drafted: number;
+  total_slated: number;
+  source_status: SourceStatusBucket[];
+  top_drop_reasons: DropReasonBucket[];
+  candidates: Candidate[];
+  cofounders: { id: string; display_name: string; active: boolean }[];
+};
+
 export const slateApi = {
   today: () => api.get<SlateTodayResponse>("/api/slate/today"),
   action: (
@@ -92,4 +140,17 @@ export const slateApi = {
     }),
   runNow: () =>
     api.post<{ task_id: string; status: string }>("/api/slate/run-now"),
+  runs: (opts?: { limit?: number; before?: string }) => {
+    const qs = new URLSearchParams();
+    if (opts?.limit) qs.set("limit", String(opts.limit));
+    if (opts?.before) qs.set("before", opts.before);
+    const tail = qs.toString();
+    return api.get<RunsListResponse>(
+      `/api/slate/runs${tail ? "?" + tail : ""}`,
+    );
+  },
+  run: (slateRunId: string) =>
+    api.get<RunDetailResponse>(
+      `/api/slate/runs/${encodeURIComponent(slateRunId)}`,
+    ),
 };

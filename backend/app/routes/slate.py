@@ -353,3 +353,217 @@ async def run_now(user: CurrentUser) -> dict[str, str]:
         raise HTTPException(400, "Onboarding not complete")
     result = daily_run_task.delay(str(user["_id"]))
     return {"task_id": result.id, "status": "queued"}
+
+
+# ── Past-runs viewer ─────────────────────────────────────────────────────
+# Operator-scoped list + per-run detail for browsing historical slate runs.
+
+
+class RunListItem(BaseModel):
+    """Compact summary of one slate_run for the past-runs list view."""
+
+    id: str
+    run_date: datetime
+    status: str  # "building" | "sealed" | "force_aborted"
+    sealed_at: datetime | None = None
+    created_at: datetime
+    runtime_seconds: float | None = None  # sealed_at - created_at
+    total_discovered: int = 0
+    total_verified: int = 0
+    total_gated: int = 0
+    total_drafted: int = 0
+    total_slated: int = 0
+    email_sent: bool = False
+    force_abort_reason: str | None = None
+
+
+class RunsListResponse(BaseModel):
+    runs: list[RunListItem]
+    next_before: datetime | None = None
+
+
+class SourceStatusBucket(BaseModel):
+    source: str
+    status: str
+    count: int
+
+
+class DropReasonBucket(BaseModel):
+    reason: str
+    count: int
+
+
+class RunDetailResponse(BaseModel):
+    slate_run: SlateRunPublic
+    runtime_seconds: float | None = None
+    total_discovered: int = 0
+    total_verified: int = 0
+    total_gated: int = 0
+    total_drafted: int = 0
+    total_slated: int = 0
+    # Per-(source, status) counts aggregated from the candidates collection.
+    source_status: list[SourceStatusBucket]
+    # Top drop_reason histogram (truncated to top 20).
+    top_drop_reasons: list[DropReasonBucket]
+    # The drafted / slated / shipped candidates for this run (UI table).
+    candidates: list[CandidatePublic]
+    cofounders: list[dict[str, Any]]
+
+
+def _run_list_item(doc: dict[str, Any]) -> RunListItem:
+    runtime: float | None = None
+    if doc.get("sealed_at") and doc.get("created_at"):
+        try:
+            runtime = (doc["sealed_at"] - doc["created_at"]).total_seconds()
+        except (TypeError, AttributeError):
+            runtime = None
+    return RunListItem(
+        id=str(doc["_id"]),
+        run_date=doc["run_date"],
+        status=doc.get("status", "building"),
+        sealed_at=doc.get("sealed_at"),
+        created_at=doc["created_at"],
+        runtime_seconds=runtime,
+        total_discovered=int(doc.get("total_discovered") or 0),
+        total_verified=int(doc.get("total_verified") or 0),
+        total_gated=int(doc.get("total_gated") or 0),
+        total_drafted=int(doc.get("total_drafted") or 0),
+        total_slated=int(doc.get("total_slated") or 0),
+        email_sent=bool(doc.get("email_sent", False)),
+        force_abort_reason=doc.get("force_abort_reason"),
+    )
+
+
+@router.get("/runs", response_model=RunsListResponse)
+async def list_runs(
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    before: Annotated[datetime | None, Query()] = None,
+) -> RunsListResponse:
+    """Past slate runs for the current operator, newest first.
+
+    ``before`` is an exclusive cursor on ``created_at`` for load-more
+    pagination; pass the last returned run's ``created_at`` to fetch the
+    next page."""
+    q: dict[str, Any] = {"operator_id": user["_id"]}
+    if before is not None:
+        q["created_at"] = {"$lt": before}
+    cursor = (
+        db.slate_runs.find(q).sort("created_at", -1).limit(limit + 1)
+    )
+    docs = await cursor.to_list(length=limit + 1)
+    has_more = len(docs) > limit
+    page = docs[:limit]
+    next_before = page[-1]["created_at"] if has_more and page else None
+    return RunsListResponse(
+        runs=[_run_list_item(d) for d in page],
+        next_before=next_before,
+    )
+
+
+@router.get("/runs/{slate_run_id}", response_model=RunDetailResponse)
+async def run_detail(
+    slate_run_id: Annotated[str, Path()],
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> RunDetailResponse:
+    """Full detail for one slate_run: funnel by source × status,
+    drop-reason histogram, and the drafted/slated candidate list."""
+    try:
+        slate_oid = ObjectId(slate_run_id)
+    except Exception:
+        raise HTTPException(400, "Invalid slate_run_id")
+    slate = await db.slate_runs.find_one(
+        {"_id": slate_oid, "operator_id": user["_id"]}
+    )
+    if not slate:
+        raise HTTPException(404, "Slate run not found")
+
+    # Per-(source, status) breakdown.
+    pipeline = [
+        {"$match": {"slate_run_id": slate_oid}},
+        {
+            "$group": {
+                "_id": {"source": "$source", "status": "$status"},
+                "count": {"$sum": 1},
+            }
+        },
+        {"$sort": {"count": -1}},
+    ]
+    source_status_rows = await db.candidates.aggregate(pipeline).to_list(length=None)
+    source_status = [
+        SourceStatusBucket(
+            source=str(r["_id"].get("source") or "(unknown)"),
+            status=str(r["_id"].get("status") or "(unknown)"),
+            count=int(r["count"]),
+        )
+        for r in source_status_rows
+    ]
+
+    # Top drop-reason histogram.
+    drop_pipeline = [
+        {
+            "$match": {
+                "slate_run_id": slate_oid,
+                "drop_reason": {"$exists": True, "$ne": None, "$type": "string"},
+            }
+        },
+        {
+            "$group": {
+                "_id": {"$substr": ["$drop_reason", 0, 80]},
+                "count": {"$sum": 1},
+            }
+        },
+        {"$sort": {"count": -1}},
+        {"$limit": 20},
+    ]
+    drop_rows = await db.candidates.aggregate(drop_pipeline).to_list(length=20)
+    top_drop_reasons = [
+        DropReasonBucket(reason=str(r["_id"]), count=int(r["count"]))
+        for r in drop_rows
+    ]
+
+    # Drafted / slated / shipped candidates.
+    cand_docs = await db.candidates.find(
+        {
+            "slate_run_id": slate_oid,
+            "status": {"$in": ["slated", "shipped", "dropped_by_user", "drafted"]},
+        }
+    ).to_list(length=None)
+    cand_docs.sort(key=_candidate_sort_key)
+    candidates = [_candidate_to_public(c) for c in cand_docs]
+
+    # Cofounders for the operator (used by the UI to group/label).
+    cofounders_raw = await db.cofounders.find(
+        {"operator_id": user["_id"]}
+    ).to_list(length=None)
+    cofounders = [
+        {
+            "id": str(cf["_id"]),
+            "display_name": cf.get("display_name") or "",
+            "active": bool(cf.get("active", True)),
+        }
+        for cf in cofounders_raw
+    ]
+
+    runtime: float | None = None
+    if slate.get("sealed_at") and slate.get("created_at"):
+        try:
+            runtime = (slate["sealed_at"] - slate["created_at"]).total_seconds()
+        except (TypeError, AttributeError):
+            runtime = None
+
+    return RunDetailResponse(
+        slate_run=_slate_to_public(slate),
+        runtime_seconds=runtime,
+        total_discovered=int(slate.get("total_discovered") or 0),
+        total_verified=int(slate.get("total_verified") or 0),
+        total_gated=int(slate.get("total_gated") or 0),
+        total_drafted=int(slate.get("total_drafted") or 0),
+        total_slated=int(slate.get("total_slated") or 0),
+        source_status=source_status,
+        top_drop_reasons=top_drop_reasons,
+        candidates=candidates,
+        cofounders=cofounders,
+    )
