@@ -23,14 +23,6 @@ function fmtDate(iso: string): string {
   }
 }
 
-function fmtRuntime(seconds: number | null): string {
-  if (seconds == null) return "—";
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  const m = Math.floor(seconds / 60);
-  const s = Math.round(seconds - m * 60);
-  return `${m}m ${s}s`;
-}
-
 function StatusBadge({ status }: { status: RunListItem["status"] }) {
   const variant =
     status === "sealed"
@@ -95,7 +87,6 @@ export default function PastRunsPage() {
               <tr>
                 <th className="px-3 py-2 text-left font-medium">Date</th>
                 <th className="px-3 py-2 text-left font-medium">Status</th>
-                <th className="px-3 py-2 text-right font-medium">Runtime</th>
                 <th className="px-3 py-2 text-right font-medium">Discovered</th>
                 <th className="px-3 py-2 text-right font-medium">Verified</th>
                 <th className="px-3 py-2 text-right font-medium">Drafted</th>
@@ -118,9 +109,6 @@ export default function PastRunsPage() {
                   </td>
                   <td className="px-3 py-2">
                     <StatusBadge status={r.status} />
-                  </td>
-                  <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
-                    {fmtRuntime(r.runtime_seconds)}
                   </td>
                   <td className="px-3 py-2 text-right tabular-nums">
                     {r.total_discovered}

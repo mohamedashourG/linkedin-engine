@@ -107,6 +107,7 @@ def compute_pipeline_breakdown(
 
     gate_pass: list[dict[str, Any]] = []
     gate_fail: list[dict[str, Any]] = []
+    gate_pending: list[dict[str, Any]] = []
     for c in candidates:
         st = c.get("status") or ""
         dr = c.get("drop_reason")
@@ -114,18 +115,33 @@ def compute_pipeline_breakdown(
             gate_pass.append(c)
         elif st == "gate_dropped" and dr and _is_gate_failure(dr):
             gate_fail.append(c)
+        elif building and st in ("verified", "cheap_gate_passed"):
+            # In streaming mode (and any in-flight legacy run) a candidate
+            # sitting at verified or cheap_gate_passed is mid-flight through
+            # the gates pipeline — show it as waiting, not failed.
+            gate_pending.append(c)
 
     alloc_pass: list[dict[str, Any]] = []
     alloc_fail: list[dict[str, Any]] = []
+    alloc_pending: list[dict[str, Any]] = []
     for c in candidates:
         st = c.get("status") or ""
         if st in ("allocated", "drafted", "slated", "shipped", "dropped_by_user"):
             alloc_pass.append(c)
         elif st == "gate_passed":
-            alloc_fail.append(c)
+            # While the run is still building, a gate_passed candidate is
+            # buffered waiting for the next allocator wave (streaming) or
+            # for the allocator to run at all (legacy) — that's a "wait",
+            # not a failure. Only after the slate seals is a leftover
+            # gate_passed truly not-selected.
+            if building:
+                alloc_pending.append(c)
+            else:
+                alloc_fail.append(c)
 
     draft_pass: list[dict[str, Any]] = []
     draft_fail: list[dict[str, Any]] = []
+    draft_pending: list[dict[str, Any]] = []
     for c in candidates:
         st = c.get("status") or ""
         dr = c.get("drop_reason")
@@ -133,6 +149,8 @@ def compute_pipeline_breakdown(
             draft_pass.append(c)
         elif st == "gate_dropped" and dr and _is_drafter_failure(dr):
             draft_fail.append(c)
+        elif building and st == "allocated":
+            draft_pending.append(c)
 
     r23_pass: list[dict[str, Any]] = []
     r23_fail: list[dict[str, Any]] = []
@@ -170,17 +188,17 @@ def compute_pipeline_breakdown(
         "gates": _finalize_lists(
             [pipeline_post_ref(c) for c in gate_pass],
             [pipeline_post_ref(c) for c in gate_fail],
-            [],
+            [pipeline_post_ref(c) for c in gate_pending],
         ),
         "allocator": _finalize_lists(
             [pipeline_post_ref(c) for c in alloc_pass],
             [pipeline_post_ref(c) for c in alloc_fail],
-            [],
+            [pipeline_post_ref(c) for c in alloc_pending],
         ),
         "drafter": _finalize_lists(
             [pipeline_post_ref(c) for c in draft_pass],
             [pipeline_post_ref(c) for c in draft_fail],
-            [],
+            [pipeline_post_ref(c) for c in draft_pending],
         ),
         "rule_23": _finalize_lists(
             [pipeline_post_ref(c) for c in r23_pass],

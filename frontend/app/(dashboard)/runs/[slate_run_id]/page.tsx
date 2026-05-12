@@ -1,14 +1,19 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, ExternalLink } from "lucide-react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { ArrowLeft, ExternalLink, Mail, Send } from "lucide-react";
+import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/shared/empty-state";
 import { slateApi, type Candidate, type SourceStatusBucket } from "@/lib/slate";
+import { ApiError } from "@/lib/api";
 
 function fmtDate(iso: string | null): string {
   if (!iso) return "—";
@@ -23,14 +28,6 @@ function fmtDate(iso: string | null): string {
   } catch {
     return iso;
   }
-}
-
-function fmtRuntime(seconds: number | null): string {
-  if (seconds == null) return "—";
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  const m = Math.floor(seconds / 60);
-  const s = Math.round(seconds - m * 60);
-  return `${m}m ${s}s`;
 }
 
 /** Pivot the flat (source, status, count) list into a sparse matrix the UI
@@ -73,6 +70,33 @@ export default function RunDetailPage() {
     queryKey: ["slate-run", slateRunId],
     queryFn: () => slateApi.run(slateRunId),
     enabled: !!slateRunId,
+  });
+
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [emailTo, setEmailTo] = useState<string>("");
+  const toggleSelected = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const emailMut = useMutation({
+    mutationFn: () =>
+      slateApi.emailSelected(slateRunId, {
+        candidate_ids: Array.from(selected),
+        to: emailTo.trim() || undefined,
+      }),
+    onSuccess: (res) => {
+      toast.success(
+        `Sent ${res.count} draft${res.count === 1 ? "" : "s"} to ${res.to}`,
+      );
+      setSelected(new Set());
+    },
+    onError: (err: ApiError) =>
+      toast.error(err?.detail || "Failed to send email"),
   });
 
   if (isLoading) {
@@ -127,8 +151,6 @@ export default function RunDetailPage() {
           >
             {data.slate_run.status}
           </Badge>
-          <span>•</span>
-          <span>runtime {fmtRuntime(data.runtime_seconds)}</span>
           <span>•</span>
           <span>sealed {fmtDate(data.slate_run.sealed_at)}</span>
           {data.slate_run.force_abort_reason && (
@@ -243,53 +265,119 @@ export default function RunDetailPage() {
       {/* Drafted / slated candidates */}
       {data.candidates.length > 0 && (
         <div className="space-y-2">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
-            Drafted candidates ({data.candidates.length})
-          </h2>
-          <div className="space-y-2">
-            {data.candidates.map((c: Candidate) => (
-              <div
-                key={c.id}
-                className="rounded-lg border bg-card p-4 space-y-1.5"
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+              Drafted candidates ({data.candidates.length})
+            </h2>
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <button
+                type="button"
+                onClick={() =>
+                  setSelected(new Set(data.candidates.map((c) => c.id)))
+                }
+                className="hover:underline"
               >
-                <div className="flex items-center gap-2 flex-wrap text-xs text-muted-foreground">
-                  <Badge variant="outline">{c.status}</Badge>
-                  {c.comment_type && (
-                    <Badge variant="secondary">type {c.comment_type}</Badge>
-                  )}
-                  {c.icp_score != null && (
-                    <span>ICP {c.icp_score}/10</span>
-                  )}
-                  <span>•</span>
-                  <span>{cofounderById.get(c.cofounder_id) || c.cofounder_id}</span>
-                  <span>•</span>
-                  <span>{c.source}</span>
-                </div>
-                <div className="text-sm">
-                  <strong>{c.author_name || "Unknown author"}</strong>
-                  {c.post_url && (
-                    <Link
-                      href={c.post_url}
-                      target="_blank"
-                      className="ml-2 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-                    >
-                      open post <ExternalLink className="h-3 w-3" />
-                    </Link>
-                  )}
-                </div>
-                {c.post_text && (
-                  <p className="text-xs text-muted-foreground line-clamp-3">
-                    {c.post_text}
-                  </p>
-                )}
-                {c.comment_text && (
-                  <div className="mt-2 rounded border bg-muted/30 p-2 text-xs">
-                    <div className="font-medium mb-0.5">Drafted comment</div>
-                    <p className="whitespace-pre-wrap">{c.comment_text}</p>
+                select all
+              </button>
+              <span>·</span>
+              <button
+                type="button"
+                onClick={() => setSelected(new Set())}
+                className="hover:underline"
+              >
+                clear
+              </button>
+            </div>
+          </div>
+          <div className="space-y-2 pb-24">
+            {data.candidates.map((c: Candidate) => {
+              const isSel = selected.has(c.id);
+              return (
+                <div
+                  key={c.id}
+                  className={`rounded-lg border p-4 space-y-1.5 transition-colors ${
+                    isSel
+                      ? "border-primary/50 bg-primary/[0.04]"
+                      : "bg-card"
+                  }`}
+                >
+                  <div className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked={isSel}
+                      onChange={() => toggleSelected(c.id)}
+                      aria-label={`Select ${c.author_name || "candidate"}`}
+                      className="mt-1 h-4 w-4 cursor-pointer accent-foreground"
+                    />
+                    <div className="flex-1 space-y-1.5">
+                      <div className="flex items-center gap-2 flex-wrap text-xs text-muted-foreground">
+                        <Badge variant="outline">{c.status}</Badge>
+                        {c.comment_type && (
+                          <Badge variant="secondary">type {c.comment_type}</Badge>
+                        )}
+                        {c.icp_score != null && (
+                          <span>ICP {c.icp_score}/10</span>
+                        )}
+                        <span>•</span>
+                        <span>{cofounderById.get(c.cofounder_id) || c.cofounder_id}</span>
+                        <span>•</span>
+                        <span>{c.source}</span>
+                      </div>
+                      <div className="text-sm">
+                        <strong>{c.author_name || "Unknown author"}</strong>
+                        {c.post_url && (
+                          <Link
+                            href={c.post_url}
+                            target="_blank"
+                            className="ml-2 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                          >
+                            open post <ExternalLink className="h-3 w-3" />
+                          </Link>
+                        )}
+                      </div>
+                      {c.post_text && (
+                        <p className="text-xs text-muted-foreground line-clamp-3">
+                          {c.post_text}
+                        </p>
+                      )}
+                      {c.comment_text && (
+                        <div className="mt-2 rounded border bg-muted/30 p-2 text-xs">
+                          <div className="font-medium mb-0.5">Drafted comment</div>
+                          <p className="whitespace-pre-wrap">{c.comment_text}</p>
+                        </div>
+                      )}
+                    </div>
                   </div>
-                )}
-              </div>
-            ))}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Sticky send bar — shows when at least one candidate is selected. */}
+      {selected.size > 0 && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-20 w-[min(720px,calc(100vw-2rem))]">
+          <div className="rounded-xl border bg-background/95 p-3 shadow-lg backdrop-blur flex items-center gap-2">
+            <div className="flex items-center gap-2 text-sm">
+              <Mail className="h-4 w-4 text-muted-foreground" />
+              <span className="font-medium">{selected.size} selected</span>
+            </div>
+            <Input
+              type="email"
+              value={emailTo}
+              onChange={(e) => setEmailTo(e.target.value)}
+              placeholder="leave blank → your account email"
+              className="flex-1 h-9 text-sm"
+            />
+            <Button
+              size="sm"
+              onClick={() => emailMut.mutate()}
+              disabled={emailMut.isPending || selected.size === 0}
+            >
+              <Send className="mr-1.5 h-3.5 w-3.5" />
+              {emailMut.isPending ? "Sending…" : "Send"}
+            </Button>
           </div>
         </div>
       )}

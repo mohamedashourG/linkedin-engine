@@ -15,6 +15,7 @@ Two passes:
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from typing import Any
 
 from bson import ObjectId
@@ -74,6 +75,14 @@ def _candidate_rank(c: dict[str, Any]) -> tuple[int, int, float]:
     return (icp_score, engagement, ts)
 
 
+def _author_key(c: dict[str, Any]) -> str | None:
+    for f in ("author_provider_id", "author_linkedin_url", "author_name"):
+        v = c.get(f)
+        if v:
+            return f"{f}:{v}"
+    return None
+
+
 def allocate(
     db: Database,
     *,
@@ -81,66 +90,85 @@ def allocate(
     cofounders: list[dict[str, Any]],
     slate_run_id: ObjectId,
 ) -> dict[str, Any]:
-    survivors_cursor = db.candidates.find(
-        {"slate_run_id": slate_run_id, "status": "gate_passed"}
+    """Pick gate_passed candidates for each cofounder, up to effective_target.
+
+    Incremental-safe: when called multiple times (streaming mode), candidates
+    already in status IN (allocated, drafted, slated, shipped) count toward
+    each cofounder's quota, and their authors are excluded from the
+    cross-cofounder cap. Each wave picks only the *remaining* headroom.
+    """
+    survivors = list(
+        db.candidates.find({"slate_run_id": slate_run_id, "status": "gate_passed"})
     )
-    survivors = list(survivors_cursor)
     by_cofounder: dict[ObjectId, list[dict[str, Any]]] = {
         cf["_id"]: [] for cf in cofounders
     }
     for c in survivors:
         by_cofounder.setdefault(c["cofounder_id"], []).append(c)
 
+    # Prior-wave state: count "already-claimed" allocations per cofounder, and
+    # collect their authors so the cross-cofounder cap stays consistent across
+    # waves. In legacy single-shot mode this is an empty query.
+    prior = list(
+        db.candidates.find(
+            {
+                "slate_run_id": slate_run_id,
+                "status": {"$in": ["allocated", "drafted", "slated", "shipped"]},
+            },
+            {
+                "cofounder_id": 1,
+                "author_provider_id": 1,
+                "author_linkedin_url": 1,
+                "author_name": 1,
+            },
+        )
+    )
+    already_count_by_cf: dict[ObjectId, int] = defaultdict(int)
+    picked_authors: set[str] = set()
+    for c in prior:
+        already_count_by_cf[c["cofounder_id"]] += 1
+        ak = _author_key(c)
+        if ak:
+            picked_authors.add(ak)
+
     quotas = operator.get("comment_quotas") or COMMENT_TYPE_QUOTAS_DEFAULT
+    mult = max(1.0, float(settings.allocator_target_multiplier))
 
     allocated_total = 0
+    new_allocations_this_call = 0
     per_cf_summary: dict[str, dict[str, int]] = {}
-
-    # Cross-cofounder author cap: at most ONE candidate per LinkedIn author
-    # per slate. Earlier runs picked the same author 3× (Eric Arzubi,
-    # Michael Glickman) — each different post but the same person — which
-    # crowded out diversity. Identity key prefers provider URN, falls back
-    # to public profile URL, then author_name.
-    picked_authors: set[str] = set()
-
-    def _author_key(c: dict[str, Any]) -> str | None:
-        for f in ("author_provider_id", "author_linkedin_url", "author_name"):
-            v = c.get(f)
-            if v:
-                return f"{f}:{v}"
-        return None
-
     skipped_by_author_cap = 0
 
     for cofounder in cofounders:
         cf_id = cofounder["_id"]
         base_target = int(cofounder.get("daily_volume_target", 20))
-        # Over-allocate: pick `base_target × multiplier` candidates so the
-        # operator has extras to review. Rule 23's "floor" check still uses
-        # `base_target × 0.7` below (not effective), so the alert "shipped
-        # less than 70% of target" keeps its original meaning.
-        mult = max(1.0, float(settings.allocator_target_multiplier))
-        target = int(base_target * mult)
-        if mult > 1.0:
-            log.info(
-                "allocator: cofounder=%s base_target=%d × %.2f = effective=%d",
-                cf_id, base_target, mult, target,
-            )
-        bucket = sorted(by_cofounder.get(cf_id, []), key=_candidate_rank, reverse=True)
+        effective_target = int(base_target * mult)
+        already_count = already_count_by_cf.get(cf_id, 0)
+        remaining_target = max(0, effective_target - already_count)
 
-        # Walk in score-desc order, take first `target` that haven't already
-        # had another post from the same author allocated.
+        if mult > 1.0 and remaining_target > 0:
+            log.info(
+                "allocator: cofounder=%s base=%d × %.2f = effective=%d "
+                "already=%d remaining=%d",
+                cf_id, base_target, mult, effective_target, already_count, remaining_target,
+            )
+
+        bucket = sorted(
+            by_cofounder.get(cf_id, []), key=_candidate_rank, reverse=True
+        )
+
         chosen: list[dict[str, Any]] = []
-        for c in bucket:
-            if len(chosen) >= target:
-                break
-            akey = _author_key(c)
-            if akey and akey in picked_authors:
-                skipped_by_author_cap += 1
-                continue
-            if akey:
-                picked_authors.add(akey)
-            chosen.append(c)
+        if remaining_target > 0:
+            for c in bucket:
+                if len(chosen) >= remaining_target:
+                    break
+                akey = _author_key(c)
+                if akey and akey in picked_authors:
+                    skipped_by_author_cap += 1
+                    continue
+                if akey:
+                    picked_authors.add(akey)
+                chosen.append(c)
 
         type_assignments = _assign_types(len(chosen), quotas)
         for c, comment_type in zip(chosen, type_assignments):
@@ -155,20 +183,20 @@ def allocate(
                 },
             )
 
+        wave_allocated = len(chosen)
+        cumulative_allocated = already_count + wave_allocated
         per_cf_summary[str(cf_id)] = {
-            # Floor is anchored on the BASE target so Rule 23's "ship at
-            # least 70% of target" alert keeps its original meaning even
-            # when over-allocation is on.
             "floor": int(base_target * 0.7),
             "base_target": base_target,
-            "effective_target": target,
+            "effective_target": effective_target,
             "drafted": 0,
             "shipped": 0,
-            "allocated": len(chosen),
-            "available": len(bucket),
+            "allocated": cumulative_allocated,
+            "available": len(bucket) + already_count,
             "skipped_by_author_cap": skipped_by_author_cap,
         }
-        allocated_total += len(chosen)
+        allocated_total += cumulative_allocated
+        new_allocations_this_call += wave_allocated
 
     if skipped_by_author_cap:
         log.info(
@@ -188,8 +216,9 @@ def allocate(
         },
     )
     log.info(
-        "allocator: slate=%s allocated=%d across %d cofounders",
+        "allocator: slate=%s wave_new=%d cumulative_total=%d across %d cofounders",
         slate_run_id,
+        new_allocations_this_call,
         allocated_total,
         len(cofounders),
     )

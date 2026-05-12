@@ -80,6 +80,94 @@ def _coerce_datetime(value: Any) -> datetime | None:
     return None
 
 
+def verify_one(
+    db: Database,
+    c: dict[str, Any],
+    *,
+    cutoff: datetime | None,
+) -> bool:
+    """Apply the verification gate to a single raw candidate.
+
+    Returns True if the candidate was promoted to status="verified", False
+    if it was dropped to status="rejected_url_mismatch". Mongo state is
+    updated either way.
+
+    Shared by both the legacy batch verifier (`verify_candidates`) and the
+    streaming `_process_one` worker in daily_run.
+    """
+    if c.get("can_post_comments") is False:
+        log.info(
+            "│  [DROP/verify] %s  ←  comments_disabled_on_post",
+            (c.get("post_url") or "<no-url>")[:90],
+        )
+        db.candidates.update_one(
+            {"_id": c["_id"]},
+            {
+                "$set": {
+                    "status": "rejected_url_mismatch",
+                    "drop_reason": "comments_disabled: author disabled comments on post",
+                    "updated_at": utcnow(),
+                }
+            },
+        )
+        return False
+
+    snippet: str = (c.get("post_text") or "").strip()
+    url: str = c.get("post_url") or ""
+    min_len = (
+        _MIN_SNIPPET_CHARS_CONTACT_SEED
+        if c.get("source") == "contact_seed"
+        else _MIN_SNIPPET_CHARS
+    )
+    if not url or len(snippet) < min_len:
+        log.info(
+            "│  [DROP/verify] %s  ←  empty_or_thin_snippet",
+            (url or "<no-url>")[:90],
+        )
+        db.candidates.update_one(
+            {"_id": c["_id"]},
+            {
+                "$set": {
+                    "status": "rejected_url_mismatch",
+                    "drop_reason": "empty_or_thin_snippet",
+                    "updated_at": utcnow(),
+                }
+            },
+        )
+        return False
+
+    if cutoff is not None:
+        published = _coerce_datetime(c.get("post_published_at"))
+        if published is not None and published < cutoff:
+            max_age_days = settings.discovery_max_age_days
+            log.info(
+                "│  [DROP/verify] %s  ←  too_old (>%dd)",
+                url[:90],
+                max_age_days,
+            )
+            db.candidates.update_one(
+                {"_id": c["_id"]},
+                {
+                    "$set": {
+                        "status": "rejected_url_mismatch",
+                        "drop_reason": f"too_old (>{max_age_days}d)",
+                        "updated_at": utcnow(),
+                    }
+                },
+            )
+            return False
+
+    update: dict[str, Any] = {
+        "status": "verified",
+        "post_text": snippet,
+        "updated_at": utcnow(),
+    }
+    if not c.get("author_linkedin_url"):
+        update["author_linkedin_url"] = _author_url_from_post_url(url)
+    db.candidates.update_one({"_id": c["_id"]}, {"$set": update})
+    return True
+
+
 def verify_candidates(
     db: Database,
     slate_run_id: ObjectId,
@@ -95,118 +183,11 @@ def verify_candidates(
         utcnow() - timedelta(days=max_age_days) if max_age_days > 0 else None
     )
 
-    # Geo-in-post gate disabled at verification: discovery / gates may still
-    # bias on geography; we do not reject raw → verified here for missing terms.
-    geos: list[str] = []
-    # if operator and settings.discovery_require_geo_in_post:
-    #     geos = _operator_geo_terms(operator)
-
     for c in raw:
-        if c.get("can_post_comments") is False:
-            log.info(
-                "│  [DROP/verify] %s  ←  comments_disabled_on_post",
-                (c.get("post_url") or "<no-url>")[:90],
-            )
-            db.candidates.update_one(
-                {"_id": c["_id"]},
-                {
-                    "$set": {
-                        "status": "rejected_url_mismatch",
-                        "drop_reason": "comments_disabled: author disabled comments on post",
-                        "updated_at": utcnow(),
-                    }
-                },
-            )
+        if verify_one(db, c, cutoff=cutoff):
+            verified += 1
+        else:
             rejected += 1
-            continue
-        snippet: str = (c.get("post_text") or "").strip()
-        url: str = c.get("post_url") or ""
-        min_len = (
-            _MIN_SNIPPET_CHARS_CONTACT_SEED
-            if c.get("source") == "contact_seed"
-            else _MIN_SNIPPET_CHARS
-        )
-        if not url or len(snippet) < min_len:
-            log.info(
-                "│  [DROP/verify] %s  ←  empty_or_thin_snippet",
-                (url or "<no-url>")[:90],
-            )
-            db.candidates.update_one(
-                {"_id": c["_id"]},
-                {
-                    "$set": {
-                        "status": "rejected_url_mismatch",
-                        "drop_reason": "empty_or_thin_snippet",
-                        "updated_at": utcnow(),
-                    }
-                },
-            )
-            rejected += 1
-            continue
-
-        # if geos:
-        #     hay = " ".join(
-        #         str(x or "")
-        #         for x in (
-        #             snippet,
-        #             c.get("author_title"),
-        #             c.get("author_company"),
-        #             c.get("author_name"),
-        #         )
-        #     )
-        #     if not _haystack_matches_geo(hay, geos):
-        #         log.info(
-        #             "│  [DROP/verify] %s  ←  geo_not_in_post_or_author",
-        #             url[:90],
-        #         )
-        #         db.candidates.update_one(
-        #             {"_id": c["_id"]},
-        #             {
-        #                 "$set": {
-        #                     "status": "rejected_url_mismatch",
-        #                     "drop_reason": "geo_not_in_post_or_author",
-        #                     "updated_at": utcnow(),
-        #                 }
-        #             },
-        #         )
-        #         rejected += 1
-        #         continue
-
-        # Recency gate: drop posts older than max_age_days. Candidates with
-        # no parseable published_at are KEPT (don't penalize missing data —
-        # apidirect omits dates for ~30% of posts).
-        if cutoff is not None:
-            published = _coerce_datetime(c.get("post_published_at"))
-            if published is not None and published < cutoff:
-                log.info(
-                    "│  [DROP/verify] %s  ←  too_old (>%dd)",
-                    url[:90],
-                    max_age_days,
-                )
-                db.candidates.update_one(
-                    {"_id": c["_id"]},
-                    {
-                        "$set": {
-                            "status": "rejected_url_mismatch",
-                            "drop_reason": f"too_old (>{max_age_days}d)",
-                            "updated_at": utcnow(),
-                        }
-                    },
-                )
-                rejected += 1
-                continue
-
-        update: dict[str, Any] = {
-            "status": "verified",
-            "post_text": snippet,
-            "updated_at": utcnow(),
-        }
-        # Only derive author_linkedin_url from the post URL if we don't already
-        # have one from Unipile (Unipile returns the author profile URL inline).
-        if not c.get("author_linkedin_url"):
-            update["author_linkedin_url"] = _author_url_from_post_url(url)
-        db.candidates.update_one({"_id": c["_id"]}, {"$set": update})
-        verified += 1
 
     log.info(
         "verification: slate=%s verified=%d rejected=%d",

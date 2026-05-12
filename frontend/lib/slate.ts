@@ -153,4 +153,12 @@ export const slateApi = {
     api.get<RunDetailResponse>(
       `/api/slate/runs/${encodeURIComponent(slateRunId)}`,
     ),
+  emailSelected: (
+    slateRunId: string,
+    body: { candidate_ids: string[]; to?: string; subject?: string },
+  ) =>
+    api.post<{ message_id: string; count: number; to: string }>(
+      `/api/slate/runs/${encodeURIComponent(slateRunId)}/email-selected`,
+      body,
+    ),
 };

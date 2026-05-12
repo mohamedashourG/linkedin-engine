@@ -28,6 +28,7 @@ import { ApiError, api } from "@/lib/api";
 import { onboardingApi, type Cofounder } from "@/lib/onboarding";
 import { repliesApi } from "@/lib/replies";
 import { settingsApi } from "@/lib/settings";
+import type { IcpRubric } from "@/lib/onboarding";
 
 export default function SettingsPage() {
   const params = useSearchParams();
@@ -453,6 +454,11 @@ function EngineConfigCard() {
   const [runTime, setRunTime] = useState("09:00");
   const [paused, setPaused] = useState(false);
   const [recipients, setRecipients] = useState<string[]>([]);
+  const [targetIndustries, setTargetIndustries] = useState<string[]>([]);
+  const [targetTitles, setTargetTitles] = useState<string[]>([]);
+  const [targetGeographies, setTargetGeographies] = useState<string[]>([]);
+  const [targetPainPoints, setTargetPainPoints] = useState<string[]>([]);
+  const [rubric, setRubric] = useState<IcpRubric | null>(null);
   const [dirty, setDirty] = useState(false);
 
   // Hydrate form from server.
@@ -470,6 +476,16 @@ function EngineConfigCard() {
     setRunTime(data.run_time_local);
     setPaused(data.paused);
     setRecipients(data.slate_recipients ?? []);
+    setTargetIndustries(data.product_extracted?.target_industries ?? []);
+    setTargetTitles(data.product_extracted?.target_titles ?? []);
+    setTargetGeographies(data.product_extracted?.target_geographies ?? []);
+    setTargetPainPoints(data.product_extracted?.target_pain_points ?? []);
+    // Deep-clone the rubric so edits don't mutate the cached server response.
+    setRubric(
+      data.icp_rubric
+        ? (JSON.parse(JSON.stringify(data.icp_rubric)) as IcpRubric)
+        : null,
+    );
     setDirty(false);
   }, [settingsQ.data]);
 
@@ -484,9 +500,20 @@ function EngineConfigCard() {
         run_time_local: runTime,
         paused,
         slate_recipients: recipients,
+        product_extracted: {
+          target_industries: targetIndustries,
+          target_titles: targetTitles,
+          target_geographies: targetGeographies,
+          target_pain_points: targetPainPoints,
+        },
       };
       const t = Number(threshold);
-      if (!isNaN(t) && settingsQ.data?.icp_rubric) {
+      if (rubric) {
+        body.icp_rubric = {
+          ...rubric,
+          threshold: !isNaN(t) ? t : rubric.threshold,
+        };
+      } else if (!isNaN(t) && settingsQ.data?.icp_rubric) {
         body.icp_rubric = { ...settingsQ.data.icp_rubric, threshold: t };
       }
       return settingsApi.patch(body);
@@ -562,6 +589,32 @@ function EngineConfigCard() {
           accent="muted"
         />
       </div>
+
+      {/* Target ICP — editable lists of industries / titles / geos / pain points */}
+      <IcpTargetEditor
+        industries={targetIndustries}
+        titles={targetTitles}
+        geographies={targetGeographies}
+        painPoints={targetPainPoints}
+        onChange={(field, v) => {
+          if (field === "industries") setTargetIndustries(v);
+          else if (field === "titles") setTargetTitles(v);
+          else if (field === "geographies") setTargetGeographies(v);
+          else setTargetPainPoints(v);
+          markDirty();
+        }}
+      />
+
+      {/* ICP scoring rubric — editable per-axis tier→score table */}
+      {rubric && (
+        <IcpRubricEditor
+          rubric={rubric}
+          onChange={(next) => {
+            setRubric(next);
+            markDirty();
+          }}
+        />
+      )}
 
       {/* Numerics */}
       <div className="rounded-xl border bg-background p-5">
@@ -744,6 +797,220 @@ function Field({
       <Label className="text-xs">{label}</Label>
       {children}
       {hint && <p className="text-[11px] text-muted-foreground">{hint}</p>}
+    </div>
+  );
+}
+
+type IcpTargetField = "industries" | "titles" | "geographies" | "painPoints";
+
+function IcpTargetEditor({
+  industries,
+  titles,
+  geographies,
+  painPoints,
+  onChange,
+}: {
+  industries: string[];
+  titles: string[];
+  geographies: string[];
+  painPoints: string[];
+  onChange: (field: IcpTargetField, v: string[]) => void;
+}) {
+  const rows: Array<{
+    field: IcpTargetField;
+    label: string;
+    hint: string;
+    values: string[];
+  }> = [
+    {
+      field: "industries",
+      label: "Target industries",
+      hint: "Sectors the engine prioritizes for author lookups",
+      values: industries,
+    },
+    {
+      field: "titles",
+      label: "Target titles",
+      hint: "Job titles the engine matches against in the ICP gate",
+      values: titles,
+    },
+    {
+      field: "geographies",
+      label: "Target geographies",
+      hint: "Regions/countries used by the inline geo gate (drops non-matching authors)",
+      values: geographies,
+    },
+    {
+      field: "painPoints",
+      label: "Target pain points",
+      hint: "Phrases drafted comments may reframe around",
+      values: painPoints,
+    },
+  ];
+  return (
+    <div className="rounded-xl border bg-background p-5 space-y-4">
+      <div>
+        <h3 className="text-sm font-semibold">Target ICP</h3>
+        <p className="text-xs text-muted-foreground">
+          What the engine looks for in an author + their post. Press{" "}
+          <kbd className="rounded border bg-muted px-1 text-[10px]">Enter</kbd>{" "}
+          or <kbd className="rounded border bg-muted px-1 text-[10px]">,</kbd>{" "}
+          to add. Click the × on a chip to remove.
+        </p>
+      </div>
+      <div className="space-y-4">
+        {rows.map((r) => (
+          <div key={r.field} className="space-y-1.5">
+            <div className="flex items-baseline justify-between gap-3">
+              <Label className="text-xs">
+                <span className="font-semibold">{r.label}</span>
+                <span className="ml-2 font-normal text-muted-foreground">
+                  {r.hint}
+                </span>
+              </Label>
+              <span className="text-[11px] tabular-nums text-muted-foreground">
+                {r.values.length}
+              </span>
+            </div>
+            <TagInput
+              value={r.values}
+              onChange={(v) => onChange(r.field, v)}
+              placeholder={`add ${r.label.toLowerCase()} and press Enter`}
+            />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function IcpRubricEditor({
+  rubric,
+  onChange,
+}: {
+  rubric: IcpRubric;
+  onChange: (r: IcpRubric) => void;
+}) {
+  const axes: Array<{ key: keyof IcpRubric; label: string }> = [
+    { key: "title", label: "Title" },
+    { key: "industry", label: "Industry" },
+    { key: "geography", label: "Geography" },
+    { key: "stage", label: "Stage" },
+  ];
+
+  // Helpers — produce a new rubric with the target axis tier mutated. The
+  // page-level dirty flag fires whenever any of these emits onChange.
+  function updateTier(
+    axis: keyof IcpRubric,
+    tierIdx: number,
+    patch: Partial<{ matches: string[]; score: number }>,
+  ) {
+    if (axis === "threshold") return;
+    const next: IcpRubric = JSON.parse(JSON.stringify(rubric));
+    const ax = next[axis] as { tiers: { matches: string[]; score: number }[] };
+    const t = ax.tiers[tierIdx];
+    if (!t) return;
+    if (patch.matches !== undefined) t.matches = patch.matches;
+    if (patch.score !== undefined) t.score = patch.score;
+    onChange(next);
+  }
+  function addTier(axis: keyof IcpRubric) {
+    if (axis === "threshold") return;
+    const next: IcpRubric = JSON.parse(JSON.stringify(rubric));
+    const ax = next[axis] as { tiers: { matches: string[]; score: number }[] };
+    ax.tiers.push({ matches: [], score: 1 });
+    onChange(next);
+  }
+  function removeTier(axis: keyof IcpRubric, tierIdx: number) {
+    if (axis === "threshold") return;
+    const next: IcpRubric = JSON.parse(JSON.stringify(rubric));
+    const ax = next[axis] as { tiers: { matches: string[]; score: number }[] };
+    ax.tiers.splice(tierIdx, 1);
+    onChange(next);
+  }
+
+  return (
+    <div className="rounded-xl border bg-background p-5 space-y-4">
+      <div>
+        <h3 className="text-sm font-semibold">ICP scoring rubric</h3>
+        <p className="text-xs text-muted-foreground">
+          How candidates are scored on each axis. A candidate must clear the
+          threshold (set under Run cadence below) to pass the ICP gate.
+        </p>
+      </div>
+      <div className="space-y-5">
+        {axes.map(({ key, label }) => {
+          const axis = rubric[key] as { tiers: { matches: string[]; score: number }[] };
+          const tiers = axis?.tiers ?? [];
+          return (
+            <div key={key} className="space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  {label}
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  type="button"
+                  onClick={() => addTier(key)}
+                >
+                  + tier
+                </Button>
+              </div>
+              {tiers.length === 0 ? (
+                <p className="text-xs italic text-muted-foreground">
+                  No tiers configured
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {tiers.map((t, i) => (
+                    <div
+                      key={`${String(key)}-${i}`}
+                      className="rounded-lg border bg-muted/20 p-3 space-y-2"
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs text-muted-foreground">
+                            Tier {i + 1} score
+                          </span>
+                          <Input
+                            type="number"
+                            min={0}
+                            max={20}
+                            value={t.score}
+                            onChange={(e) =>
+                              updateTier(key, i, {
+                                score: Number(e.target.value) || 0,
+                              })
+                            }
+                            className="h-7 w-16 text-xs"
+                          />
+                        </div>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          type="button"
+                          className="h-7 text-destructive hover:text-destructive"
+                          onClick={() => removeTier(key, i)}
+                        >
+                          remove
+                        </Button>
+                      </div>
+                      <TagInput
+                        value={t.matches}
+                        onChange={(v) =>
+                          updateTier(key, i, { matches: v })
+                        }
+                        placeholder="add a match phrase and press Enter"
+                      />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

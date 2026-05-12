@@ -182,8 +182,19 @@ async def get_today(
         )
         pipeline = PipelineBreakdownPublic.model_validate(pipeline_raw)
 
+        # While the run is still building, surface drafted-but-not-yet-sealed
+        # candidates too so the operator sees them appear live as the drafter
+        # worker emits each one (streaming pipeline) rather than waiting for
+        # RULE 23 + email at the end. After seal, only the final lineup
+        # (slated / shipped / dropped_by_user) shows — drafted leftovers that
+        # didn't make the seal are filtered out (rule_23 dropped them).
+        slate_status = str(slate.get("status") or "building")
+        if slate_status == "building":
+            visible_statuses = ("slated", "shipped", "dropped_by_user", "drafted")
+        else:
+            visible_statuses = ("slated", "shipped", "dropped_by_user")
         candidates_raw = [
-            c for c in all_for_run if c.get("status") in ("slated", "shipped", "dropped_by_user")
+            c for c in all_for_run if c.get("status") in visible_statuses
         ]
         # Sort in Python — Mongo can't easily order by a nested gate_results
         # path while also grouping by cofounder. Within each cofounder we
@@ -567,3 +578,119 @@ async def run_detail(
         candidates=candidates,
         cofounders=cofounders,
     )
+
+
+class EmailSelectedRequest(BaseModel):
+    candidate_ids: list[str] = Field(min_length=1, max_length=200)
+    to: str | None = None  # default: the operator's own email
+    subject: str | None = None
+
+
+class EmailSelectedResponse(BaseModel):
+    message_id: str
+    count: int
+    to: str
+
+
+def _selected_drafts_html(rows: list[dict[str, Any]], subject: str) -> str:
+    """Render the selected candidates as an inlined-CSS email body."""
+    blocks: list[str] = []
+    for c in rows:
+        icp = ((c.get("gate_results") or {}).get("icp") or {}).get("score_0_10")
+        icp_str = str(icp) if icp is not None else "?"
+        comment_text = (c.get("comment_text") or "(no drafted comment)").strip()
+        post_text = (c.get("post_text") or "")[:600]
+        post_url = c.get("post_url") or "#"
+        ctype = c.get("comment_type") or "?"
+        author = c.get("author_name") or "(unknown author)"
+        # Escape minimal HTML — these are LinkedIn strings, no scripts expected,
+        # but defensive.
+        def esc(s: str) -> str:
+            return (
+                s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            )
+        blocks.append(
+            "<div style=\"margin:0 0 28px 0;padding:16px;border:1px solid #e5e7eb;"
+            "border-radius:12px;font-family:-apple-system,Segoe UI,Roboto,sans-serif;\">"
+            f"<div style=\"font-size:12px;color:#6b7280;margin-bottom:6px;\">"
+            f"Type {esc(ctype)} · ICP {esc(icp_str)} · {esc(author)}</div>"
+            "<div style=\"font-size:13px;color:#111827;margin-bottom:10px;\">"
+            "<strong>Original post</strong><br/>"
+            f"<span style=\"color:#374151;\">{esc(post_text)}</span></div>"
+            "<div style=\"font-size:13px;background:#0b1220;color:#e5e7eb;padding:12px;"
+            f"border-radius:8px;white-space:pre-wrap;\">{esc(comment_text)}</div>"
+            "<div style=\"margin-top:8px;font-size:12px;\">"
+            f"<a href=\"{esc(post_url)}\">Open post on LinkedIn →</a></div>"
+            "</div>"
+        )
+    return (
+        "<html><body style=\"background:#f9fafb;padding:24px;\">"
+        f"<h2 style=\"font-family:-apple-system,Segoe UI,Roboto,sans-serif;\">{subject}</h2>"
+        + "".join(blocks)
+        + "</body></html>"
+    )
+
+
+@router.post(
+    "/runs/{slate_run_id}/email-selected",
+    response_model=EmailSelectedResponse,
+)
+async def email_selected_drafts(
+    slate_run_id: Annotated[str, Path()],
+    payload: EmailSelectedRequest,
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> EmailSelectedResponse:
+    """Email a chosen subset of a run's candidates (original post + drafted
+    comment) to the operator. Defaults `to` to the logged-in operator's email."""
+    if not ObjectId.is_valid(slate_run_id):
+        raise HTTPException(400, "Invalid slate_run_id")
+
+    # Authorize: run must belong to this operator.
+    slate = await db.slate_runs.find_one(
+        {"_id": ObjectId(slate_run_id), "operator_id": user["_id"]},
+        {"_id": 1},
+    )
+    if not slate:
+        raise HTTPException(404, "Run not found")
+
+    # Validate ids + load candidates scoped to operator + this run.
+    cand_oids: list[ObjectId] = []
+    for s in payload.candidate_ids:
+        if ObjectId.is_valid(s):
+            cand_oids.append(ObjectId(s))
+    if not cand_oids:
+        raise HTTPException(400, "No valid candidate ids")
+
+    cursor = db.candidates.find(
+        {
+            "_id": {"$in": cand_oids},
+            "slate_run_id": ObjectId(slate_run_id),
+            "operator_id": user["_id"],
+        }
+    )
+    rows = await cursor.to_list(length=len(cand_oids))
+    if not rows:
+        raise HTTPException(404, "No candidates matched")
+
+    # Preserve the client's id order so the email matches the UI selection order.
+    pos = {oid: i for i, oid in enumerate(cand_oids)}
+    rows.sort(key=lambda r: pos.get(r["_id"], 1_000_000))
+
+    to_addr = (payload.to or user.get("email") or "").strip().lower()
+    if not to_addr:
+        raise HTTPException(400, "No recipient")
+
+    subject = payload.subject or f"Selected slate drafts ({len(rows)} candidates)"
+    html = _selected_drafts_html(rows, subject)
+
+    # Import here so a missing Resend key only fails the route, not import time.
+    from app.services.email import send_email, EmailNotConfigured
+    try:
+        msg_id = send_email(to=to_addr, subject=subject, html=html)
+    except EmailNotConfigured as err:
+        raise HTTPException(503, f"Email not configured: {err}")
+    except Exception as err:  # noqa: BLE001 — Resend raises a variety
+        raise HTTPException(502, f"Email send failed: {err}")
+
+    return EmailSelectedResponse(message_id=msg_id, count=len(rows), to=to_addr)

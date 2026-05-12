@@ -15,7 +15,10 @@ Each stage emits an audit_record. Force-aborts halt the pipeline immediately.
 from __future__ import annotations
 
 import logging
-from datetime import date as date_type, datetime, time, timezone
+import threading
+import time as _time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date as date_type, datetime, time, timedelta, timezone
 from typing import Any
 
 from billiard.exceptions import SoftTimeLimitExceeded
@@ -133,149 +136,21 @@ def run_for_operator(db: Database, operator_id: ObjectId) -> dict[str, Any]:
     log.info("┌── daily_run start  operator=%s  slate=%s", operator_id, slate_run_id)
 
     try:
-        # 1-3. Discovery → verification → gates (cheap then expensive), with up to
-        # _MAX_TOP_UP_ROUNDS top-up passes targeting cofounders below their
-        # RULE 23 per-cofounder floor. Each round only fetches/processes for
-        # the deficit cofounders, so cost scales with how short we are, not
-        # how many cofounders the operator has.
-        cof_ids = [cf["_id"] for cf in cofounders]
-        gate_counts = {"non_buyer": 0, "analyst": 0, "icp_low": 0, "post_quality": 0, "passed": 0}
-        verified_total = 0
-
-        for round_num in range(_MAX_TOP_UP_ROUNDS + 1):
-            round_label = "discovery" if round_num == 0 else f"discovery_topup_{round_num}"
-            round_cofounders = (
-                cofounders
-                if round_num == 0
-                else _cofounders_below_floor(
-                    cofounders,
-                    _per_cofounder_passed_counts(db, slate_run_id=slate_run_id, cofounder_ids=cof_ids),
-                )
+        # 1-5. Discovery → verification → gates → allocator → drafter.
+        # In streaming mode (default) all five stages run as concurrent
+        # worker threads: each post flows through verify+gates as soon as
+        # it's discovered, allocator runs in waves of
+        # `pipeline_buffer_min`, and drafter consumes allocated candidates
+        # as they're emitted. Legacy mode runs stages strictly
+        # sequentially with up to `_MAX_TOP_UP_ROUNDS` top-up passes.
+        if settings.pipeline_streaming_enabled:
+            _run_streaming_pipeline(
+                db, operator, operator_id, cofounders, slate_run_id
             )
-            if round_num > 0 and not round_cofounders:
-                log.info("│  [topup]       all cofounders meet floor — no top-up needed")
-                break
-            if round_num > 0:
-                short_names = [cf.get("display_name", "?") for cf in round_cofounders]
-                log.info("│  [topup]       round %d for %s", round_num, short_names)
-
-            # 1. Discovery (initial OR top-up for deficit cofounders)
-            t = utcnow()
-            _set_stage(db, slate_run_id, round_label, started_at=t, note="searching LinkedIn")
-            discovered = discovery.discover_for_operator(
-                db,
-                operator=operator,
-                cofounders=round_cofounders,
-                slate_run_id=slate_run_id,
-                crustdata_simulation_ping=(round_num == 0),
+        else:
+            _run_legacy_pipeline(
+                db, operator, operator_id, cofounders, slate_run_id
             )
-            log.info("│  [%-13s] %d candidates  (%.1fs)", round_label, discovered, (utcnow() - t).total_seconds())
-            _audit(db, operator_id, slate_run_id, "stage_complete", round_label, {"count": discovered})
-
-            # 2. Verification (only newly-raw rows)
-            t = utcnow()
-            _set_stage(db, slate_run_id, "verification", started_at=t, total=discovered, note="checking URLs + text")
-            verified, rejected = verification.verify_candidates(
-                db, slate_run_id, operator=operator
-            )
-            verified_total += verified
-            log.info("│  [verify]      %d verified, %d rejected  (%.1fs)", verified, rejected, (utcnow() - t).total_seconds())
-            _audit(db, operator_id, slate_run_id, "stage_complete", "verification", {"verified": verified, "rejected": rejected, "round": round_num})
-
-            # 2b. CHEAP gates (non_buyer + post_quality) — title-free, drops ~70%
-            t = utcnow()
-            _set_stage(db, slate_run_id, "gates", started_at=t, total=verified, note=f"cheap gates (round {round_num})")
-            cheap_counts = _run_gates(
-                db,
-                slate_run_id=slate_run_id,
-                operator=operator,
-                stage_started_at=t,
-                phase="cheap",
-            )
-            cheap_passed = cheap_counts.get("passed", 0)
-            log.info(
-                "│  [cheap_gates] %d passed / %d (drops: nb=%d q=%d)  (%.1fs)",
-                cheap_passed,
-                verified,
-                cheap_counts.get("non_buyer", 0),
-                cheap_counts.get("post_quality", 0),
-                (utcnow() - t).total_seconds(),
-            )
-            _audit(db, operator_id, slate_run_id, "stage_complete", f"cheap_gates_round_{round_num}", cheap_counts)
-
-            # 2c. EXPENSIVE gates (analyst + icp_scoring) — author fields come from
-            # discovery (e.g. Unipile inline / post payload), not a separate enrich stage.
-            t = utcnow()
-            _set_stage(db, slate_run_id, "gates", started_at=t, total=cheap_passed, note=f"expensive gates (round {round_num})")
-            expensive_counts = _run_gates(
-                db,
-                slate_run_id=slate_run_id,
-                operator=operator,
-                stage_started_at=t,
-                phase="expensive",
-            )
-            log.info(
-                "│  [exp_gates r%d] %d passed / %d (drops: an=%d icp=%d)  (%.1fs)",
-                round_num,
-                expensive_counts.get("passed", 0),
-                cheap_passed,
-                expensive_counts.get("analyst", 0),
-                expensive_counts.get("icp_low", 0),
-                (utcnow() - t).total_seconds(),
-            )
-            _audit(db, operator_id, slate_run_id, "stage_complete", f"expensive_gates_round_{round_num}", expensive_counts)
-
-            # Merge into the cumulative gate_counts for downstream reporting.
-            round_gate_counts = {
-                "non_buyer": cheap_counts.get("non_buyer", 0),
-                "post_quality": cheap_counts.get("post_quality", 0),
-                "analyst": expensive_counts.get("analyst", 0),
-                "icp_low": expensive_counts.get("icp_low", 0),
-                "passed": expensive_counts.get("passed", 0),
-            }
-            for k, v in round_gate_counts.items():
-                gate_counts[k] = gate_counts.get(k, 0) + v
-
-        _audit(db, operator_id, slate_run_id, "stage_complete", "gates", {**gate_counts, "verified_total": verified_total})
-
-        db.slate_runs.update_one(
-            {"_id": slate_run_id},
-            {"$set": {"total_verified": verified_total}},
-        )
-        gated_n = db.candidates.count_documents(
-            {"slate_run_id": slate_run_id, "status": "gate_passed"}
-        )
-        db.slate_runs.update_one(
-            {"_id": slate_run_id},
-            {"$set": {"total_gated": gated_n}},
-        )
-
-        # 4. Allocation
-        t = utcnow()
-        _set_stage(db, slate_run_id, "allocator", started_at=t, note="picking top survivors per cofounder")
-        per_cf = allocator.allocate(
-            db, operator=operator, cofounders=cofounders, slate_run_id=slate_run_id
-        )
-        allocated_total = sum(v.get("allocated", 0) for v in per_cf.values())
-        log.info("│  [allocator]   %d allocated across %d cofounders  (%.1fs)", allocated_total, len(per_cf), (utcnow() - t).total_seconds())
-        _audit(db, operator_id, slate_run_id, "stage_complete", "allocator", {"summary": per_cf})
-
-        # 5. Drafter + validator + slate-level rebalance
-        t = utcnow()
-        _set_stage(db, slate_run_id, "drafter", started_at=t, total=allocated_total, note="drafting voice-matched comments")
-        drafted_count = _run_drafter(db, slate_run_id=slate_run_id, cofounders=cofounders)
-        log.info("│  [drafter]     %d drafted, validators all pass  (%.1fs)", drafted_count, (utcnow() - t).total_seconds())
-        _audit(db, operator_id, slate_run_id, "stage_complete", "drafter", {"drafted": drafted_count})
-        drafted_in_pipeline = db.candidates.count_documents(
-            {
-                "slate_run_id": slate_run_id,
-                "status": {"$in": ["drafted", "slated", "shipped", "dropped_by_user"]},
-            }
-        )
-        db.slate_runs.update_one(
-            {"_id": slate_run_id},
-            {"$set": {"total_drafted": drafted_in_pipeline}},
-        )
 
         # 6. RULE 23 (optional bypass: settings.skip_rule_23 / SKIP_RULE_23)
         t = utcnow()
@@ -442,21 +317,37 @@ def _cofounders_below_floor(
 
 
 def _evaluate_cheap_gates(
-    c: dict[str, Any], *, product_summary: str
+    c: dict[str, Any],
+    *,
+    product_summary: str,
+    target_industries: list[str],
+    target_titles: list[str],
 ) -> tuple[str, dict[str, Any]]:
-    """Phase A: cheap gates that don't need author title.
+    """Phase A: cheap gates that focus on the author's buyer-vs-competitor fit
+    plus post quality.
 
-    Runs non_buyer first (highest drop rate, ~65%), then post_quality. Both
-    operate on post_text + author_name only — no enrichment data required.
+    non_buyer now reads author_title + author_company + the operator's
+    target_industries / target_titles so it can drop posts from people at
+    competitor vendors (other RCM platforms, EHR vendors, healthcare AI
+    scribes, etc.) and keep posts from authors in the operator's target
+    industries with matching titles. post_quality is unaffected.
 
     verdict ∈ {"non_buyer", "post_quality", "cheap_passed", "error_<gate>"}
     """
     post_text = c.get("post_text") or ""
     author = c.get("author_name")
+    author_title = c.get("author_title")
+    author_company = c.get("author_company")
 
     try:
         nb = non_buyer.evaluate(
-            post_text=post_text, author_name=author, product_summary=product_summary
+            post_text=post_text,
+            author_name=author,
+            author_title=author_title,
+            author_company=author_company,
+            product_summary=product_summary,
+            target_industries=target_industries,
+            target_titles=target_titles,
         )
     except Exception as err:
         return "error_non_buyer", {"err": str(err)}
@@ -602,6 +493,11 @@ def _run_gates(
 
     counts = {"non_buyer": 0, "analyst": 0, "icp_low": 0, "post_quality": 0, "passed": 0}
     product_summary = (operator.get("product_description") or "")[:1500]
+    # Buyer profile drives the strengthened non_buyer gate's "is this a
+    # buyer or a competitor selling to the same buyers" judgement.
+    extracted = operator.get("product_extracted") or {}
+    target_industries = list(extracted.get("target_industries") or [])
+    target_titles = list(extracted.get("target_titles") or [])
     # Per-user rubric overlays the client baseline (RULE 20). On axes the user
     # left blank, the client config's tier list is used.
     cfg = client_config.for_operator(operator)
@@ -639,7 +535,12 @@ def _run_gates(
 
     def _eval(c: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         if phase == "cheap":
-            return _evaluate_cheap_gates(c, product_summary=product_summary)
+            return _evaluate_cheap_gates(
+                c,
+                product_summary=product_summary,
+                target_industries=target_industries,
+                target_titles=target_titles,
+            )
         return _evaluate_expensive_gates(c, rubric=rubric)
 
     processed = 0
@@ -889,6 +790,566 @@ def _run_drafter(
     if redrafted:
         log.info("rebalance: %d candidates redrafted", redrafted)
     return drafted
+
+
+def _run_legacy_pipeline(
+    db: Database,
+    operator: dict[str, Any],
+    operator_id: ObjectId,
+    cofounders: list[dict[str, Any]],
+    slate_run_id: ObjectId,
+) -> None:
+    """Sequential per-stage pipeline (legacy). Each stage waits for the
+    previous one to finish on the entire candidate pool before starting.
+    Includes up to `_MAX_TOP_UP_ROUNDS` discovery + gates top-up passes
+    for cofounders that fall below their RULE 23 per-cofounder floor.
+    """
+    cof_ids = [cf["_id"] for cf in cofounders]
+    gate_counts = {"non_buyer": 0, "analyst": 0, "icp_low": 0, "post_quality": 0, "passed": 0}
+    verified_total = 0
+
+    for round_num in range(_MAX_TOP_UP_ROUNDS + 1):
+        round_label = "discovery" if round_num == 0 else f"discovery_topup_{round_num}"
+        round_cofounders = (
+            cofounders
+            if round_num == 0
+            else _cofounders_below_floor(
+                cofounders,
+                _per_cofounder_passed_counts(db, slate_run_id=slate_run_id, cofounder_ids=cof_ids),
+            )
+        )
+        if round_num > 0 and not round_cofounders:
+            log.info("│  [topup]       all cofounders meet floor — no top-up needed")
+            break
+        if round_num > 0:
+            short_names = [cf.get("display_name", "?") for cf in round_cofounders]
+            log.info("│  [topup]       round %d for %s", round_num, short_names)
+
+        t = utcnow()
+        _set_stage(db, slate_run_id, round_label, started_at=t, note="searching LinkedIn")
+        discovered = discovery.discover_for_operator(
+            db,
+            operator=operator,
+            cofounders=round_cofounders,
+            slate_run_id=slate_run_id,
+            crustdata_simulation_ping=(round_num == 0),
+        )
+        log.info("│  [%-13s] %d candidates  (%.1fs)", round_label, discovered, (utcnow() - t).total_seconds())
+        _audit(db, operator_id, slate_run_id, "stage_complete", round_label, {"count": discovered})
+
+        t = utcnow()
+        _set_stage(db, slate_run_id, "verification", started_at=t, total=discovered, note="checking URLs + text")
+        verified, rejected = verification.verify_candidates(
+            db, slate_run_id, operator=operator
+        )
+        verified_total += verified
+        log.info("│  [verify]      %d verified, %d rejected  (%.1fs)", verified, rejected, (utcnow() - t).total_seconds())
+        _audit(db, operator_id, slate_run_id, "stage_complete", "verification", {"verified": verified, "rejected": rejected, "round": round_num})
+
+        t = utcnow()
+        _set_stage(db, slate_run_id, "gates", started_at=t, total=verified, note=f"cheap gates (round {round_num})")
+        cheap_counts = _run_gates(
+            db,
+            slate_run_id=slate_run_id,
+            operator=operator,
+            stage_started_at=t,
+            phase="cheap",
+        )
+        cheap_passed = cheap_counts.get("passed", 0)
+        log.info(
+            "│  [cheap_gates] %d passed / %d (drops: nb=%d q=%d)  (%.1fs)",
+            cheap_passed,
+            verified,
+            cheap_counts.get("non_buyer", 0),
+            cheap_counts.get("post_quality", 0),
+            (utcnow() - t).total_seconds(),
+        )
+        _audit(db, operator_id, slate_run_id, "stage_complete", f"cheap_gates_round_{round_num}", cheap_counts)
+
+        t = utcnow()
+        _set_stage(db, slate_run_id, "gates", started_at=t, total=cheap_passed, note=f"expensive gates (round {round_num})")
+        expensive_counts = _run_gates(
+            db,
+            slate_run_id=slate_run_id,
+            operator=operator,
+            stage_started_at=t,
+            phase="expensive",
+        )
+        log.info(
+            "│  [exp_gates r%d] %d passed / %d (drops: an=%d icp=%d)  (%.1fs)",
+            round_num,
+            expensive_counts.get("passed", 0),
+            cheap_passed,
+            expensive_counts.get("analyst", 0),
+            expensive_counts.get("icp_low", 0),
+            (utcnow() - t).total_seconds(),
+        )
+        _audit(db, operator_id, slate_run_id, "stage_complete", f"expensive_gates_round_{round_num}", expensive_counts)
+
+        round_gate_counts = {
+            "non_buyer": cheap_counts.get("non_buyer", 0),
+            "post_quality": cheap_counts.get("post_quality", 0),
+            "analyst": expensive_counts.get("analyst", 0),
+            "icp_low": expensive_counts.get("icp_low", 0),
+            "passed": expensive_counts.get("passed", 0),
+        }
+        for k, v in round_gate_counts.items():
+            gate_counts[k] = gate_counts.get(k, 0) + v
+
+    _audit(db, operator_id, slate_run_id, "stage_complete", "gates", {**gate_counts, "verified_total": verified_total})
+
+    db.slate_runs.update_one(
+        {"_id": slate_run_id},
+        {"$set": {"total_verified": verified_total}},
+    )
+    gated_n = db.candidates.count_documents(
+        {"slate_run_id": slate_run_id, "status": "gate_passed"}
+    )
+    db.slate_runs.update_one(
+        {"_id": slate_run_id},
+        {"$set": {"total_gated": gated_n}},
+    )
+
+    t = utcnow()
+    _set_stage(db, slate_run_id, "allocator", started_at=t, note="picking top survivors per cofounder")
+    per_cf = allocator.allocate(
+        db, operator=operator, cofounders=cofounders, slate_run_id=slate_run_id
+    )
+    allocated_total = sum(v.get("allocated", 0) for v in per_cf.values())
+    log.info("│  [allocator]   %d allocated across %d cofounders  (%.1fs)", allocated_total, len(per_cf), (utcnow() - t).total_seconds())
+    _audit(db, operator_id, slate_run_id, "stage_complete", "allocator", {"summary": per_cf})
+
+    t = utcnow()
+    _set_stage(db, slate_run_id, "drafter", started_at=t, total=allocated_total, note="drafting voice-matched comments")
+    drafted_count = _run_drafter(db, slate_run_id=slate_run_id, cofounders=cofounders)
+    log.info("│  [drafter]     %d drafted, validators all pass  (%.1fs)", drafted_count, (utcnow() - t).total_seconds())
+    _audit(db, operator_id, slate_run_id, "stage_complete", "drafter", {"drafted": drafted_count})
+    drafted_in_pipeline = db.candidates.count_documents(
+        {
+            "slate_run_id": slate_run_id,
+            "status": {"$in": ["drafted", "slated", "shipped", "dropped_by_user"]},
+        }
+    )
+    db.slate_runs.update_one(
+        {"_id": slate_run_id},
+        {"$set": {"total_drafted": drafted_in_pipeline}},
+    )
+
+
+# ── Streaming pipeline ────────────────────────────────────────────────────
+#
+# Four worker threads run concurrently. Each candidate moves between
+# stages by mutation of the `status` field on db.candidates — the status
+# field IS the inter-stage queue. Workers poll for their input status,
+# process, write the next status. No external queue/Redis required.
+#
+# Coordination via threading.Event "done" flags:
+#   discovery_done  → set when discovery_thread finishes all sources
+#   process_done    → set when process_thread drains all status=raw
+#   allocator_done  → set when allocator_thread drains all status=gate_passed
+#
+# Each downstream worker exits when (its input queue is empty) AND
+# (the upstream done flag is set). The main orchestrator joins all four
+# and re-raises the first worker exception (if any).
+#
+# Top-up rounds: not supported in v1 streaming. Discovery runs once.
+
+def _process_one(
+    db: Database,
+    candidate_id: ObjectId,
+    *,
+    cutoff: datetime | None,
+    product_summary: str,
+    rubric: dict[str, Any],
+    target_industries: list[str],
+    target_titles: list[str],
+) -> str:
+    """Run verify → cheap_gates → expensive_gates inline on one candidate.
+
+    Returns the terminal status string for logging. Mongo state is
+    updated at each step (verified, cheap_gate_passed, gate_passed) or to
+    a drop state with the appropriate reason. Reused by `_process_thread`.
+    """
+    c = db.candidates.find_one({"_id": candidate_id})
+    if c is None or c.get("status") != "raw":
+        return c.get("status", "missing") if c else "missing"
+
+    if not verification.verify_one(db, c, cutoff=cutoff):
+        return "rejected_url_mismatch"
+
+    c = db.candidates.find_one({"_id": candidate_id})
+    if c is None:
+        return "missing"
+
+    verdict, payload = _evaluate_cheap_gates(
+        c,
+        product_summary=product_summary,
+        target_industries=target_industries,
+        target_titles=target_titles,
+    )
+    if verdict.startswith("error_"):
+        _drop(db, c, f"gate_{verdict}: {payload.get('err')}", gate_results=payload.get("gate_results"))
+        return "gate_dropped"
+    if verdict != "cheap_passed":
+        _drop(db, c, f"{verdict}: {payload.get('reason', '')}", gate_results=payload.get("gate_results"))
+        return "gate_dropped"
+
+    db.candidates.update_one(
+        {"_id": c["_id"]},
+        {"$set": {
+            "status": "cheap_gate_passed",
+            "gate_results": payload["gate_results"],
+            "updated_at": utcnow(),
+        }},
+    )
+    c["status"] = "cheap_gate_passed"
+    c["gate_results"] = payload["gate_results"]
+
+    verdict, payload = _evaluate_expensive_gates(c, rubric=rubric)
+    if verdict.startswith("error_"):
+        _drop(db, c, f"gate_{verdict}: {payload.get('err')}", gate_results=payload.get("gate_results"))
+        return "gate_dropped"
+    if verdict != "passed":
+        _drop(db, c, f"{verdict}: {payload.get('reason', '')}", gate_results=payload.get("gate_results"))
+        return "gate_dropped"
+
+    db.candidates.update_one(
+        {"_id": c["_id"]},
+        {"$set": {
+            "status": "gate_passed",
+            "gate_results": payload["gate_results"],
+            "updated_at": utcnow(),
+        }},
+    )
+    return "gate_passed"
+
+
+def _discovery_thread(
+    db: Database,
+    operator: dict[str, Any],
+    operator_id: ObjectId,
+    cofounders: list[dict[str, Any]],
+    slate_run_id: ObjectId,
+    discovery_done: threading.Event,
+    errors: list[BaseException],
+    errors_lock: threading.Lock,
+) -> None:
+    try:
+        t = utcnow()
+        log.info("│  [stream.discovery] start (concurrent with process/allocator/drafter)")
+        discovered = discovery.discover_for_operator(
+            db,
+            operator=operator,
+            cofounders=cofounders,
+            slate_run_id=slate_run_id,
+            crustdata_simulation_ping=True,
+        )
+        log.info(
+            "│  [stream.discovery] done: %d candidates  (%.1fs)",
+            discovered, (utcnow() - t).total_seconds(),
+        )
+        _audit(db, operator_id, slate_run_id, "stage_complete", "discovery", {"count": discovered})
+    except BaseException as err:
+        log.exception("│  [stream.discovery] failed: %s", err)
+        with errors_lock:
+            errors.append(err)
+    finally:
+        discovery_done.set()
+
+
+def _process_thread(
+    db: Database,
+    operator: dict[str, Any],
+    operator_id: ObjectId,
+    slate_run_id: ObjectId,
+    discovery_done: threading.Event,
+    process_done: threading.Event,
+    errors: list[BaseException],
+    errors_lock: threading.Lock,
+) -> None:
+    """Poll status=raw → run verify+cheap_gates+expensive_gates per candidate
+    using a small thread pool. Exit when discovery_done AND no raw remaining.
+    """
+    try:
+        max_age_days = settings.discovery_max_age_days
+        cutoff: datetime | None = (
+            utcnow() - timedelta(days=max_age_days) if max_age_days > 0 else None
+        )
+        product_summary = (operator.get("product_description") or "")[:1500]
+        extracted = operator.get("product_extracted") or {}
+        target_industries = list(extracted.get("target_industries") or [])
+        target_titles = list(extracted.get("target_titles") or [])
+        cfg = client_config.for_operator(operator)
+        rubric = client_config.merge_icp_rubric(operator.get("icp_rubric"), cfg.icp_rubric)
+
+        batch_size = max(1, int(settings.pipeline_process_batch_size))
+        max_workers = max(1, int(settings.pipeline_process_max_workers))
+        poll_sleep = max(0.05, float(settings.pipeline_poll_interval_seconds))
+        processed_total = 0
+
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="stream.process") as pool:
+            while True:
+                batch_ids = [
+                    c["_id"]
+                    for c in db.candidates.find(
+                        {"slate_run_id": slate_run_id, "status": "raw"},
+                        {"_id": 1},
+                    ).limit(batch_size)
+                ]
+                if not batch_ids:
+                    if discovery_done.is_set():
+                        break
+                    _time.sleep(poll_sleep)
+                    continue
+
+                futures = [
+                    pool.submit(
+                        _process_one,
+                        db,
+                        cid,
+                        cutoff=cutoff,
+                        product_summary=product_summary,
+                        rubric=rubric,
+                        target_industries=target_industries,
+                        target_titles=target_titles,
+                    )
+                    for cid in batch_ids
+                ]
+                for f in futures:
+                    f.result()
+                processed_total += len(batch_ids)
+
+        log.info("│  [stream.process] done: processed=%d", processed_total)
+        _audit(db, operator_id, slate_run_id, "stage_complete", "stream_process", {"processed": processed_total})
+    except BaseException as err:
+        log.exception("│  [stream.process] failed: %s", err)
+        with errors_lock:
+            errors.append(err)
+    finally:
+        process_done.set()
+
+
+def _allocator_thread(
+    db: Database,
+    operator: dict[str, Any],
+    operator_id: ObjectId,
+    cofounders: list[dict[str, Any]],
+    slate_run_id: ObjectId,
+    process_done: threading.Event,
+    allocator_done: threading.Event,
+    errors: list[BaseException],
+    errors_lock: threading.Lock,
+) -> None:
+    """Poll status=gate_passed. Run allocator wave once count >= buffer_min
+    OR upstream done. Each wave is incremental — allocator.allocate() reads
+    existing allocations and only picks the remaining headroom per cofounder.
+    """
+    try:
+        buffer_min = max(1, int(settings.pipeline_buffer_min))
+        poll_sleep = max(0.05, float(settings.pipeline_poll_interval_seconds))
+        wave = 0
+        last_pending_after_wave: int | None = None
+
+        while True:
+            pending = db.candidates.count_documents(
+                {"slate_run_id": slate_run_id, "status": "gate_passed"}
+            )
+            upstream_done = process_done.is_set()
+
+            if pending == 0:
+                if upstream_done:
+                    break
+                _time.sleep(poll_sleep)
+                continue
+
+            if pending < buffer_min and not upstream_done:
+                _time.sleep(poll_sleep)
+                continue
+
+            # Stuck-wave guard: if upstream is finished and the last wave
+            # didn't move the gate_passed count down, all remaining
+            # candidates are un-allocatable (every cofounder hit its
+            # effective_target, or every remaining author was already
+            # claimed by the cross-cofounder cap). Exit to prevent a hot
+            # loop spinning allocate() on candidates no one can take.
+            if upstream_done and last_pending_after_wave == pending:
+                log.info(
+                    "│  [stream.allocator] %d gate_passed candidate(s) un-allocatable — exiting",
+                    pending,
+                )
+                break
+
+            wave += 1
+            log.info(
+                "│  [stream.allocator] wave=%d pending=%d upstream_done=%s",
+                wave, pending, upstream_done,
+            )
+            allocator.allocate(
+                db,
+                operator=operator,
+                cofounders=cofounders,
+                slate_run_id=slate_run_id,
+            )
+            last_pending_after_wave = db.candidates.count_documents(
+                {"slate_run_id": slate_run_id, "status": "gate_passed"}
+            )
+
+        log.info("│  [stream.allocator] done: waves=%d", wave)
+        _audit(db, operator_id, slate_run_id, "stage_complete", "stream_allocator", {"waves": wave})
+    except BaseException as err:
+        log.exception("│  [stream.allocator] failed: %s", err)
+        with errors_lock:
+            errors.append(err)
+    finally:
+        allocator_done.set()
+
+
+def _drafter_thread(
+    db: Database,
+    operator_id: ObjectId,
+    cofounders: list[dict[str, Any]],
+    slate_run_id: ObjectId,
+    allocator_done: threading.Event,
+    errors: list[BaseException],
+    errors_lock: threading.Lock,
+) -> None:
+    """Poll status=allocated → _draft_one (validator-retry loop preserved).
+    Exit when allocator_done AND no allocated left.
+    """
+    try:
+        cofounder_by_id = {cf["_id"]: cf for cf in cofounders}
+        poll_sleep = max(0.05, float(settings.pipeline_poll_interval_seconds))
+        drafted_total = 0
+
+        while True:
+            c = db.candidates.find_one(
+                {"slate_run_id": slate_run_id, "status": "allocated"}
+            )
+            if c is None:
+                if allocator_done.is_set():
+                    break
+                _time.sleep(poll_sleep)
+                continue
+
+            cofounder = cofounder_by_id.get(c["cofounder_id"])
+            if cofounder is None:
+                _drop(db, c, "drafter_no_cofounder")
+                continue
+            if not cofounder.get("voice_profile"):
+                cofounder["voice_profile"] = drafter.DEFAULT_VOICE_PROFILE
+                log.warning(
+                    "drafter: cofounder=%s missing voice_profile — using DEFAULT_VOICE_PROFILE fallback.",
+                    cofounder.get("_id"),
+                )
+
+            if _draft_one(db, c, cofounder):
+                drafted_total += 1
+
+        log.info("│  [stream.drafter] done: drafted=%d", drafted_total)
+        _audit(db, operator_id, slate_run_id, "stage_complete", "stream_drafter", {"drafted": drafted_total})
+    except BaseException as err:
+        log.exception("│  [stream.drafter] failed: %s", err)
+        with errors_lock:
+            errors.append(err)
+
+
+def _run_streaming_pipeline(
+    db: Database,
+    operator: dict[str, Any],
+    operator_id: ObjectId,
+    cofounders: list[dict[str, Any]],
+    slate_run_id: ObjectId,
+) -> None:
+    """Concurrent worker-thread pipeline: discovery + process + allocator
+    + drafter all overlap. See `_discovery_thread` / `_process_thread` /
+    `_allocator_thread` / `_drafter_thread` for per-stage logic.
+    """
+    discovery_done = threading.Event()
+    process_done = threading.Event()
+    allocator_done = threading.Event()
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+
+    t0 = utcnow()
+    _set_stage(
+        db, slate_run_id, "streaming", started_at=t0,
+        note="discovery + process + allocator + drafter concurrent",
+    )
+
+    workers = [
+        threading.Thread(
+            target=_discovery_thread, name="stream.discovery",
+            args=(db, operator, operator_id, cofounders, slate_run_id,
+                  discovery_done, errors, errors_lock),
+        ),
+        threading.Thread(
+            target=_process_thread, name="stream.process",
+            args=(db, operator, operator_id, slate_run_id,
+                  discovery_done, process_done, errors, errors_lock),
+        ),
+        threading.Thread(
+            target=_allocator_thread, name="stream.allocator",
+            args=(db, operator, operator_id, cofounders, slate_run_id,
+                  process_done, allocator_done, errors, errors_lock),
+        ),
+        threading.Thread(
+            target=_drafter_thread, name="stream.drafter",
+            args=(db, operator_id, cofounders, slate_run_id,
+                  allocator_done, errors, errors_lock),
+        ),
+    ]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+
+    if errors:
+        # Re-raise the first error so the outer try/except in
+        # run_for_operator records the abort with the existing handlers
+        # (Rule23ForceAbort, SoftTimeLimitExceeded, generic Exception).
+        raise errors[0]
+
+    # Roll up final totals onto slate_runs (parity with legacy pipeline).
+    discovered_n = db.candidates.count_documents({"slate_run_id": slate_run_id})
+    rejected_n = db.candidates.count_documents({
+        "slate_run_id": slate_run_id,
+        "status": "rejected_url_mismatch",
+    })
+    verified_total = discovered_n - rejected_n
+    gated_n = db.candidates.count_documents({
+        "slate_run_id": slate_run_id,
+        "status": {"$in": ["gate_passed", "allocated", "drafted", "slated", "shipped"]},
+    })
+    db.slate_runs.update_one(
+        {"_id": slate_run_id},
+        {"$set": {
+            "total_verified": verified_total,
+            "total_gated": gated_n,
+            "updated_at": utcnow(),
+        }},
+    )
+
+    # Slate-level reframe rebalancer (same as legacy)
+    redrafted = _rebalance_reframe_overrep(
+        db, slate_run_id=slate_run_id, cofounders=cofounders
+    )
+    if redrafted:
+        log.info("│  [stream.rebalance] %d candidates redrafted", redrafted)
+
+    drafted_in_pipeline = db.candidates.count_documents({
+        "slate_run_id": slate_run_id,
+        "status": {"$in": ["drafted", "slated", "shipped", "dropped_by_user"]},
+    })
+    db.slate_runs.update_one(
+        {"_id": slate_run_id},
+        {"$set": {"total_drafted": drafted_in_pipeline}},
+    )
+
+    log.info(
+        "│  [streaming]   discovered=%d verified=%d gated=%d drafted=%d  (%.1fs)",
+        discovered_n, verified_total, gated_n, drafted_in_pipeline,
+        (utcnow() - t0).total_seconds(),
+    )
 
 
 def _audit(

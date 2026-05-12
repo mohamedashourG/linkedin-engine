@@ -49,9 +49,19 @@ class CommentQuotas(BaseModel):
     F: list[float] = Field(min_length=2, max_length=2)
 
 
+class ProductExtractedPublic(BaseModel):
+    target_industries: list[str] = Field(default_factory=list)
+    target_titles: list[str] = Field(default_factory=list)
+    target_geographies: list[str] = Field(default_factory=list)
+    target_pain_points: list[str] = Field(default_factory=list)
+
+
 class SettingsResponse(BaseModel):
     keywords: KeywordTiers
     icp_rubric: IcpRubric | None = None
+    product_extracted: ProductExtractedPublic = Field(
+        default_factory=ProductExtractedPublic
+    )
     comment_quotas: dict[str, list[float]]
     daily_target: int
     hard_floor: int
@@ -64,6 +74,7 @@ class SettingsResponse(BaseModel):
 class SettingsPatch(BaseModel):
     keywords: KeywordTiers | None = None
     icp_rubric: IcpRubric | None = None
+    product_extracted: ProductExtractedPublic | None = None
     comment_quotas: CommentQuotas | None = None
     daily_target: int | None = Field(default=None, ge=1, le=200)
     hard_floor: int | None = Field(default=None, ge=1, le=200)
@@ -84,6 +95,12 @@ def _to_response(user: dict[str, Any]) -> SettingsResponse:
             tier_3=keywords_raw.get("tier_3") or [],
         ),
         icp_rubric=IcpRubric(**user["icp_rubric"]) if user.get("icp_rubric") else None,
+        product_extracted=ProductExtractedPublic(
+            target_industries=extracted.get("target_industries") or [],
+            target_titles=extracted.get("target_titles") or [],
+            target_geographies=extracted.get("target_geographies") or [],
+            target_pain_points=extracted.get("target_pain_points") or [],
+        ),
         comment_quotas=user.get("comment_quotas") or {},
         daily_target=int(user.get("daily_target") or 30),
         hard_floor=int(user.get("hard_floor") or 20),
@@ -107,11 +124,18 @@ async def update_settings(
 ) -> SettingsResponse:
     update: dict[str, Any] = {"updated_at": utcnow()}
 
-    if payload.keywords is not None:
-        # keywords live inside product_extracted.suggested_keywords
-        product_extracted = (user.get("product_extracted") or {}).copy()
-        product_extracted["suggested_keywords"] = payload.keywords.model_dump()
-        update["product_extracted"] = product_extracted
+    # product_extracted is a nested doc with multiple sub-fields. Merge the
+    # patch fields into the existing doc so a partial update (e.g. keywords
+    # only, or target_titles only) doesn't blow away the others.
+    if payload.keywords is not None or payload.product_extracted is not None:
+        merged_extracted = (user.get("product_extracted") or {}).copy()
+        if payload.keywords is not None:
+            merged_extracted["suggested_keywords"] = payload.keywords.model_dump()
+        if payload.product_extracted is not None:
+            pe = payload.product_extracted.model_dump()
+            for k, v in pe.items():
+                merged_extracted[k] = v
+        update["product_extracted"] = merged_extracted
 
     if payload.icp_rubric is not None:
         update["icp_rubric"] = payload.icp_rubric.model_dump()

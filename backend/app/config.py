@@ -188,6 +188,33 @@ class Settings(BaseSettings):
     # attempts use the primary tier (gpt-5.4) — see drafter.draft_comment.
     drafter_validator_feedback_retries: int = 3
 
+    # ── Streaming pipeline ─────────────────────────────────────────────
+    # When True (default), the daily run uses a streaming orchestrator:
+    # discovery, process (verify+gates), allocator and drafter all run as
+    # concurrent worker threads. Each candidate flows through verify+gates
+    # as soon as discovery emits it, allocator runs in waves once
+    # `pipeline_buffer_min` gate-passed candidates accumulate, and drafter
+    # consumes allocated candidates as soon as a wave finishes. When
+    # False, falls back to the legacy sequential per-stage pipeline.
+    pipeline_streaming_enabled: bool = True
+    # Allocator wave trigger: wait until at least this many candidates
+    # have status="gate_passed" before running an allocator wave. Set to
+    # 1 (default) so each gate-passed candidate flows through allocation
+    # immediately and into the drafter — there's no quality reason to
+    # batch, allocation is just top-N selection + per-author dedup.
+    # Raise this if you want allocator to amortize its bucket re-sort
+    # across many candidates per wave.
+    pipeline_buffer_min: int = 1
+    # How often each worker thread polls Mongo for new work between
+    # process loops (seconds). Tiny values waste CPU on Mongo round-trips;
+    # large values add latency between stages. 1.0s is a good balance.
+    pipeline_poll_interval_seconds: float = 1.0
+    # The process worker (verify + cheap_gates + expensive_gates) fetches
+    # raw candidates this many at a time and processes them concurrently
+    # using a thread pool of size `pipeline_process_max_workers`.
+    pipeline_process_batch_size: int = 10
+    pipeline_process_max_workers: int = 10
+
     # ── Gate relaxation for ICP-qualified candidates ───────────────────
     # When a Unipile candidate cleared the inline rubric's Path A (author
     # title + industry + geo all matched the operator's ICP fields), the

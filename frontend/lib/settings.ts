@@ -12,9 +12,17 @@ export type CommentQuotas = Record<
   number[]
 >;
 
+export type ProductExtracted = {
+  target_industries: string[];
+  target_titles: string[];
+  target_geographies: string[];
+  target_pain_points: string[];
+};
+
 export type SettingsResponse = {
   keywords: KeywordTiers;
   icp_rubric: IcpRubric | null;
+  product_extracted: ProductExtracted;
   comment_quotas: Record<string, number[]>;
   daily_target: number;
   hard_floor: number;
@@ -27,6 +35,7 @@ export type SettingsResponse = {
 export type SettingsPatch = Partial<{
   keywords: KeywordTiers;
   icp_rubric: IcpRubric;
+  product_extracted: ProductExtracted;
   comment_quotas: CommentQuotas;
   daily_target: number;
   hard_floor: number;

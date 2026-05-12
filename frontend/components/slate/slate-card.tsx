@@ -94,12 +94,16 @@ export function SlateCard({
 
   const isShipped = candidate.user_action === "shipped";
   const isDropped = candidate.user_action === "dropped";
+  // Streaming pipeline: drafter emits "drafted" candidates live before
+  // RULE 23 seals the slate. Flag them so the operator knows the comment
+  // is provisional — not yet in the sealed lineup, no email sent yet.
+  const isPreview = candidate.status === "drafted";
 
   return (
     <div
       className={`rounded-xl border bg-background p-5 space-y-4 transition ${
         isShipped ? "border-emerald-200 bg-emerald-50/30" : ""
-      } ${isDropped ? "opacity-50" : ""}`}
+      } ${isPreview ? "border-amber-200 bg-amber-50/30" : ""} ${isDropped ? "opacity-50" : ""}`}
     >
       {/* Header chips */}
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -126,6 +130,11 @@ export function SlateCard({
           <Badge variant="outline" className="rounded-full">
             via {SOURCE_LABELS[candidate.source] ?? candidate.source}
           </Badge>
+          {isPreview && (
+            <Badge variant="warning" className="rounded-full">
+              preview · not sealed yet
+            </Badge>
+          )}
           {isShipped && (
             <Badge variant="success" className="rounded-full">
               <Check className="h-3 w-3" />
