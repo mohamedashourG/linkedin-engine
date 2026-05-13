@@ -2,17 +2,21 @@
 from __future__ import annotations
 
 # How many keywords from each tier we draw on per cofounder per run.
-# Spec defaults: 8/5/0. Higher discovery → more candidates → more survivors
-# after gates → enough drafts to clear the per-cofounder floor.
-DISCOVERY_TIER_1_PER_RUN = 8
+# 0 = no limit (sweep the entire pool, still shuffled). See discovery._rotate.
+# Tier_1 is unlimited on the Unipile keyword path so every high-signal
+# keyword the operator curated gets exercised each run; tier_2 stays capped
+# to keep wall-clock bounded; tier_3 sweeps a small fixed cap (broader
+# phrases that complement tier_1/2 — same funnel as the Exa side).
+DISCOVERY_TIER_1_PER_RUN = 0
 DISCOVERY_TIER_2_PER_RUN = 5
-DISCOVERY_TIER_3_PER_RUN = 0  # tier-3 only used as last-resort fallback
+DISCOVERY_TIER_3_PER_RUN = 4
 
-# Exa: one API call per keyword; broader tier mix than apidirect/unipile so
-# each round retrieves enough raw candidates to survive gates and Rule 23.
-EXA_DISCOVERY_TIER_1_PER_RUN = 12
-EXA_DISCOVERY_TIER_2_PER_RUN = 8
-EXA_DISCOVERY_TIER_3_PER_RUN = 4
+# Exa: one API call per keyword. ALL tiers unlimited — Exa's neural search
+# is the broadest recall vendor and we want to sweep the full pool every
+# run so the long tail of topical phrases gets coverage.
+EXA_DISCOVERY_TIER_1_PER_RUN = 0
+EXA_DISCOVERY_TIER_2_PER_RUN = 0
+EXA_DISCOVERY_TIER_3_PER_RUN = 0
 
 # Pages per keyword search on apidirect (default; overridden by settings.discovery_apidirect_max_pages).
 DISCOVERY_PAGES_PER_KEYWORD = 3

@@ -106,6 +106,8 @@ class EnrichedProfile:
     title: str | None
     employer_name: str | None
     employer_domain: str | None
+    employer_description: str | None
+    employer_linkedin_id: str | None
     headline: str | None
     location: str | None
     num_connections: int | None
@@ -157,12 +159,24 @@ def _parse_one(raw: dict[str, Any]) -> EnrichedProfile:
     first = employers[0] if employers else {}
     domains = first.get("employer_company_website_domain") or []
     domain = domains[0] if isinstance(domains, list) and domains else None
+    # Crustdata person enrichment doesn't return structured company industry —
+    # that lives on the separate /screener/company endpoint. The free signal
+    # we DO get is `employer_linkedin_description` (the company's about-page
+    # blurb) which usually mentions the industry vertical in plain English
+    # ("Mount Sinai is a leading academic medical center..."). Better than
+    # substring-matching the company NAME for industry rubric scoring.
+    emp_desc = first.get("employer_linkedin_description")
+    emp_desc = emp_desc.strip() if isinstance(emp_desc, str) and emp_desc.strip() else None
+    emp_lid = first.get("employer_linkedin_id")
+    emp_lid = emp_lid.strip() if isinstance(emp_lid, str) and emp_lid.strip() else None
     return EnrichedProfile(
         linkedin_url=raw.get("linkedin_flagship_url") or raw.get("linkedin_profile_url") or "",
         name=raw.get("name") or None,
         title=raw.get("title") or first.get("employee_title") or None,
         employer_name=first.get("employer_name"),
         employer_domain=domain,
+        employer_description=emp_desc,
+        employer_linkedin_id=emp_lid,
         headline=raw.get("headline") or None,
         location=raw.get("location") or None,
         num_connections=raw.get("num_of_connections"),

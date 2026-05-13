@@ -410,6 +410,10 @@ _REASON_META: dict[str, dict[str, str]] = {
         "label": "ICP gate error",
         "description": "Exception inside the icp_scoring gate.",
     },
+    "validator_retries_exhausted": {
+        "label": "Validator retries exhausted",
+        "description": "Drafter re-drafted N times with corrective feedback, every attempt still failed the validator. Inspect the drafter_attempts_log on the candidate doc to see which validation rule kept firing.",
+    },
     "other": {
         "label": "Other",
         "description": "Drop reason couldn't be classified into a known bucket — inspect the raw reason text.",
@@ -433,6 +437,7 @@ _REASON_TO_STAGE = {
     "drafter_error": "drafter",
     "drafter_no_cofounder": "drafter",
     "validator": "drafter",
+    "validator_retries_exhausted": "drafter",
     "gate_error_unexpected": "expensive_gates",
 }
 
@@ -594,6 +599,7 @@ async def gate_funnel(
     order = ["inline_geo", "inline_no_profile", "inline_rubric",
              "comments_disabled", "rejected_url_mismatch", "non_buyer", "post_quality",
              "analyst", "icp_low", "drafter_error", "validator",
+             "validator_retries_exhausted",
              "drafter_no_cofounder", "gate_error_unexpected",
              "error_non_buyer", "error_quality", "error_analyst",
              "error_icp", "other"]

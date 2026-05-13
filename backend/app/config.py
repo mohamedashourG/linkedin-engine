@@ -324,6 +324,13 @@ class Settings(BaseSettings):
     cofounder_daily_initial_comment_quota: int = 50
     # Optional APIDirect: fetch per-emoji reaction breakdown on post details.
     apidirect_fetch_reaction_breakdown: bool = False
+    # Optional APIDirect: fetch structured company details (industry, employee
+    # count, description, specialties) via GET /v1/linkedin/company for each
+    # author's current employer when Crustdata returns an employer_linkedin_id.
+    # Cost: $0.006 per matched company; 50 free monthly requests. Failure is
+    # graceful — discovery continues without the extra context. Cached 30d
+    # in apidirect_company_cache so repeat companies cost zero.
+    apidirect_fetch_company_details: bool = True
     # When true, auto-queue reply-backs from reply_drafter (high risk — default off).
     engine_auto_send_public_reply_back: bool = False
 
