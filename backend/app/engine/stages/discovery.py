@@ -208,6 +208,36 @@ def _operator_primary_geography(operator: dict[str, Any]) -> str | None:
     return None
 
 
+def _mark_geo_verified_by_resolver(
+    doc: dict[str, Any],
+    operator: dict[str, Any],
+    enriched_profile: dict[str, Any] | None,
+) -> None:
+    """If the operator targets US AND the candidate has a REAL enriched
+    location string that resolves to US via the geonamescache resolver,
+    mark ``geo_verified_at_source=True`` on the candidate doc. The LLM ICP
+    scoring gate then auto-credits the geography axis at the rubric's top
+    tier instead of re-scoring from rubric (`icp_scoring.evaluate` honors
+    this flag).
+
+    Skip when ``enriched_profile`` has no real location, when the location
+    is a synthesized fallback (e.g. Exa's ``_location_source='exa_default'``),
+    or when the resolver returns anything other than True. Conservative —
+    we only set the flag when we have positive evidence."""
+    if not _operator_targets_us(operator):
+        return
+    if not enriched_profile:
+        return
+    loc_source = (enriched_profile.get("_location_source") or "").strip().lower()
+    if loc_source == "exa_default":
+        return  # synthesized — not real verification
+    loc = (enriched_profile.get("location") or "").strip()
+    if not loc:
+        return
+    if is_us_location(loc) is True:
+        doc["geo_verified_at_source"] = True
+
+
 def _operator_targets_us(operator: dict[str, Any]) -> bool:
     """True iff any of the operator's geography terms (target_geographies or
     rubric.geography.tiers[*].matches) resolves to a US signal.
@@ -2756,6 +2786,10 @@ def _run_apidirect(
                 details=details,
                 enriched_profile=enriched_profile,
             )
+            # Mark `geo_verified_at_source=True` when the resolver confirmed
+            # US — saves the LLM ICP gate from re-scoring geography on a
+            # candidate we already verified deterministically.
+            _mark_geo_verified_by_resolver(ap_doc, operator, enriched_profile)
             db.candidates.insert_one(ap_doc)
             _discovery_record_insert(db, ap_doc)
             inserted += 1
@@ -2914,6 +2948,10 @@ def _run_exa(
                 source_classification=classification,
                 enriched_profile=enriched_profile,
             )
+            # Resolver-based geo verification — skipped when location was
+            # synthesized from `_operator_primary_geography` (see the
+            # `_location_source='exa_default'` guard inside the helper).
+            _mark_geo_verified_by_resolver(exa_doc, operator, enriched_profile)
             db.candidates.insert_one(exa_doc)
             _discovery_record_insert(db, exa_doc)
             inserted += 1
@@ -3329,6 +3367,9 @@ def _run_unipile(
                 enriched_profile=enriched_profile,
                 unipile_rubric=rubric_snapshot,
             )
+            # Resolver verified US geo during inline rubric scoring — mark
+            # so the LLM ICP gate doesn't redundantly re-score geography.
+            _mark_geo_verified_by_resolver(raw_doc, operator, enriched_profile)
             db.candidates.insert_one(raw_doc)
             _discovery_record_insert(db, raw_doc)
             inserted += 1

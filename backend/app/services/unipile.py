@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,33 @@ _TIMEOUT = 30.0
 # Transient 429 from Unipile/LinkedIn — brief exponential backoff then re-raise via _check_resp.
 _UNIPILE_429_MAX_ATTEMPTS = 3
 _UNIPILE_429_BACKOFF_BASE_S = 0.75
+
+# Process-global throttle for `/users/{slug}` profile lookups (the "fallback"
+# path used by Crustdata-miss authors). LinkedIn's automation-detection
+# heuristics flag accounts that hit /users/ in rapid succession from the
+# same session — spacing the calls with jitter mimics human browsing
+# cadence. Only the /users/{slug} resolve path goes through here; high-
+# throughput search/post calls are unaffected.
+_UNIPILE_USERS_MIN_INTERVAL_S = 1.4   # baseline gap between consecutive calls
+_UNIPILE_USERS_JITTER_MAX_S = 0.6     # uniform 0..0.6s noise on top of baseline
+_users_throttle_lock = threading.Lock()
+_users_throttle_last_ts = 0.0
+
+
+def _throttle_users_call() -> None:
+    """Block briefly so consecutive `/users/{slug}` calls space out with
+    human-like cadence. Process-global lock; safe in single-worker mode
+    (the only mode the engine runs in today)."""
+    import random as _rand
+    global _users_throttle_last_ts
+    with _users_throttle_lock:
+        now = time.monotonic()
+        elapsed = now - _users_throttle_last_ts
+        wait = _UNIPILE_USERS_MIN_INTERVAL_S - elapsed
+        wait += _rand.uniform(0, _UNIPILE_USERS_JITTER_MAX_S)
+        if wait > 0:
+            time.sleep(wait)
+        _users_throttle_last_ts = time.monotonic()
 
 
 class UnipileNotConfigured(RuntimeError):
@@ -1027,7 +1055,10 @@ def _resolve_user_provider_id(client: httpx.Client, *, account_id: str, slug: st
     slugs and returns the URN in `provider_id`.
 
     Returns None if the slug can't be resolved (locked profile, etc.).
+    Throttled to ~1.5s+jitter between calls to mimic human cadence and
+    avoid LinkedIn's automation-detection heuristics on /users/.
     """
+    _throttle_users_call()
     try:
         resp = _request_with_429_retry(
             client, "GET", f"/users/{slug}", params={"account_id": account_id}
@@ -1332,7 +1363,12 @@ def find_account_by_name(name: str) -> UnipileAccount | None:
 # ---------------------------------------------------------------- profile lookup
 
 def resolve_profile(*, account_id: str, public_identifier_or_url: str) -> dict[str, Any]:
-    """Resolve a LinkedIn slug or URL to provider_id + member_urn."""
+    """Resolve a LinkedIn slug or URL to provider_id + member_urn.
+
+    Throttled with ~1.5s + 0..0.6s jitter between consecutive calls — this
+    endpoint hits LinkedIn's `/users/{slug}` surface, which LinkedIn's
+    automation-detection heuristics flag if hit too fast from the same
+    session. Spacing mimics human browsing cadence."""
     if settings.unipile_mock:
         slug = public_identifier_or_url.rstrip("/").rsplit("/", 1)[-1]
         return {
@@ -1344,6 +1380,7 @@ def resolve_profile(*, account_id: str, public_identifier_or_url: str) -> dict[s
     slug = public_identifier_or_url
     if "/in/" in slug:
         slug = slug.split("/in/", 1)[1].split("/", 1)[0].split("?", 1)[0]
+    _throttle_users_call()
     with _client() as client:
         resp = _request_with_429_retry(
             client, "GET", f"/users/{slug}", params={"account_id": account_id}
