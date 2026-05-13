@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field, HttpUrl
 
 
 class ProductExtractRequest(BaseModel):
-    free_text: str = Field(min_length=20, max_length=10000)
+    free_text: str = Field(min_length=20, max_length=50000)
 
 
 class ProductExtractResponse(BaseModel):
@@ -13,7 +13,7 @@ class ProductExtractResponse(BaseModel):
 
 
 class ProductSaveRequest(BaseModel):
-    product_description: str = Field(min_length=20, max_length=10000)
+    product_description: str = Field(min_length=20, max_length=50000)
     product_extracted: dict[str, Any]
     icp_rubric: dict[str, Any]
 

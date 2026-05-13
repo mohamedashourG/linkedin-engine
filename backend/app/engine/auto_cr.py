@@ -21,7 +21,8 @@ from app.engine.stages.validator import (
     validate_cr_note,
 )
 from app.models.common import utcnow
-from app.services.openai_client import OpenAINotConfigured, parse_structured_sync
+from app.services.llm import parse_structured_sync
+from app.services.openai_client import OpenAINotConfigured
 from app.services.unipile import (
     UnipileError,
     UnipileNotConfigured,

@@ -282,3 +282,42 @@ async def sync_cofounder_unipile(
         },
     )
     return SyncResponse(attached=True, account_id=account.id)
+
+
+class DisconnectResponse(BaseModel):
+    detached: bool
+    previous_account_id: str | None = None
+
+
+@router.post(
+    "/unipile/disconnect/{cofounder_id}", response_model=DisconnectResponse
+)
+async def disconnect_cofounder_unipile(
+    cofounder_id: Annotated[str, Path()],
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> DisconnectResponse:
+    """Explicit detach: clear the cofounder's `unipile_account_id` so the
+    next Connect attempt can attach a fresh account. The Unipile-side
+    account itself is left intact (we don't delete it from your tenant).
+    """
+    if not ObjectId.is_valid(cofounder_id):
+        raise HTTPException(400, "Invalid id")
+    cf = await db.cofounders.find_one(
+        {"_id": ObjectId(cofounder_id), "operator_id": user["_id"]}
+    )
+    if not cf:
+        raise HTTPException(404, "Cofounder not found")
+
+    prev = cf.get("unipile_account_id")
+    if not prev:
+        return DisconnectResponse(detached=False, previous_account_id=None)
+
+    await db.cofounders.update_one(
+        {"_id": cf["_id"]},
+        {
+            "$unset": {"unipile_account_id": ""},
+            "$set": {"updated_at": utcnow()},
+        },
+    )
+    return DisconnectResponse(detached=True, previous_account_id=prev)

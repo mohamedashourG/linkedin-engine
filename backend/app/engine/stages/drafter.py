@@ -17,7 +17,7 @@ from app.engine.constants import (
     SENTENCE_COUNT_BY_TYPE,
     TYPE_CLOSE_PATTERNS,
 )
-from app.services.openai_client import parse_structured_sync
+from app.services.llm import parse_structured_sync
 
 log = logging.getLogger(__name__)
 

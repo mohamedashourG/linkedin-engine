@@ -1148,7 +1148,6 @@ def _allocator_thread(
         buffer_min = max(1, int(settings.pipeline_buffer_min))
         poll_sleep = max(0.05, float(settings.pipeline_poll_interval_seconds))
         wave = 0
-        last_pending_after_wave: int | None = None
 
         while True:
             pending = db.candidates.count_documents(
@@ -1166,33 +1165,50 @@ def _allocator_thread(
                 _time.sleep(poll_sleep)
                 continue
 
-            # Stuck-wave guard: if upstream is finished and the last wave
-            # didn't move the gate_passed count down, all remaining
-            # candidates are un-allocatable (every cofounder hit its
-            # effective_target, or every remaining author was already
-            # claimed by the cross-cofounder cap). Exit to prevent a hot
-            # loop spinning allocate() on candidates no one can take.
-            if upstream_done and last_pending_after_wave == pending:
-                log.info(
-                    "│  [stream.allocator] %d gate_passed candidate(s) un-allocatable — exiting",
-                    pending,
-                )
-                break
-
             wave += 1
             log.info(
                 "│  [stream.allocator] wave=%d pending=%d upstream_done=%s",
                 wave, pending, upstream_done,
             )
-            allocator.allocate(
+            per_cf = allocator.allocate(
                 db,
                 operator=operator,
                 cofounders=cofounders,
                 slate_run_id=slate_run_id,
             )
-            last_pending_after_wave = db.candidates.count_documents(
+
+            # Quota-saturation exit: once every cofounder has reached its
+            # effective_target, no future gate_passed candidate can ever
+            # be allocated — the per-cofounder cap is hard.
+            if per_cf and all(
+                s.get("allocated", 0) >= s.get("effective_target", 1)
+                for s in per_cf.values()
+            ):
+                log.info(
+                    "│  [stream.allocator] all %d cofounder(s) at effective_target — exiting",
+                    len(per_cf),
+                )
+                break
+
+            # Stuck-wave / author-cap exit: upstream is finished AND this
+            # wave made no progress. The remaining gate_passed candidates
+            # can't be allocated — their authors are already claimed by
+            # the cross-cofounder author cap, or no eligible cofounder
+            # has remaining target capacity. No new candidates will
+            # arrive since process_done is set, so spinning is pointless.
+            pending_after = db.candidates.count_documents(
                 {"slate_run_id": slate_run_id, "status": "gate_passed"}
             )
+            if upstream_done and pending_after == pending:
+                log.info(
+                    "│  [stream.allocator] %d gate_passed un-allocatable (author cap / quota mismatch) — exiting",
+                    pending_after,
+                )
+                break
+
+            # Sleep briefly between waves to avoid tight-loop CPU burn when
+            # the allocator did make progress but more candidates may arrive.
+            _time.sleep(poll_sleep)
 
         log.info("│  [stream.allocator] done: waves=%d", wave)
         _audit(db, operator_id, slate_run_id, "stage_complete", "stream_allocator", {"waves": wave})

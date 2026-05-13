@@ -319,12 +319,15 @@ function CofounderUnipileCard({ cofounder }: { cofounder: Cofounder }) {
   });
 
   const disconnect = useMutation({
-    mutationFn: () =>
-      api.put(`/api/onboarding/cofounders/${cofounder._id}`, {
-        unipile_account_id: null,
-      }),
-    onSuccess: () => {
-      toast.message("Disconnected from Unipile");
+    mutationFn: () => repliesApi.unipileDisconnect(cofounder._id),
+    onSuccess: (res) => {
+      if (res.detached) {
+        toast.success(
+          `Detached ${res.previous_account_id ?? "Unipile account"}. Click Connect LinkedIn to attach a fresh one.`,
+        );
+      } else {
+        toast.message("Nothing was attached.");
+      }
       qc.invalidateQueries({ queryKey: ["cofounders"] });
     },
     onError: (err: ApiError) => toast.error(err.detail),
@@ -454,6 +457,8 @@ function EngineConfigCard() {
   const [runTime, setRunTime] = useState("09:00");
   const [paused, setPaused] = useState(false);
   const [recipients, setRecipients] = useState<string[]>([]);
+  const [companyName, setCompanyName] = useState("");
+  const [productDescription, setProductDescription] = useState("");
   const [targetIndustries, setTargetIndustries] = useState<string[]>([]);
   const [targetTitles, setTargetTitles] = useState<string[]>([]);
   const [targetGeographies, setTargetGeographies] = useState<string[]>([]);
@@ -476,6 +481,8 @@ function EngineConfigCard() {
     setRunTime(data.run_time_local);
     setPaused(data.paused);
     setRecipients(data.slate_recipients ?? []);
+    setCompanyName(data.company_name ?? "");
+    setProductDescription(data.product_description ?? "");
     setTargetIndustries(data.product_extracted?.target_industries ?? []);
     setTargetTitles(data.product_extracted?.target_titles ?? []);
     setTargetGeographies(data.product_extracted?.target_geographies ?? []);
@@ -500,6 +507,8 @@ function EngineConfigCard() {
         run_time_local: runTime,
         paused,
         slate_recipients: recipients,
+        company_name: companyName.trim(),
+        product_description: productDescription,
         product_extracted: {
           target_industries: targetIndustries,
           target_titles: targetTitles,
@@ -526,6 +535,32 @@ function EngineConfigCard() {
     onError: (err: ApiError) => toast.error(err.detail),
   });
 
+  const regenerateIcp = useMutation({
+    mutationFn: () =>
+      settingsApi.regenerateIcp(productDescription.trim() || undefined),
+    onSuccess: (data) => {
+      qc.setQueryData(["settings"], data);
+      // Re-hydrate the in-form state so the UI shows the new extraction
+      // immediately without needing the user to refresh.
+      setTargetIndustries(data.product_extracted?.target_industries ?? []);
+      setTargetTitles(data.product_extracted?.target_titles ?? []);
+      setTargetGeographies(data.product_extracted?.target_geographies ?? []);
+      setTargetPainPoints(data.product_extracted?.target_pain_points ?? []);
+      setTier1(data.keywords?.tier_1 ?? []);
+      setTier2(data.keywords?.tier_2 ?? []);
+      setTier3(data.keywords?.tier_3 ?? []);
+      if (data.icp_rubric) {
+        setRubric(JSON.parse(JSON.stringify(data.icp_rubric)) as IcpRubric);
+        setThreshold(String(data.icp_rubric.threshold ?? 6));
+      }
+      setProductDescription(data.product_description ?? "");
+      setDirty(false);
+      toast.success("ICP re-extracted from your product description");
+    },
+    onError: (err: ApiError) =>
+      toast.error(err.detail || "Failed to regenerate ICP"),
+  });
+
   const togglePaused = useMutation({
     mutationFn: (next: boolean) => settingsApi.patch({ paused: next }),
     onSuccess: (data) => {
@@ -547,6 +582,67 @@ function EngineConfigCard() {
 
   return (
     <div className="space-y-6">
+      {/* Company + product description (drives AI ICP extraction + email subject) */}
+      <div className="rounded-xl border bg-background p-5 space-y-4">
+        <div>
+          <h3 className="text-sm font-semibold">Company &amp; product</h3>
+          <p className="text-xs text-muted-foreground">
+            Company name appears in the slate-email subject (“Today’s
+            comments for &lt;company&gt;”). The product description is
+            what the AI ICP extractor uses to derive industries / titles /
+            keywords — re-run extraction below after you edit it.
+          </p>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-3">
+          <div className="sm:col-span-1">
+            <Label className="text-xs">Company name</Label>
+            <Input
+              value={companyName}
+              maxLength={200}
+              onChange={(e) => {
+                setCompanyName(e.target.value);
+                markDirty();
+              }}
+              placeholder="e.g. glnk"
+              className="mt-1.5"
+            />
+          </div>
+          <div className="sm:col-span-2">
+            <Label className="text-xs">Product description</Label>
+            <Textarea
+              value={productDescription}
+              maxLength={50000}
+              rows={6}
+              onChange={(e) => {
+                setProductDescription(e.target.value);
+                markDirty();
+              }}
+              placeholder="What you sell, who buys it, what pain it solves…"
+              className="mt-1.5 text-sm"
+            />
+            <p className="mt-1 text-[11px] text-muted-foreground tabular-nums">
+              {productDescription.length} / 50000
+            </p>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
+          <p className="text-[11px] text-muted-foreground">
+            “Regenerate ICP” replaces your target industries / titles /
+            geographies / pain points + keyword tiers + scoring rubric
+            with what the AI extracts from the description above.
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            type="button"
+            onClick={() => regenerateIcp.mutate()}
+            disabled={regenerateIcp.isPending || !productDescription.trim()}
+          >
+            {regenerateIcp.isPending ? "Regenerating…" : "Regenerate ICP with AI"}
+          </Button>
+        </div>
+      </div>
+
       {/* Keywords */}
       <div className="rounded-xl border bg-background p-5 space-y-5">
         <div>

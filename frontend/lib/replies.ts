@@ -52,4 +52,8 @@ export const repliesApi = {
     api.post<{ attached: boolean; account_id: string | null }>(
       `/api/replies/unipile/sync/${cofounderId}`,
     ),
+  unipileDisconnect: (cofounderId: string) =>
+    api.post<{ detached: boolean; previous_account_id: string | null }>(
+      `/api/replies/unipile/disconnect/${cofounderId}`,
+    ),
 };

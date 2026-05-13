@@ -62,6 +62,8 @@ class SettingsResponse(BaseModel):
     product_extracted: ProductExtractedPublic = Field(
         default_factory=ProductExtractedPublic
     )
+    company_name: str = ""
+    product_description: str = ""
     comment_quotas: dict[str, list[float]]
     daily_target: int
     hard_floor: int
@@ -75,6 +77,8 @@ class SettingsPatch(BaseModel):
     keywords: KeywordTiers | None = None
     icp_rubric: IcpRubric | None = None
     product_extracted: ProductExtractedPublic | None = None
+    company_name: str | None = Field(default=None, max_length=200)
+    product_description: str | None = Field(default=None, max_length=50000)
     comment_quotas: CommentQuotas | None = None
     daily_target: int | None = Field(default=None, ge=1, le=200)
     hard_floor: int | None = Field(default=None, ge=1, le=200)
@@ -101,6 +105,8 @@ def _to_response(user: dict[str, Any]) -> SettingsResponse:
             target_geographies=extracted.get("target_geographies") or [],
             target_pain_points=extracted.get("target_pain_points") or [],
         ),
+        company_name=user.get("company_name") or "",
+        product_description=user.get("product_description") or "",
         comment_quotas=user.get("comment_quotas") or {},
         daily_target=int(user.get("daily_target") or 30),
         hard_floor=int(user.get("hard_floor") or 20),
@@ -140,6 +146,11 @@ async def update_settings(
     if payload.icp_rubric is not None:
         update["icp_rubric"] = payload.icp_rubric.model_dump()
 
+    if payload.company_name is not None:
+        update["company_name"] = payload.company_name.strip()
+    if payload.product_description is not None:
+        update["product_description"] = payload.product_description.strip()
+
     if payload.comment_quotas is not None:
         update["comment_quotas"] = payload.comment_quotas.model_dump()
 
@@ -174,3 +185,82 @@ async def update_settings(
     if not result:
         raise HTTPException(404, "User not found")
     return _to_response(result)
+
+
+# ── AI ICP regeneration ────────────────────────────────────────────────
+# Lets the operator re-run the AI-driven ICP extractor against either
+# their saved product_description or a fresh free-text blurb. The
+# extractor returns (product_extracted, icp_rubric) which we persist as
+# a single $set. The keyword pool (`product_extracted.suggested_keywords`)
+# is preserved from the previous extraction when the new one doesn't
+# include keywords — protects hand-curated keyword edits.
+
+class RegenerateIcpRequest(BaseModel):
+    free_text: str | None = Field(
+        default=None,
+        max_length=50000,
+        description="Optional new product description to re-extract from. "
+                    "If blank, uses the operator's saved product_description.",
+    )
+
+
+@router.post("/icp/regenerate", response_model=SettingsResponse)
+async def regenerate_icp(
+    payload: RegenerateIcpRequest,
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> SettingsResponse:
+    """Re-run the AI ICP extractor and overwrite product_extracted +
+    icp_rubric on the operator's user doc.
+    """
+    from app.services import icp_extractor
+    from app.services.openai_client import OpenAINotConfigured
+
+    free_text = (payload.free_text or "").strip() or (
+        user.get("product_description") or ""
+    ).strip()
+    if not free_text:
+        raise HTTPException(
+            400,
+            "No product_description on file and no free_text in body. "
+            "Save your product description first or pass `free_text`.",
+        )
+
+    try:
+        result = await icp_extractor.extract(free_text)
+    except OpenAINotConfigured as err:
+        raise HTTPException(503, str(err))
+    except Exception as err:  # noqa: BLE001 — surface as 502 for the UI
+        raise HTTPException(502, f"ICP extraction failed: {err}")
+
+    new_extracted = result.get("product_extracted") or {}
+    new_rubric = result.get("icp_rubric") or None
+
+    # Preserve hand-curated suggested_keywords if the new extraction
+    # didn't return any (extractor sometimes omits the keyword block).
+    prior_extracted = user.get("product_extracted") or {}
+    if not new_extracted.get("suggested_keywords") and prior_extracted.get(
+        "suggested_keywords"
+    ):
+        new_extracted["suggested_keywords"] = prior_extracted["suggested_keywords"]
+
+    # If the operator passed fresh free_text, also persist it as their
+    # new product_description so subsequent regenerate calls are
+    # idempotent without re-pasting.
+    update: dict[str, Any] = {
+        "product_extracted": new_extracted,
+        "updated_at": utcnow(),
+    }
+    if new_rubric is not None:
+        update["icp_rubric"] = new_rubric
+    if payload.free_text is not None and payload.free_text.strip():
+        update["product_description"] = payload.free_text.strip()
+
+    refreshed = await db.users.find_one_and_update(
+        {"_id": user["_id"]},
+        {"$set": update},
+        return_document=True,
+    )
+    if not refreshed:
+        raise HTTPException(404, "User not found")
+    return _to_response(refreshed)

@@ -39,6 +39,11 @@ class UserInDB(BaseModel):
     name: str
     timezone: str
     client_slug: str = "glnk"
+    # Operator-facing company name. Appears in the slate email subject
+    # ("Today's comments for <company>") and the email body header so
+    # multi-tenant recipients can tell at a glance which operator the
+    # slate is for. Empty string = use the generic legacy subject.
+    company_name: str | None = None
     product_description: str | None = None
     product_extracted: dict[str, Any] | None = None
     icp_rubric: dict[str, Any] | None = None

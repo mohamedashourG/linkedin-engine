@@ -93,6 +93,18 @@ def compute_pipeline_breakdown(
 
     discovery_pass = list(candidates)
 
+    # Inline rubric (runs INSIDE discovery — geo + title/industry + post-keyword
+    # tier checks via Path A / Path B). Drops here happen before the candidate
+    # ever reaches verification, so they get their own step.
+    inline_pass: list[dict[str, Any]] = []
+    inline_fail: list[dict[str, Any]] = []
+    for c in candidates:
+        st = c.get("status") or ""
+        if st == "rejected_inline":
+            inline_fail.append(c)
+        else:
+            inline_pass.append(c)
+
     ver_pass: list[dict[str, Any]] = []
     ver_fail: list[dict[str, Any]] = []
     ver_pending: list[dict[str, Any]] = []
@@ -102,6 +114,9 @@ def compute_pipeline_breakdown(
             ver_fail.append(c)
         elif st == "raw" and building:
             ver_pending.append(c)
+        elif st == "rejected_inline":
+            # Stopped before verification ran — don't credit as ver_pass.
+            continue
         else:
             ver_pass.append(c)
 
@@ -178,6 +193,11 @@ def compute_pipeline_breakdown(
         "discovery": _finalize_lists(
             [pipeline_post_ref(c) for c in discovery_pass],
             [],
+            [],
+        ),
+        "inline_rubric": _finalize_lists(
+            [pipeline_post_ref(c) for c in inline_pass],
+            [pipeline_post_ref(c) for c in inline_fail],
             [],
         ),
         "verification": _finalize_lists(
