@@ -1,0 +1,205 @@
+{
+  "_comment": "Cardiowell ICP rubric. Sells remote BP monitoring (managed RPM) into primary care, internal medicine, cardiology, nephrology, FQHCs, ACOs, MSOs, health systems, employer wellness. Three buyer tracks (clinical/operational/finance) across 11 lanes. Threshold=6 of 10. Score axes: title (max 5), industry (max 3), geography (max 2), stage (max 3) = max raw 13 → projected to 0-10.",
+  "title": {
+    "tiers": [
+      {
+        "_lane": "Track A clinical + Track C finance — highest-fit decision-makers",
+        "matches": [
+          "Chief Executive Officer",
+          "CEO",
+          "Chief Operating Officer",
+          "COO",
+          "Chief Financial Officer",
+          "CFO",
+          "Chief Medical Officer",
+          "CMO",
+          "Practice Owner",
+          "Lead Cardiologist",
+          "Cardiologist",
+          "Nephrologist",
+          "Practice Lead",
+          "VP of Revenue Cycle",
+          "VP Revenue Cycle",
+          "VP of Finance",
+          "VP Finance",
+          "VP of Population Health",
+          "Chief Quality Officer",
+          "Chief Administrative Officer",
+          "Medical Group Administrator"
+        ],
+        "score": 5
+      },
+      {
+        "_lane": "Track A clinicians + Track B mid-tier ops + digital health leads",
+        "matches": [
+          "Practice Manager",
+          "Office Administrator",
+          "Director of Operations",
+          "Director of Clinical Operations",
+          "Director of Care Management",
+          "Director Patient Access",
+          "Director of Practice Operations",
+          "Director of Quality",
+          "Director of Remote Patient Monitoring",
+          "Director of Telehealth",
+          "VP of Digital Health",
+          "VP of Clinical Operations",
+          "Chief Medical Information Officer",
+          "CMIO",
+          "VP of Benefits",
+          "Director of Employee Wellness",
+          "Chief People Officer",
+          "Billing Director",
+          "Director of Revenue Cycle Management",
+          "Director RCM",
+          "Chief Nursing Officer",
+          "CNO",
+          "MD",
+          "DO",
+          "PA-C",
+          "Physician Assistant",
+          "Internal Medicine physician",
+          "Family Medicine physician",
+          "Primary Care physician",
+          "Clinical Director"
+        ],
+        "score": 3
+      },
+      {
+        "_lane": "Adjacent practitioners + Lane 9 RPM partner channel",
+        "matches": [
+          "Nurse Practitioner",
+          "NP",
+          "Registered Nurse",
+          "RN",
+          "Nurse Manager",
+          "VP of Partnerships",
+          "VP of Product",
+          "Founding Physician",
+          "Founder",
+          "President"
+        ],
+        "score": 1
+      }
+    ]
+  },
+  "industry": {
+    "tiers": [
+      {
+        "_lane": "Core care-delivery industries — Tracks A and B",
+        "matches": [
+          "Hospitals and Health Care",
+          "Hospital and Health Care",
+          "Health Care Services",
+          "Medical Practice",
+          "Medical Groups",
+          "Medical Group Practice",
+          "Health Systems",
+          "Hospital Network",
+          "Federally Qualified Health Centers",
+          "FQHC",
+          "Community Health Centers",
+          "Cardiology",
+          "Nephrology",
+          "Internal Medicine",
+          "Family Medicine",
+          "Primary Care",
+          "Multi-Specialty Group"
+        ],
+        "score": 3
+      },
+      {
+        "_lane": "VBC + digital health + RPM adjacent",
+        "matches": [
+          "Accountable Care Organization",
+          "ACO",
+          "Management Services Organization",
+          "MSO",
+          "Clinically Integrated Network",
+          "Population Health Management",
+          "Telehealth",
+          "Telemedicine",
+          "Remote Patient Monitoring",
+          "Digital Health",
+          "Healthcare Technology",
+          "Health Insurance"
+        ],
+        "score": 2
+      },
+      {
+        "_lane": "Lane 10 employer wellness + Lane 9 RPM partner channel",
+        "matches": [
+          "Employee Benefits",
+          "Wellness and Fitness Services",
+          "Health Wellness and Fitness",
+          "Insurance"
+        ],
+        "score": 1
+      }
+    ]
+  },
+  "geography": {
+    "tiers": [
+      {
+        "_lane": "Active campaign + priority-expansion states",
+        "matches": [
+          "United States",
+          "US",
+          "USA",
+          "California",
+          "Florida",
+          "Arizona",
+          "Colorado",
+          "Texas",
+          "New York",
+          "Georgia"
+        ],
+        "score": 2
+      }
+    ]
+  },
+  "stage": {
+    "tiers": [
+      {
+        "_lane": "Sweet spot — small/independent practices (Lane 1 sweet spot 3-20 providers)",
+        "matches": [
+          "independent practice",
+          "private practice",
+          "small practice",
+          "medical practice",
+          "physician group",
+          "small medical group"
+        ],
+        "score": 3
+      },
+      {
+        "_lane": "Larger groups + multi-site + specialty groups (Lanes 2, 3, 5, 8)",
+        "matches": [
+          "multi-site practice",
+          "large medical group",
+          "specialty practice",
+          "cardiology group",
+          "nephrology group",
+          "physician network"
+        ],
+        "score": 2
+      },
+      {
+        "_lane": "Enterprise (Lanes 4, 6, 7, 11) — slower to convert but bigger expansion",
+        "matches": [
+          "health system",
+          "hospital network",
+          "FQHC",
+          "community health center",
+          "ACO",
+          "MSO",
+          "clinically integrated network",
+          "MSSP",
+          "self-insured employer"
+        ],
+        "score": 1
+      }
+    ]
+  },
+  "threshold": 6
+}

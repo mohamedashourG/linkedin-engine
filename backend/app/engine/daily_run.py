@@ -1202,9 +1202,17 @@ def _allocator_thread(
                 cofounders=cofounders,
                 slate_run_id=slate_run_id,
             )
-            last_pending_after_wave = db.candidates.count_documents(
+            new_pending = db.candidates.count_documents(
                 {"slate_run_id": slate_run_id, "status": "gate_passed"}
             )
+            # If this wave didn't drain ANY gate_passed (e.g. all remaining
+            # candidates are un-allocatable due to per-author cap or
+            # cofounder-target hit), back off before re-evaluating. Without
+            # this sleep the loop hot-spins ~25,000 waves/sec until upstream
+            # finishes (then the stuck-wave guard above kicks in).
+            if new_pending == pending:
+                _time.sleep(poll_sleep)
+            last_pending_after_wave = new_pending
 
         log.info("│  [stream.allocator] done: waves=%d", wave)
         _audit(db, operator_id, slate_run_id, "stage_complete", "stream_allocator", {"waves": wave})

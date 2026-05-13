@@ -31,9 +31,13 @@ from app.config import settings
 log = logging.getLogger(__name__)
 
 _TIMEOUT = 30.0
-# Transient 429 from Unipile/LinkedIn — brief exponential backoff then re-raise via _check_resp.
-_UNIPILE_429_MAX_ATTEMPTS = 3
-_UNIPILE_429_BACKOFF_BASE_S = 0.75
+# Transient 429 from Unipile/LinkedIn — exponential backoff then re-raise via _check_resp.
+# Bumped base from 0.75s → 4s and attempts from 3 → 5 (max wait
+# 4 + 8 + 16 + 32 = 60s) after Cardiowell run hit a sustained rate-limit
+# window that the previous short backoff couldn't ride out. Unipile's
+# limiter appears to reset on a multi-second window per account.
+_UNIPILE_429_MAX_ATTEMPTS = 5
+_UNIPILE_429_BACKOFF_BASE_S = 4.0
 
 # Process-global throttle for `/users/{slug}` profile lookups (the "fallback"
 # path used by Crustdata-miss authors). LinkedIn's automation-detection
@@ -45,6 +49,17 @@ _UNIPILE_USERS_MIN_INTERVAL_S = 1.4   # baseline gap between consecutive calls
 _UNIPILE_USERS_JITTER_MAX_S = 0.6     # uniform 0..0.6s noise on top of baseline
 _users_throttle_lock = threading.Lock()
 _users_throttle_last_ts = 0.0
+
+# Process-global throttle for `/linkedin/search` (people + content). Unipile
+# rate-limits ~3-4 req/s per account before issuing 429s; the RULE 24 sweep
+# can fire 100+ queries in a single discovery pass. Tightened from 1.2s →
+# 2.0s baseline + 0..0.8s jitter (= ~2.0-2.8s between calls) after the
+# previous account got quota-exhausted mid-run. This keeps cumulative
+# search-call rate around 22-30 req/min, well below any Unipile soft cap.
+_UNIPILE_SEARCH_MIN_INTERVAL_S = 2.0
+_UNIPILE_SEARCH_JITTER_MAX_S = 0.8
+_search_throttle_lock = threading.Lock()
+_search_throttle_last_ts = 0.0
 
 
 def _throttle_users_call() -> None:
@@ -61,6 +76,23 @@ def _throttle_users_call() -> None:
         if wait > 0:
             time.sleep(wait)
         _users_throttle_last_ts = time.monotonic()
+
+
+def _throttle_search_call() -> None:
+    """Block briefly so consecutive `/linkedin/search` calls space out below
+    Unipile's burst rate-limit. Used by people-search (RULE 24) and content
+    search (keyword post search). Process-global lock; safe in single-worker
+    mode."""
+    import random as _rand
+    global _search_throttle_last_ts
+    with _search_throttle_lock:
+        now = time.monotonic()
+        elapsed = now - _search_throttle_last_ts
+        wait = _UNIPILE_SEARCH_MIN_INTERVAL_S - elapsed
+        wait += _rand.uniform(0, _UNIPILE_SEARCH_JITTER_MAX_S)
+        if wait > 0:
+            time.sleep(wait)
+        _search_throttle_last_ts = time.monotonic()
 
 
 class UnipileNotConfigured(RuntimeError):
@@ -491,6 +523,7 @@ def _search_posts_call(
     params: dict[str, Any] = {"account_id": account_id, "limit": limit}
     if cursor is not None and str(cursor).strip():
         params["cursor"] = cursor
+    _throttle_search_call()
     with _client() as client:
         resp = _request_with_429_retry(
             client, "POST", "/linkedin/search", params=params, json=body
@@ -943,6 +976,7 @@ def search_people(
         body["industry"] = list(industry_ids)
     if network_distance_degrees:
         body["network_distance"] = list(network_distance_degrees)
+    _throttle_search_call()
     with _client() as client:
         resp = _request_with_429_retry(
             client,

@@ -8,6 +8,7 @@ from datetime import date, datetime, time, timezone
 from typing import Annotated, Any, Literal
 
 from bson import ObjectId
+from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from pymongo import MongoClient
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -56,6 +57,11 @@ class SlateRunPublic(BaseModel):
     stage_started_at: datetime | None = None
     stage_eta_seconds: int | None = None
     stage_note: str | None = None
+    # Operator-controlled flags. `skip_remaining_discovery=True` tells the
+    # discovery worker to abandon all remaining sources and let downstream
+    # gates/allocator/drafter finish on already-found candidates.
+    skip_remaining_discovery: bool = False
+    skip_remaining_discovery_at: datetime | None = None
 
 
 class PipelinePostRef(BaseModel):
@@ -150,6 +156,8 @@ def _slate_to_public(doc: dict[str, Any]) -> SlateRunPublic:
         stage_started_at=doc.get("stage_started_at"),
         stage_eta_seconds=doc.get("stage_eta_seconds"),
         stage_note=doc.get("stage_note"),
+        skip_remaining_discovery=bool(doc.get("skip_remaining_discovery", False)),
+        skip_remaining_discovery_at=doc.get("skip_remaining_discovery_at"),
     )
 
 
@@ -364,6 +372,46 @@ async def run_now(user: CurrentUser) -> dict[str, str]:
         raise HTTPException(400, "Onboarding not complete")
     result = daily_run_task.delay(str(user["_id"]))
     return {"task_id": result.id, "status": "queued"}
+
+
+@router.post("/runs/{slate_run_id}/skip-discovery")
+async def skip_remaining_discovery(
+    slate_run_id: str,
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> dict[str, Any]:
+    """Flag the in-flight slate to abandon all remaining discovery sources.
+
+    The discovery worker checks this flag at the top of every source and
+    every per-query iteration (within a few seconds). Already-inserted
+    candidates continue flowing through gates → allocator → drafter → seal.
+
+    Idempotent. Returns the current state."""
+    try:
+        run_oid = ObjectId(slate_run_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(400, "Invalid slate_run_id")
+
+    result = await db.slate_runs.find_one_and_update(
+        {"_id": run_oid, "operator_id": user["_id"]},
+        {
+            "$set": {
+                "skip_remaining_discovery": True,
+                "skip_remaining_discovery_at": utcnow(),
+                "updated_at": utcnow(),
+            }
+        },
+        return_document=True,
+    )
+    if not result:
+        raise HTTPException(404, "Slate run not found")
+    return {
+        "slate_run_id": str(run_oid),
+        "skip_remaining_discovery": True,
+        "skip_remaining_discovery_at": result.get("skip_remaining_discovery_at"),
+        "status": result.get("status"),
+        "current_stage": result.get("current_stage"),
+    }
 
 
 # ── Past-runs viewer ─────────────────────────────────────────────────────

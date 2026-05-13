@@ -3,8 +3,8 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { ArrowLeft, ExternalLink, Mail, Send } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ArrowLeft, ExternalLink, FastForward, Mail, Send } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -66,10 +66,27 @@ function pivotSourceStatus(buckets: SourceStatusBucket[]) {
 export default function RunDetailPage() {
   const params = useParams<{ slate_run_id: string }>();
   const slateRunId = params?.slate_run_id ?? "";
+  const queryClient = useQueryClient();
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["slate-run", slateRunId],
     queryFn: () => slateApi.run(slateRunId),
     enabled: !!slateRunId,
+    // Poll while the run is still building so the skip button + progress
+    // bars update in near-real-time.
+    refetchInterval: (q) =>
+      q.state.data?.slate_run.status === "building" ? 3000 : false,
+  });
+
+  const skipDiscoveryMut = useMutation({
+    mutationFn: () => slateApi.skipDiscovery(slateRunId),
+    onSuccess: () => {
+      toast.success(
+        "Skip-discovery flag set. Worker will exit remaining sources within a few seconds; downstream gates and drafter keep running.",
+      );
+      queryClient.invalidateQueries({ queryKey: ["slate-run", slateRunId] });
+    },
+    onError: (err: ApiError) =>
+      toast.error(err?.detail || "Failed to skip discovery"),
   });
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -153,6 +170,12 @@ export default function RunDetailPage() {
           </Badge>
           <span>•</span>
           <span>sealed {fmtDate(data.slate_run.sealed_at)}</span>
+          {data.slate_run.current_stage && (
+            <>
+              <span>•</span>
+              <span>stage: {data.slate_run.current_stage}</span>
+            </>
+          )}
           {data.slate_run.force_abort_reason && (
             <>
               <span>•</span>
@@ -162,6 +185,29 @@ export default function RunDetailPage() {
             </>
           )}
         </div>
+        {data.slate_run.status === "building" && (
+          <div className="mt-3">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => skipDiscoveryMut.mutate()}
+              disabled={
+                skipDiscoveryMut.isPending ||
+                data.slate_run.skip_remaining_discovery === true
+              }
+            >
+              <FastForward className="mr-2 h-3.5 w-3.5" />
+              {data.slate_run.skip_remaining_discovery
+                ? "Discovery skip requested — worker exiting"
+                : "Skip remaining discovery → gates"}
+            </Button>
+            {data.slate_run.skip_remaining_discovery_at && (
+              <span className="ml-2 text-xs text-muted-foreground">
+                requested {fmtDate(data.slate_run.skip_remaining_discovery_at)}
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Funnel summary */}

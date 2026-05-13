@@ -1,0 +1,33 @@
+{
+  "_comment": "Cardiowell per-client drafter overlays. extra_banned_phrases blocks at validation time. anchors / cta_styles surface in the drafter prompt. Locked numbers per § 07 Messaging Anchors; Cardiowell name is allowed in comments (CR notes only when thread invites Angle 3).",
+  "extra_banned_phrases": [
+    "$60-120",
+    "$60 to 120",
+    "schedule a demo",
+    "book a demo",
+    "book a call",
+    "let's chat",
+    "calendly.com",
+    "transform your practice",
+    "revolutionize",
+    "best-in-class",
+    "thought leader"
+  ],
+  "extra_banned_buzzwords": [
+    "best-in-class",
+    "synergy",
+    "paradigm shift",
+    "game-changer",
+    "thought leadership"
+  ],
+  "anchors": [
+    "The between-visit monitoring gap is the structural reason BP goes uncontrolled. Most hypertensive patients are seen 2-3 times a year; everything in between is largely invisible.",
+    "$100-120 per hypertensive patient per month via CPT 99457 and 99458, plus the new 2026 codes 99445 and 99470 that make remote BP reimbursement materially easier to capture.",
+    "Two things kill remote monitoring programs: Bluetooth devices patients cannot pair, and troubleshooting that lands on staff. 4G cellular devices that transmit automatically remove both failure modes.",
+    "Approximately 120 million Americans have hypertension. Only about 24 percent have BP under control. Uncontrolled hypertension costs the US healthcare system about $131 billion per year.",
+    "30 days to fully running. No upfront cost. 20 minutes per patient per month of clinician time. The practice approves enrollment and does a monthly review; Cardiowell handles devices, shipping, onboarding, monitoring, billing support, and auto-generated documentation."
+  ],
+  "cta_styles": ["question", "data_offer"],
+  "never_mention_in_cr": false,
+  "client_name_in_cr_allowed": true
+}

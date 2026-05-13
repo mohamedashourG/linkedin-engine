@@ -110,7 +110,7 @@ def _resolve_industry_ids_for_operator(
     operator_id: ObjectId,
     operator: dict[str, Any],
     account_id: str,
-    max_terms: int = 6,
+    max_terms: int = 25,
     max_ids_per_term: int = 2,
 ) -> list[str]:
     """Resolve the operator's target industries → Unipile/LinkedIn INDUSTRY
@@ -590,6 +590,27 @@ def _discovery_wall_clock_exceeded(t0: float, max_seconds: int) -> bool:
     if max_seconds <= 0:
         return False
     return (time.monotonic() - t0) >= float(max_seconds)
+
+
+def _should_skip_remaining_discovery(
+    db: Database, slate_run_id: ObjectId
+) -> bool:
+    """Return True if the operator (via UI / API) flagged this slate to
+    abandon all remaining discovery sources and let the gates/allocator/
+    drafter finish on what's already been inserted.
+
+    Checked at the top of each major discovery source AND inside each
+    per-query loop, so the operator-side cancellation is responsive within
+    a few seconds. Cheap projection-only Mongo query (one document) — fine
+    to run on every iteration."""
+    try:
+        doc = db.slate_runs.find_one(
+            {"_id": slate_run_id, "skip_remaining_discovery": True},
+            projection={"_id": 1},
+        )
+    except Exception:
+        return False
+    return doc is not None
 
 
 def _seen_post_urls(db: Database, operator_id: ObjectId) -> set[str]:
@@ -2282,6 +2303,14 @@ def discover_for_operator(
         title_search_inserted = 0
         contacts_inserted = 0
 
+        # Skip-remaining-discovery flag check at the top of every source.
+        # When the operator hits "skip discovery" in the UI, we abandon all
+        # remaining sources for THIS cofounder; the gates/allocator/drafter
+        # still process whatever's already been inserted.
+        if _should_skip_remaining_discovery(db, slate_run_id):
+            log.info("│  skip_remaining_discovery flag set — abandoning all sources for cofounder %s", cofounder_id)
+            continue
+
         # ── SOURCE 1 (PRIMARY): RULE 24 title-search PEOPLE channel ───────
         # Promoted to first position — server-side LOCATION + INDUSTRY +
         # network_distance filter at Unipile means every returned candidate
@@ -2636,6 +2665,9 @@ def _run_apidirect(
 
     inserted = 0
     for query, classification in plan:
+        if _should_skip_remaining_discovery(db, slate_run_id):
+            log.info("│  [apidirect]   skip_remaining_discovery flag set — exiting")
+            break
         if _discovery_wall_clock_exceeded(
             t_ap, settings.discovery_wall_clock_cap_seconds_apidirect
         ):
@@ -2820,6 +2852,9 @@ def _run_exa(
 
     inserted = 0
     for query, classification in plan:
+        if _should_skip_remaining_discovery(db, slate_run_id):
+            log.info("│  [exa]         skip_remaining_discovery flag set — exiting")
+            break
         if _discovery_wall_clock_exceeded(
             t_ex, settings.discovery_wall_clock_cap_seconds_exa
         ):
@@ -3022,6 +3057,9 @@ def _run_unipile(
     t_kw = time.monotonic()
     for kind, payload, source, classification in plan:
         assert kind == "kw"
+        if _should_skip_remaining_discovery(db, slate_run_id):
+            log.info("│  [unipile-kw]  skip_remaining_discovery flag set — exiting keyword source")
+            break
         if _discovery_wall_clock_exceeded(
             t_kw, settings.discovery_wall_clock_cap_seconds_unipile_keyword
         ):
@@ -3363,6 +3401,9 @@ def _run_unipile_title_search(
     inserted = 0
     t_ts = time.monotonic()
     for query in plan:
+        if _should_skip_remaining_discovery(db, slate_run_id):
+            log.info("│  [unipile-people] skip_remaining_discovery flag set — exiting title_search")
+            break
         if _discovery_wall_clock_exceeded(
             t_ts, settings.discovery_wall_clock_cap_seconds_unipile_keyword
         ):
@@ -3373,20 +3414,34 @@ def _run_unipile_title_search(
             break
         # Unipile people search enforces US (or UNIPILE_RULE24_LOCATION_IDS) via
         # geoUrn server-side. Appending geo terms to the literal-text query
-        # kills recall; keep seniority hints (they meaningfully bias toward
-        # decision-makers) but strip geo.
-        vendor_q = _compose_discovery_query(query, operator, with_geo=False)
+        # kills recall. Seniority hints are ALSO removed here — the base query
+        # already contains a specific title (e.g. "Lead Cardiologist medical
+        # group"), so concatenating a multi-token seniority tail like
+        # "President Director Chief CMO CFO CEO COO VP" forces LinkedIn to
+        # AND-match all of those, which collapses recall to 0. The curated
+        # title × company_type query is the right signal.
+        vendor_q = _compose_discovery_query(
+            query, operator, with_geo=False, with_seniority=False
+        )
         log.info(
             "│  [unipile-people] query=%r (geo via default geoUrn, not text)",
             vendor_q,
         )
-        # Step 1 — people search (US, 2nd-degree, optional INDUSTRY filter).
+        # Step 1 — people search (US, no degree filter — see network_distance
+        # rationale below, optional INDUSTRY filter).
+        # network_distance_degrees=() drops the degree filter entirely so we
+        # don't cap recall to the cofounder's 2nd-degree network. Important
+        # on accounts whose Unipile source is MESSAGING-only (people-search
+        # already collapses to the local network for those); also lifts the
+        # ceiling for SEARCH-source accounts when the cofounder's network
+        # doesn't overlap the ICP cluster yet.
         try:
             people = search_people(
                 account_id=account_id,
                 query=vendor_q,
                 limit=DISCOVERY_TITLE_SEARCH_PEOPLE_PER_QUERY,
                 industry_ids=industry_ids or None,
+                network_distance_degrees=(),
             )
         except UnipileNotConfigured as err:
             log.warning("discovery: title_search unipile unconfigured: %s", err)

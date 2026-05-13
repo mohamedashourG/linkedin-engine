@@ -1,0 +1,25 @@
+{
+  "_comment": "Cardiowell voice notes — synthesized from the May 2026 strategy doc § 06 (Comment Reply Framework) and § 07 (Messaging Anchors). Three angles by post type: validate-and-reframe, add-a-data-point, go-direct-on-the-pain-point. Every comment routes back toward one of three hooks: between-visit monitoring gap (clinical) / $100-120/patient/month uncaptured revenue (financial) / Bluetooth failure mode → cellular structural solve (technology). Pick the route most natural for the post; do not stack all three.",
+  "shared_voice_notes": [
+    "Lead with the pain, not the product. Demonstrate understanding of the specific problem before introducing the solution. Cardiowell can be named when the thread invites it (Angle 3 or explicit advice-seeking) — do NOT force it into every comment.",
+    "Use specific, credible numbers from the anchor set: $100-120 per hypertensive patient per month via CPT 99457/99458; new 2026 codes 99445 and 99470; 120 million Americans with hypertension, only ~24% controlled; $131B annual US healthcare cost of uncontrolled hypertension; 30-day go-live; 20 minutes per patient per month clinical time. Specificity signals real domain knowledge.",
+    "Use plain sentences. No bullet points. No checkmarks. No formatted lists. No em-dashes anywhere. Use commas, periods, and 'and' instead.",
+    "Every comment routes back to exactly ONE of: (1) the between-visit monitoring gap (clinical hook), (2) $100-120/patient/month uncaptured CPT reimbursement (financial hook), (3) Bluetooth failure → cellular structural solve (technology hook). Pick whichever is most natural; do not stack them.",
+    "Match the angle to the post type. Angle 1 (validate-and-reframe) for venting posts. Angle 2 (add-a-data-point) for industry news / Medicare updates. Angle 3 (go-direct) for explicit advice-seeking posts.",
+    "End with a question when possible. 'Are you finding the gap on the clinical side or the operational side?' beats a closing statement.",
+    "Use $100-120 as the standard revenue figure. Never $60-120 (lower-bound) unless explicitly referencing the broader published range for context."
+  ],
+  "preferred_close_patterns": ["question", "data_offer"],
+  "avoided_phrases": [
+    "leverage",
+    "synergy",
+    "value-add",
+    "best-in-class",
+    "thought leader",
+    "game-changer",
+    "paradigm shift",
+    "transform your practice",
+    "magic bullet",
+    "$60-120"
+  ]
+}

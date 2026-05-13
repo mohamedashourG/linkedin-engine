@@ -34,6 +34,8 @@ export type SlateRun = {
   stage_started_at: string | null;
   stage_eta_seconds: number | null;
   stage_note: string | null;
+  skip_remaining_discovery?: boolean;
+  skip_remaining_discovery_at?: string | null;
 };
 
 export type SlateCofounder = {
@@ -140,6 +142,14 @@ export const slateApi = {
     }),
   runNow: () =>
     api.post<{ task_id: string; status: string }>("/api/slate/run-now"),
+  skipDiscovery: (slateRunId: string) =>
+    api.post<{
+      slate_run_id: string;
+      skip_remaining_discovery: boolean;
+      skip_remaining_discovery_at: string | null;
+      status: string;
+      current_stage: string | null;
+    }>(`/api/slate/runs/${encodeURIComponent(slateRunId)}/skip-discovery`),
   runs: (opts?: { limit?: number; before?: string }) => {
     const qs = new URLSearchParams();
     if (opts?.limit) qs.set("limit", String(opts.limit));

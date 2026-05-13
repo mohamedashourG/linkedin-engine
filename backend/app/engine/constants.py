@@ -4,12 +4,12 @@ from __future__ import annotations
 # How many keywords from each tier we draw on per cofounder per run.
 # 0 = no limit (sweep the entire pool, still shuffled). See discovery._rotate.
 # Tier_1 is unlimited on the Unipile keyword path so every high-signal
-# keyword the operator curated gets exercised each run; tier_2 stays capped
-# to keep wall-clock bounded; tier_3 sweeps a small fixed cap (broader
-# phrases that complement tier_1/2 — same funnel as the Exa side).
+# keyword the operator curated gets exercised each run; tier_2 and tier_3
+# capped at 10 each (per user 2026-05-13) so broader phrases get meaningful
+# rotation but wall-clock stays bounded.
 DISCOVERY_TIER_1_PER_RUN = 0
-DISCOVERY_TIER_2_PER_RUN = 5
-DISCOVERY_TIER_3_PER_RUN = 4
+DISCOVERY_TIER_2_PER_RUN = 10
+DISCOVERY_TIER_3_PER_RUN = 10
 
 # Exa: one API call per keyword. ALL tiers unlimited — Exa's neural search
 # is the broadest recall vendor and we want to sweep the full pool every
@@ -25,12 +25,18 @@ DISCOVERY_PAGES_PER_KEYWORD = 3
 # content search (Unipile). Per cofounder per run; 4 keeps the daily mix
 # (4 topical + 4 title-industry) consistent with the audit. The pool itself
 # (14 queries, 14-day no-repeat) lives in configs/<client>/keyword_pools.json.
-DISCOVERY_TITLE_INDUSTRY_PER_RUN = 4
+# 0 = no limit (sweep entire pool, still shuffled). See discovery._rotate.
+# Lifted to 0 so operators with rich title_industry pools (multi-lane ICPs
+# like Cardiowell — 11 buyer lanes, ~50 curated queries plus the cross-
+# product expander) exercise every angle each run.
+DISCOVERY_TITLE_INDUSTRY_PER_RUN = 0
 
-# RULE 24: title-search PEOPLE channel via Unipile. Audit-locked envelope
-# is 6 queries × 10 candidates × N cofounders per day. Recent-activity walk
-# fetches up to 5 posts per person.
-DISCOVERY_TITLE_SEARCH_QUERIES_PER_RUN = 8
+# RULE 24: title-search PEOPLE channel via Unipile.
+# Queries per run = 0 (no limit) so the full curated title_industry pool
+# AND the cross-product expansion both run each cycle for multi-ICP clients.
+# People per query stays at 25 (Unipile vendor cap). Posts per person walks
+# up to 10 of the person's recent activity.
+DISCOVERY_TITLE_SEARCH_QUERIES_PER_RUN = 0
 DISCOVERY_TITLE_SEARCH_PEOPLE_PER_QUERY = 25
 DISCOVERY_TITLE_SEARCH_POSTS_PER_PERSON = 10
 

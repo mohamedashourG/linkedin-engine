@@ -318,3 +318,92 @@ Right answer depends on Unipile's actual rate limit (we haven't probed it).
 - ✅ Content-type-filter removal: per-query recall jumped ~50×.
 - ✅ Inline drop savings: 633 candidates that would otherwise hit LLM gates
   ≈ $1.50-3 of LLM credits saved.
+
+---
+
+## UI categorization gap: `rejected_inline` is invisible (NEW, 2026-05-13)
+
+### What the user sees
+
+On the `/runs/[id]` pipeline view, the funnel collapses in a confusing way:
+
+- **Verification → pass:** large number (e.g. 287 of 287)
+- **Verification → fail:** tiny
+- **Gates → pass:** 1
+- **Gates → fail:** 31
+- **"Missing" between Verification and Gates:** ~255 candidates with no visible bucket
+
+### What's actually happening
+
+There are TWO filters between Verification and the 4 LLM gates that the UI
+doesn't render:
+
+1. **Inline rubric** runs immediately after Crustdata/Unipile-fallback author
+   enrichment, BEFORE any LLM call. Drops authors whose title/industry/geography
+   rubric score has no qualifying path.
+2. Candidates that fail are stored as `status='rejected_inline'` with
+   `drop_reason='inline_geo: ...'` or `'inline_rubric: T=x I=y G=z post=w → no path'`.
+
+`backend/app/routes/slate_pipeline.py::compute_pipeline_breakdown` then
+categorizes:
+
+- `verification.pass` = everything NOT in `rejected_url_mismatch`
+- `gates.pass/fail/pending` = only statuses in
+  `{gate_passed, allocated, drafted, slated, shipped, dropped_by_user,
+  gate_dropped, verified, cheap_gate_passed}`
+
+`rejected_inline` matches NEITHER — so the inline-rubric drops:
+
+- Inflate `verification.pass` (they SHOULD be a separate stage)
+- Vanish entirely from the gates column
+
+### Concrete example (Cardiowell keyword-only run `e5db6e23`, 2026-05-13)
+
+Of 151 candidates from the first 4 tier_1 keywords:
+
+| Bucket | Count | Status / drop_reason |
+|---|---|---|
+| Inline geo (non-US) | 107 | `rejected_inline` / `inline_geo: geo_not_in_author_location` |
+| Inline rubric T=0 I=0 | 24 | `rejected_inline` / `inline_rubric: T=0 I=0 G=2 post=*` |
+| LLM gates rejected (vendor/competitor) | 17 | `gate_dropped` / `non_buyer: vendor pitch ...` |
+| Reshare | 1 | `rejected_url_mismatch` / `is_repost: ...` |
+| icp_low | 1 | `gate_dropped` / `icp_low: score=4 < 6` |
+| Drafted ✓ | 1 | `drafted` |
+
+The UI shows ver_pass=150, gates_fail=17, gates_pass=1 — leaving the operator
+wondering where 131 candidates went.
+
+### Fix options (deferred per operator decision on 2026-05-13)
+
+Three viable patches, listed by preference:
+
+1. **Add an "Inline rubric" pipeline stage** between Verification and Gates in
+   `compute_pipeline_breakdown` and the frontend pipeline view.
+   `rejected_inline` candidates land in this new bucket.
+2. **Fold `rejected_inline` into verification.fail** with a sub-label. Simpler
+   but loses the geo-vs-rubric split.
+3. **Fold `rejected_inline` into gates.fail** with drop_reason prefix
+   `inline_*`. Mixes pre-gate and post-gate rejections.
+
+Decision: leave as-is for now, document instead. The underlying Mongo state is
+correct; only the UI is misleading.
+
+### Operator quick-check until the UI fix lands
+
+```
+docker exec infra-backend-1 python -c "
+import asyncio
+from motor.motor_asyncio import AsyncIOMotorClient
+from app.config import settings
+from bson import ObjectId
+async def m():
+    c = AsyncIOMotorClient(settings.mongodb_uri); db = c[settings.mongodb_db]
+    sid = ObjectId('<your_slate_id>')
+    n   = await db.candidates.count_documents({'slate_run_id': sid, 'status': 'rejected_inline'})
+    geo = await db.candidates.count_documents({'slate_run_id': sid, 'drop_reason': {'\$regex':'^inline_geo'}})
+    rub = await db.candidates.count_documents({'slate_run_id': sid, 'drop_reason': {'\$regex':'^inline_rubric'}})
+    print(f'rejected_inline total: {n}  (geo={geo}  rubric={rub})')
+    c.close()
+asyncio.run(m())
+"
+```

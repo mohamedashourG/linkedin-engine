@@ -112,6 +112,32 @@ def verify_one(
         )
         return False
 
+    # Drop reshares unconditionally. The pipeline stores the resharer in
+    # `author_name` but the original poster's profile in `author_linkedin_url`
+    # and `post_url` — so a comment generated for the resharer would actually
+    # land under the original author's post, addressed to the wrong person.
+    # On top of that, per-author cap collapses (one resharer touching N posts
+    # generates N candidates with N different author_linkedin_urls), and
+    # personal/sensitive original content (e.g. health updates) leaks through
+    # when only the resharer's industry-fit is checked. Engage with original
+    # posts only.
+    if c.get("is_repost") is True:
+        log.info(
+            "│  [DROP/verify] %s  ←  is_repost (reshare of another author's post)",
+            (c.get("post_url") or "<no-url>")[:90],
+        )
+        db.candidates.update_one(
+            {"_id": c["_id"]},
+            {
+                "$set": {
+                    "status": "rejected_url_mismatch",
+                    "drop_reason": "is_repost: reshare not engaged (would post on original author's content)",
+                    "updated_at": utcnow(),
+                }
+            },
+        )
+        return False
+
     snippet: str = (c.get("post_text") or "").strip()
     url: str = c.get("post_url") or ""
     min_len = (
