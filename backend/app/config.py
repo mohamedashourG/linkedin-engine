@@ -312,6 +312,14 @@ class Settings(BaseSettings):
     # call (~$0.05-0.10 worst case). Validator failure was the worst kind
     # of drop because the candidate had already paid full gate cost.
     drafter_max_attempts: int = 3
+    # Hard cap on candidates that flow through verification per slate run.
+    # Discovery routinely surfaces 3-10k raw posts; running every one
+    # through verification + cheap-gates + expensive-gates would burn ~$30
+    # of LLM cost per run. The cap takes the FIRST N candidates by insert
+    # order, which (given the source-priority sequence: RULE 24 → Unipile
+    # keyword → filter-only → APIDirect → Exa → contact seeds) favors the
+    # highest-precision sources first. Set to 0 to disable the cap.
+    discovery_max_verified_per_run: int = 100
     # When true, auto-queue reply-backs from reply_drafter (high risk — default off).
     engine_auto_send_public_reply_back: bool = False
 

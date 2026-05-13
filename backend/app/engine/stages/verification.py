@@ -86,8 +86,27 @@ def verify_candidates(
     *,
     operator: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
-    """Returns (verified_count, rejected_count) for this slate run."""
-    raw = db.candidates.find({"slate_run_id": slate_run_id, "status": "raw"})
+    """Returns (verified_count, rejected_count) for this slate run.
+
+    Caps the processed batch at ``settings.discovery_max_verified_per_run``
+    (default 100). Discovery routinely surfaces thousands of raw posts;
+    running every one through verification + cheap-gates + expensive-gates
+    is wasteful at the LLM-cost scale. The cap respects insert order, which
+    is roughly source-priority (RULE 24 first → Unipile keyword → APIDirect
+    → Exa → contact seeds), so the highest-precision sources get priority.
+    Set ``DISCOVERY_MAX_VERIFIED_PER_RUN=0`` to disable."""
+    cap = int(settings.discovery_max_verified_per_run or 0)
+    cursor = db.candidates.find(
+        {"slate_run_id": slate_run_id, "status": "raw"}
+    ).sort("_id", 1)
+    if cap > 0:
+        cursor = cursor.limit(cap)
+    raw = list(cursor)
+    if cap > 0:
+        log.info(
+            "verification: capped at %d raw candidates (slate=%s)",
+            cap, slate_run_id,
+        )
     verified, rejected = 0, 0
 
     max_age_days = settings.discovery_max_age_days
