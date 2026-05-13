@@ -11,7 +11,7 @@ import logging
 
 from pydantic import BaseModel, Field
 
-from app.services.openai_client import parse_structured_sync
+from app.services.llm import parse_structured_sync
 
 log = logging.getLogger(__name__)
 

@@ -40,10 +40,16 @@ def render_slate_email(
     for c in slated:
         by_cf.setdefault(c["cofounder_id"], []).append(c)
 
-    subject = f"Your daily LinkedIn slate · {len(slated)} comments"
+    company = (operator.get("company_name") or "").strip()
+    if company:
+        subject = f"Today's comments for {company} · {len(slated)} comments"
+        header_text = f"Today's comments for {escape(company)} · {len(slated)}"
+    else:
+        subject = f"Your daily LinkedIn slate · {len(slated)} comments"
+        header_text = f"Today's slate · {len(slated)} comments"
     html_parts: list[str] = [
         "<html><body style=\"font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 720px; margin: 0 auto; color: #0f172a;\">",
-        f"<h1 style=\"font-size: 22px;\">Today's slate · {len(slated)} comments</h1>",
+        f"<h1 style=\"font-size: 22px;\">{header_text}</h1>",
         f"<p style=\"color:#64748b\">Run for {escape(operator.get('name', ''))}.</p>",
     ]
 
@@ -69,9 +75,48 @@ def render_slate_email(
     return subject, "\n".join(html_parts)
 
 
-def _render_candidate(c: dict[str, Any]) -> str:
+def _source_badge(c: dict[str, Any]) -> str:
+    """Render a small pill that tells the operator whether this comment
+    came from one of their curated contacts vs from the engine's keyword/
+    discovery search. Contact-sourced posts skip the LLM gate funnel —
+    we want that fact visible at a glance.
+
+    A leading non-breaking space (&nbsp;) ensures the author name and the
+    badge are visually separated even if the email client strips CSS
+    (Gmail and Outlook are inconsistent about preserving margin-left on
+    inline-block spans). Without it, the text reads "Schneiderfrom
+    keyword search" — one squished blob.
+    """
+    source = (c.get("source") or "").strip()
+    is_contact = source in ("contact_unipile", "contact_seed")
+    label = "from your contacts" if is_contact else "from keyword search"
+    bg = "#dcfce7" if is_contact else "#e0e7ff"
+    fg = "#166534" if is_contact else "#3730a3"
+    return (
+        "&nbsp;"
+        f"<span style=\"display:inline-block;background:{bg};color:{fg};"
+        f"padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;"
+        f"vertical-align:middle\">"
+        f"{label}</span>"
+    )
+
+
+def _icp_label(c: dict[str, Any]) -> str:
+    """Mirror the today-page logic: prefer the audit's normalized 0-10
+    score, fall back to legacy `total` for pre-RULE-14 slates. Show
+    "spared" when the inline rubric pre-qualified the candidate and the
+    LLM ICP gate was skipped (no numeric score exists for those)."""
     icp = (c.get("gate_results") or {}).get("icp") or {}
-    score = icp.get("total", "?")
+    s = icp.get("score_0_10")
+    if s is None:
+        s = icp.get("total")
+    if s is None:
+        return "spared" if icp.get("spared_inline_icp") else "—"
+    return f"{s}/10"
+
+
+def _render_candidate(c: dict[str, Any]) -> str:
+    score_label = _icp_label(c)
     ctype = c.get("comment_type") or "?"
     author = escape(c.get("author_name") or "Unknown author")
     post_text = escape((c.get("post_text") or "")[:400])
@@ -79,11 +124,12 @@ def _render_candidate(c: dict[str, Any]) -> str:
         post_text += "…"
     comment = escape(c.get("comment_text") or "")
     post_url = escape(c.get("post_url") or "#")
+    source_badge = _source_badge(c)
 
     return (
         "<div style=\"border:1px solid #e2e8f0;border-radius:8px;padding:16px;margin:12px 0\">"
         f"<div style=\"font-size:12px;color:#64748b;margin-bottom:8px\">"
-        f"<strong>Type {ctype}</strong> · ICP {score} · {author}"
+        f"<strong>Type {ctype}</strong> · ICP {score_label} · {author}{source_badge}"
         "</div>"
         f"<div style=\"background:#f8fafc;padding:12px;border-radius:6px;font-size:13px;color:#475569\">"
         f"<div style=\"font-weight:600;margin-bottom:4px;color:#0f172a\">Original post</div>"

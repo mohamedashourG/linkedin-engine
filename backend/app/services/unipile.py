@@ -1299,18 +1299,32 @@ def create_hosted_auth_link(
 
 
 def find_account_by_name(name: str) -> UnipileAccount | None:
-    """Find the most recent account on this tenant whose `name` correlates."""
+    """Find the most recent account on this tenant whose `name` correlates.
+
+    Unipile's hosted-auth flow creates a *new* account on each connect
+    attempt (type:create), so when a cofounder has reconnected after a
+    stale session, the tenant ends up with multiple accounts that share
+    the same `cof_<id>` correlation name. Pick the NEWEST by created_at
+    so reconnect actually replaces the dead one.
+    """
     if settings.unipile_mock:
         return None
     with _client() as client:
         resp = _request_with_429_retry(
-            client, "GET", "/accounts", params={"name": name, "limit": 5}
+            client, "GET", "/accounts", params={"name": name, "limit": 25}
         )
     payload = _check_resp(resp, "find_account_by_name")
     items = payload.get("items") or []
     if not items:
         return None
-    raw = items[0]
+
+    def _created_key(raw: dict[str, Any]) -> str:
+        # Sort lexicographically on ISO-8601 created_at; falls back to "" so
+        # accounts without the field land last.
+        return str(raw.get("created_at") or "")
+
+    items_sorted = sorted(items, key=_created_key, reverse=True)
+    raw = items_sorted[0]
     return UnipileAccount(
         id=str(raw.get("id") or ""),
         name=raw.get("name") or "(unnamed)",

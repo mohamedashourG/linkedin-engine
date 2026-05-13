@@ -23,7 +23,8 @@ from pydantic import BaseModel, Field
 from pymongo.database import Database
 
 from app.models.common import utcnow
-from app.services.openai_client import OpenAINotConfigured, parse_structured_sync
+from app.services.llm import parse_structured_sync
+from app.services.openai_client import OpenAINotConfigured
 
 log = logging.getLogger(__name__)
 

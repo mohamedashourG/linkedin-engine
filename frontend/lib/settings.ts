@@ -23,6 +23,8 @@ export type SettingsResponse = {
   keywords: KeywordTiers;
   icp_rubric: IcpRubric | null;
   product_extracted: ProductExtracted;
+  company_name: string;
+  product_description: string;
   comment_quotas: Record<string, number[]>;
   daily_target: number;
   hard_floor: number;
@@ -36,6 +38,8 @@ export type SettingsPatch = Partial<{
   keywords: KeywordTiers;
   icp_rubric: IcpRubric;
   product_extracted: ProductExtracted;
+  company_name: string;
+  product_description: string;
   comment_quotas: CommentQuotas;
   daily_target: number;
   hard_floor: number;
@@ -48,4 +52,8 @@ export const settingsApi = {
   get: () => api.get<SettingsResponse>("/api/settings/"),
   patch: (body: SettingsPatch) =>
     api.put<SettingsResponse>("/api/settings/", body),
+  regenerateIcp: (free_text?: string) =>
+    api.post<SettingsResponse>("/api/settings/icp/regenerate", {
+      free_text: free_text ?? null,
+    }),
 };

@@ -3547,6 +3547,51 @@ def _contact_seed_post_text(
     ).strip()
 
 
+# Recruiter / "we're hiring" pattern matcher used by the contact-only path.
+# Targets POSTS that announce open jobs (recruiter-shaped) while leaving
+# career-move announcements ("excited to join X as COO") alone. Reasoning
+# behind each branch:
+#   - "we're/we are/i'm hiring" — explicit hiring statement
+#   - "now/is/are hiring" — same, third-person/active voice
+#   - "join our/my/the team|company|crew" — recruiter call-to-action
+#   - "apply now/here/today/via/at" — recruiter call-to-action
+#   - "open/new role|roles|position|opening" — job-listing language
+#   - "hiring <role-shape>" — "hiring a Senior Engineer", "hiring our next AE"
+#   - "send/dm/email me your resume|cv" — recruiter solicitation
+#   - "job posting/opening/opportunity" — explicit job-board language
+#   - "we're growing" — recruiter framing (almost always followed by a role list)
+import re as _re
+
+_HIRING_POST_RE = _re.compile(
+    r"\b(?:"
+    r"(?:we['’]?re|we are|i['’]?m|i am)\s+hiring|"
+    r"now\s+hiring|"
+    r"is\s+hiring|"
+    r"are\s+hiring|"
+    r"join\s+(?:our|my|the)\s+(?:team|company|crew|squad)|"
+    r"apply\s+(?:now|here|today|via|at)|"
+    r"(?:open|new)\s+(?:role|roles|position|positions|opening|openings)|"
+    r"hiring\s+(?:a\s+|an\s+|our\s+|for\s+)?(?:senior|junior|lead|head|director|manager|principal|staff|sr\.?|jr\.?|sdr|ae|account\s+executive|engineer|developer|designer|product|sales|marketing|recruiter|nurse|tech|operations)|"
+    r"(?:send|dm|email)\s+(?:me\s+)?your\s+(?:resume|cv)|"
+    r"job\s+(?:posting|opening|opportunity)|"
+    r"we['’]?re\s+growing"
+    r")\b",
+    _re.IGNORECASE,
+)
+
+
+def _looks_like_hiring_post(text: str) -> bool:
+    """True when the post reads like a recruiter/hiring announcement.
+
+    Career-move posts ("excited to join X as COO", "joined New Jersey
+    Urology as Chief Operating Officer") are NOT flagged — they don't
+    contain the recruiter-call-to-action language the regex targets.
+    """
+    if not text:
+        return False
+    return bool(_HIRING_POST_RE.search(text))
+
+
 def _run_contact_seeds(
     db: Database,
     *,
@@ -3768,6 +3813,7 @@ def _run_contact_seeds_unipile(
     inserted = 0
     too_old_dropped = 0
     quality_dropped = 0
+    hiring_dropped = 0
     posts_per_contact = max(1, int(settings.discovery_contact_unipile_posts_per_user))
 
     # Recency cutoff for the bypass path. Verification's max_age filter is
@@ -3779,6 +3825,11 @@ def _run_contact_seeds_unipile(
     # event announcements, recruiting ads, vague platitudes — content that
     # would survive ICP scoring but produce a weak comment.
     run_quality_gate = bool(settings.discovery_contact_unipile_run_post_quality)
+
+    # Drop "we're hiring / apply here" posts via cheap regex (no LLM cost).
+    # Career-move announcements ("joined X as COO") are kept — the regex
+    # only matches recruiter-shape calls-to-action.
+    drop_hiring = bool(settings.discovery_contact_unipile_drop_hiring_posts)
 
     for seed in seeds:
         linkedin_url = (seed.get("linkedin_url") or "").strip()
@@ -3827,6 +3878,17 @@ def _run_contact_seeds_unipile(
                 if published < cutoff:
                     too_old_dropped += 1
                     continue
+
+            # Hiring-post filter: drop "we're hiring / apply here" content
+            # before the LLM gate runs. Cheap, free, deterministic. Career-
+            # move announcements ("excited to join X as COO") are kept.
+            if drop_hiring and _looks_like_hiring_post(post.text or ""):
+                hiring_dropped += 1
+                log.info(
+                    "discovery: contact_seeds_unipile drop %r — hiring post (recruiter-shape language)",
+                    post.url,
+                )
+                continue
 
             # Post-quality gate (cheap LLM): drops recruiting ads, event
             # announcements, vague platitudes, engagement bait. Skips when
@@ -3905,13 +3967,15 @@ def _run_contact_seeds_unipile(
             inserted += 1
 
     log.info(
-        "discovery: contact_seeds_unipile cofounder=%s contacts=%d inserted=%d too_old_dropped=%d quality_dropped=%d (most gates bypassed, post_quality=%s, max_age=%dd)",
+        "discovery: contact_seeds_unipile cofounder=%s contacts=%d inserted=%d too_old_dropped=%d hiring_dropped=%d quality_dropped=%d (most gates bypassed, post_quality=%s, drop_hiring=%s, max_age=%dd)",
         cofounder_id,
         len(seeds),
         inserted,
         too_old_dropped,
+        hiring_dropped,
         quality_dropped,
         "on" if run_quality_gate else "off",
+        "on" if drop_hiring else "off",
         max_age_days,
     )
     return inserted

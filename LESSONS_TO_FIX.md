@@ -321,7 +321,15 @@ Right answer depends on Unipile's actual rate limit (we haven't probed it).
 
 ---
 
-## UI categorization gap: `rejected_inline` is invisible (NEW, 2026-05-13)
+## UI categorization gap: `rejected_inline` is invisible (NEW, 2026-05-13 — RESOLVED 2026-05-13 in engineer commit 671c412)
+
+> **Update:** the engineer's 2026-05-13 commit "Update dependencies and enhance
+> configuration for Anthropic integration" added an explicit `inline_rubric`
+> step to `compute_pipeline_breakdown` and to `PipelineBreakdownPublic`
+> (backend) + the frontend pipeline view. Status `rejected_inline` is now
+> visible as a dedicated funnel stage between Verification and Gates. The
+> notes below are retained as the historical context behind the fix.
+
 
 ### What the user sees
 

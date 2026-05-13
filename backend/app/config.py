@@ -49,6 +49,46 @@ class Settings(BaseSettings):
     azure_openai_deployment_primary: str = "gpt-5.4"
     azure_openai_deployment_cheap: str = "gpt-4.1"
 
+    # ── Anthropic Claude (preferred for drafting + gates) ─────────────────
+    # Three credential modes, checked in this order by the client:
+    #
+    #   1. Azure AI Foundry — Claude deployed on Azure (most common for us).
+    #      Set AZURE_CLAUDE_API_KEY + AZURE_CLAUDE_ENDPOINT. The client
+    #      points the Anthropic SDK at the Foundry endpoint and injects
+    #      Azure's `api-key` header (instead of Anthropic's `x-api-key`).
+    #
+    #   2. Generic Anthropic-compatible base URL — set ANTHROPIC_BASE_URL
+    #      and ANTHROPIC_AUTH_TOKEN. Useful for self-hosted gateways or
+    #      other clouds (Bedrock proxies, GCP Vertex shim, etc.).
+    #
+    #   3. Direct Anthropic — set ANTHROPIC_API_KEY. Default behavior; no
+    #      base URL override needed.
+    #
+    # Whichever path is configured, the LLM router (services/llm.py) only
+    # sees that *some* Anthropic credential exists and starts routing
+    # `auto`-tier calls to Claude. OpenAI stays wired as the fallback.
+    azure_claude_api_key: str = ""
+    azure_claude_endpoint: str = ""
+
+    anthropic_api_key: str = ""
+    anthropic_base_url: str = ""        # blank → default api.anthropic.com
+    anthropic_auth_token: str = ""      # alternative to api_key for Azure Foundry
+    anthropic_model_primary: str = "claude-opus-4-5-20251101"
+    anthropic_model_cheap: str = "claude-haiku-4-5-20251101"
+
+    # Master switch. When False (default) every LLM call goes to OpenAI /
+    # Azure-OpenAI, regardless of the per-tier LLM_PROVIDER_* knobs or
+    # whether an Anthropic key is configured. Set to True to let the
+    # per-tier knobs route to Claude. Useful as a one-line kill switch
+    # while debugging or while a Claude deployment is being provisioned.
+    llm_use_anthropic: bool = False
+
+    # Per-tier provider routing. Only consulted when llm_use_anthropic
+    # is True. Valid values: "anthropic" | "openai" | "auto". "auto" =
+    # anthropic when a Claude credential is configured, else openai.
+    llm_provider_primary: str = "auto"
+    llm_provider_cheap: str = "auto"
+
     apidirect_api_key: str = ""
     apidirect_mock: bool = False
 
@@ -269,6 +309,13 @@ class Settings(BaseSettings):
     # Default off: contact-only Unipile is operator-curated; pass posts through
     # to drafting without an extra LLM drop step.
     discovery_contact_unipile_run_post_quality: bool = False
+    # Drop hiring/recruiting posts from the contact-only Unipile pull. These
+    # are "we're hiring X — apply here" announcements that a curated contact
+    # might post but the operator doesn't want to engage with (no buyer
+    # signal, just a job board). Career-move/new-hire-announcement posts
+    # ("excited to join X as COO") are KEPT — the filter is narrowly
+    # targeted at recruiter-shaped language. Cheap regex, no LLM cost.
+    discovery_contact_unipile_drop_hiring_posts: bool = True
     # When product_extracted.target_geographies (or ICP geography tiers) is
     # non-empty, drop verified candidates whose post + author text does not
     # mention any geography term (substring match, case-insensitive).

@@ -6,17 +6,60 @@ import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import type { PipelineBreakdown, PipelinePostRef } from "@/lib/slate";
 
-const STEPS: { key: keyof PipelineBreakdown; title: string; hint?: string }[] = [
-  { key: "discovery", title: "Discovery", hint: "Posts pulled from search" },
-  { key: "verification", title: "Verification" },
-  { key: "gates", title: "4-gate filter" },
-  { key: "allocator", title: "Allocation" },
-  { key: "drafter", title: "Drafting" },
-  { key: "rule_23", title: "RULE 23" },
+type StepSpec = {
+  key: keyof PipelineBreakdown;
+  title: string;
+  description: string;
+};
+
+const STEPS: StepSpec[] = [
+  {
+    key: "discovery",
+    title: "Discovery",
+    description:
+      "Posts pulled from Unipile keyword + people search, Crustdata inbox/screener, apidirect, and Exa. Each source feeds the engine in turn until the per-cofounder pool is full.",
+  },
+  {
+    key: "inline_rubric",
+    title: "Inline rubric",
+    description:
+      "Cheap author check that runs inside discovery, before verification. Two paths: Path A scores author title + industry + geography against your ICP fields; Path B counts post-text matches against tier 1/2/3 keywords. Drops anything that fails the geo gate or doesn't clear the threshold on either path.",
+  },
+  {
+    key: "verification",
+    title: "Verification",
+    description:
+      "Per-post freshness check. Drops posts older than the age cutoff, with thin or empty snippets, or where the author disabled comments. Anything that survives gets status=verified and flows to the gates.",
+  },
+  {
+    key: "gates",
+    title: "4-gate filter",
+    description:
+      "Four LLM gates run in sequence: non_buyer (is this person a buyer or a competitor selling INTO the same buyers?), post_quality (worth commenting on?), analyst (analyst-reportage detector), icp_scoring (rubric score must clear your threshold). Inline-ICP-qualified candidates skip non_buyer + icp_scoring.",
+  },
+  {
+    key: "allocator",
+    title: "Allocation",
+    description:
+      "Pick top-N per cofounder by ICP score, with cross-cofounder author dedup (one post per author per slate). Pure selection — no quality drops. Effective target = daily_volume_target × overage multiplier.",
+  },
+  {
+    key: "drafter",
+    title: "Drafting",
+    description:
+      "LLM drafts a voice-matched comment for each allocated candidate, then validates it (banned tokens, sentence count, specificity). On validator failure, retries up to N times with the failure reason fed back into the next attempt.",
+  },
+  {
+    key: "rule_23",
+    title: "RULE 23",
+    description:
+      "Atomic 6-layer seal: per-cofounder floor check, comment-type quotas, reframe diversity, voice consistency, HMAC stamp, audit record. If any layer fails the slate is force-aborted and not delivered.",
+  },
   {
     key: "email_delivery",
     title: "Sending",
-    hint: "Included in the slate email when sent",
+    description:
+      "Sealed slate is emailed to the operator + slate_recipients via Resend. Sealed posts appear under Sending → failed until delivery succeeds.",
   },
 ];
 
@@ -102,7 +145,7 @@ export function PipelineBreakdownView({
         </p>
       </div>
       <div className="divide-y">
-        {STEPS.map(({ key, title, hint }) => {
+        {STEPS.map(({ key, title, description }) => {
           const step = pipeline[key];
           const hasAny =
             step.passed.length > 0 ||
@@ -110,25 +153,27 @@ export function PipelineBreakdownView({
             (step.pending?.length ?? 0) > 0;
           return (
             <details key={key} className="group" open>
-              <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-sm hover:bg-muted/40 [&::-webkit-details-marker]:hidden">
-                <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
-                <span className="font-medium">{title}</span>
-                {hint ? (
-                  <span className="hidden text-xs text-muted-foreground sm:inline">{hint}</span>
-                ) : null}
-                <span className="ml-auto flex flex-wrap items-center justify-end gap-1">
-                  <Badge variant="success" className="rounded-full font-mono text-[10px]">
-                    ok {step.passed_total}
-                  </Badge>
-                  <Badge variant="destructive" className="rounded-full font-mono text-[10px]">
-                    fail {step.failed_total}
-                  </Badge>
-                  {step.pending_total > 0 ? (
-                    <Badge variant="warning" className="rounded-full font-mono text-[10px]">
-                      wait {step.pending_total}
+              <summary className="cursor-pointer list-none px-4 py-2.5 text-sm hover:bg-muted/40 [&::-webkit-details-marker]:hidden">
+                <div className="flex items-center gap-2">
+                  <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+                  <span className="font-medium">{title}</span>
+                  <span className="ml-auto flex flex-wrap items-center justify-end gap-1">
+                    <Badge variant="success" className="rounded-full font-mono text-[10px]">
+                      ok {step.passed_total}
                     </Badge>
-                  ) : null}
-                </span>
+                    <Badge variant="destructive" className="rounded-full font-mono text-[10px]">
+                      fail {step.failed_total}
+                    </Badge>
+                    {step.pending_total > 0 ? (
+                      <Badge variant="warning" className="rounded-full font-mono text-[10px]">
+                        wait {step.pending_total}
+                      </Badge>
+                    ) : null}
+                  </span>
+                </div>
+                <p className="mt-1 ml-6 pr-2 text-xs leading-snug text-muted-foreground">
+                  {description}
+                </p>
               </summary>
               <div className="space-y-3 border-t bg-muted/10 px-4 py-3">
                 {step.truncated ? (

@@ -85,6 +85,7 @@ class PipelineStepBreakdownPublic(BaseModel):
 
 class PipelineBreakdownPublic(BaseModel):
     discovery: PipelineStepBreakdownPublic
+    inline_rubric: PipelineStepBreakdownPublic
     verification: PipelineStepBreakdownPublic
     gates: PipelineStepBreakdownPublic
     allocator: PipelineStepBreakdownPublic
@@ -640,28 +641,56 @@ class EmailSelectedResponse(BaseModel):
     to: str
 
 
+def _icp_label(c: dict[str, Any]) -> str:
+    """ICP label that mirrors the today-page logic.
+
+    Prefer the audit's normalized 0-10 score (RULE 14). Fall back to raw
+    `total` for slates pre-dating the normalization patch. For ICP-spared
+    candidates (inline rubric already qualified them, LLM ICP gate was
+    skipped via gates_icp_scoring_spare_inline_icp) show "spared" since
+    there is no numeric score to display.
+    """
+    icp = (c.get("gate_results") or {}).get("icp") or {}
+    s = icp.get("score_0_10")
+    if s is None:
+        s = icp.get("total")
+    if s is None:
+        return "spared" if icp.get("spared_inline_icp") else "—"
+    return f"{s}/10"
+
+
 def _selected_drafts_html(rows: list[dict[str, Any]], subject: str) -> str:
     """Render the selected candidates as an inlined-CSS email body."""
     blocks: list[str] = []
     for c in rows:
-        icp = ((c.get("gate_results") or {}).get("icp") or {}).get("score_0_10")
-        icp_str = str(icp) if icp is not None else "?"
+        icp_str = _icp_label(c)
         comment_text = (c.get("comment_text") or "(no drafted comment)").strip()
         post_text = (c.get("post_text") or "")[:600]
         post_url = c.get("post_url") or "#"
         ctype = c.get("comment_type") or "?"
         author = c.get("author_name") or "(unknown author)"
+        source = (c.get("source") or "").strip()
+        is_contact = source in ("contact_unipile", "contact_seed")
+        source_label = "from your contacts" if is_contact else "from keyword search"
+        source_bg = "#dcfce7" if is_contact else "#e0e7ff"
+        source_fg = "#166534" if is_contact else "#3730a3"
         # Escape minimal HTML — these are LinkedIn strings, no scripts expected,
         # but defensive.
         def esc(s: str) -> str:
             return (
                 s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             )
+        source_pill = (
+            "&nbsp;"
+            f"<span style=\"display:inline-block;background:{source_bg};color:{source_fg};"
+            f"padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;"
+            f"vertical-align:middle;\">{esc(source_label)}</span>"
+        )
         blocks.append(
             "<div style=\"margin:0 0 28px 0;padding:16px;border:1px solid #e5e7eb;"
             "border-radius:12px;font-family:-apple-system,Segoe UI,Roboto,sans-serif;\">"
             f"<div style=\"font-size:12px;color:#6b7280;margin-bottom:6px;\">"
-            f"Type {esc(ctype)} · ICP {esc(icp_str)} · {esc(author)}</div>"
+            f"Type {esc(ctype)} · ICP {esc(icp_str)} · {esc(author)}{source_pill}</div>"
             "<div style=\"font-size:13px;color:#111827;margin-bottom:10px;\">"
             "<strong>Original post</strong><br/>"
             f"<span style=\"color:#374151;\">{esc(post_text)}</span></div>"
