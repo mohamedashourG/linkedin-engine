@@ -1473,11 +1473,22 @@ def _enrich_via_crustdata(
     )
 
     # De-duplicate the candidate URL set so a popular author who appears in
-    # multiple posts is only enriched once per query.
+    # multiple posts is only enriched once per query. Author URL is sourced
+    # in priority order:
+    #   1. `post.author_profile_url`   (Unipile keyword post payload sets this)
+    #   2. derived: `linkedin.com/in/<slug>` from post URL    (APIDirect / Exa)
+    # The derived form lets APIDirect and Exa results flow through the same
+    # Crustdata-first → Unipile-fallback chain as Unipile keyword.
     unique_urls: dict[str, str] = {}  # url -> slug
     skipped_urn = 0
     for post in posts_pending:
         url = (getattr(post, "author_profile_url", "") or "").strip()
+        if not url:
+            # Synthesize from post URL slug (APIDirect / Exa posts).
+            post_url = (getattr(post, "url", "") or "").strip()
+            derived_slug = _extract_author_slug_from_post_url(post_url)
+            if derived_slug:
+                url = f"https://www.linkedin.com/in/{derived_slug}"
         if not url or url in unique_urls:
             continue
         if not is_likely_person_slug(url):
@@ -2440,6 +2451,119 @@ def discover_for_operator(
     return inserted
 
 
+def _enrich_authors_for_post_batch(
+    db: Database,
+    *,
+    operator_id: ObjectId,
+    posts: list[Any],
+    account_id: str | None,
+    slate_run_id: ObjectId | None,
+    ttl_days: int,
+) -> dict[str, dict[str, Any]]:
+    """Crustdata-first → Unipile-fallback enrichment for a batch of posts.
+
+    Designed for the APIDirect and Exa keyword paths where each post has
+    ``post.url`` (the LinkedIn post URL) but no pre-set ``author_profile_url``.
+    Returns a dict keyed by **post.url** so the caller can look up the
+    enriched profile per post: ``profiles[post.url]`` → dict or absent.
+
+    Three passes, identical semantics to the inline chain in `_run_unipile`:
+
+    1. **Cache** — `unipile_author_cache` by (operator_id, public_identifier).
+       Free.
+    2. **Crustdata batch** — only when ``enrichment_strategy`` permits it
+       (crustdata_first / crustdata_only) and the slug is likely a person.
+       URN-form slugs are skipped (Crustdata's index isn't URN-aware).
+       3 credits per matched profile. Also fires APIDirect company-details
+       enrichment per matched employer (see `_enrich_via_crustdata`).
+    3. **Unipile `/users/{slug}` fallback** — for posts still unenriched
+       after passes 1+2. Slate-wide atomic budget enforced. Skipped under
+       ``crustdata_only``.
+
+    Failures are silent: callers receive an absent key and fall back to
+    "no enriched profile available" — same behavior as the per-post
+    helper `_enrich_via_unipile_slug` it replaces."""
+    if not posts:
+        return {}
+
+    enrichment_strategy = settings.discovery_unipile_enrichment_strategy
+    crustdata_enabled = enrichment_strategy in ("crustdata_first", "crustdata_only")
+    unipile_fallback_allowed = (
+        enrichment_strategy in ("crustdata_first", "unipile_only")
+        and bool(account_id)
+    )
+
+    out: dict[str, dict[str, Any]] = {}
+
+    # --- PASS 1: cache lookup ---
+    pending_for_crustdata: list[Any] = []
+    pending_for_unipile: list[tuple[Any, str]] = []  # (post, slug)
+    for post in posts:
+        post_url = (getattr(post, "url", "") or "").strip()
+        if not post_url:
+            continue
+        slug = _extract_author_slug_from_post_url(post_url)
+        if not slug:
+            continue
+        cached = _lookup_unipile_author_cache(
+            db,
+            operator_id=operator_id,
+            provider_id=None,
+            public_identifier=slug,
+            ttl_days=ttl_days,
+        )
+        if cached is not None:
+            out[post_url] = cached
+            continue
+        pending_for_crustdata.append(post)
+        pending_for_unipile.append((post, slug))
+
+    # --- PASS 2: Crustdata batch ---
+    if crustdata_enabled and pending_for_crustdata:
+        cd_results = _enrich_via_crustdata(
+            db,
+            operator_id=operator_id,
+            posts_pending=pending_for_crustdata,
+        )
+        if cd_results:
+            for post in pending_for_crustdata:
+                post_url = (getattr(post, "url", "") or "").strip()
+                if not post_url or post_url in out:
+                    continue
+                # Find the cd_results entry for this post by its derived URL
+                slug = _extract_author_slug_from_post_url(post_url) or ""
+                if not slug:
+                    continue
+                derived_url = f"https://www.linkedin.com/in/{slug}"
+                # Crustdata may have keyed under either form depending on
+                # whether the post had author_profile_url set or not. Try
+                # both. Reading both is cheap; never falses.
+                prof = cd_results.get(derived_url) or cd_results.get(
+                    getattr(post, "author_profile_url", "") or ""
+                )
+                if prof is not None:
+                    out[post_url] = prof
+
+    # --- PASS 3: Unipile fallback ---
+    if unipile_fallback_allowed:
+        for post, slug in pending_for_unipile:
+            post_url = (getattr(post, "url", "") or "").strip()
+            if not post_url or post_url in out:
+                continue
+            profile, _was_fetched = _get_cached_unipile_author_profile_by_slug(
+                db,
+                operator_id=operator_id,
+                slug=slug,
+                account_id=account_id or "",
+                ttl_days=ttl_days,
+                slate_run_id=slate_run_id,
+            )
+            if profile is not None:
+                out[post_url] = profile
+
+    return out
+
+
 def _enrich_via_unipile_slug(
     db: Database,
     *,
@@ -2533,6 +2657,27 @@ def _run_apidirect(
             log.warning("discovery: apidirect %r failed: %s", vendor_q, err)
             continue
 
+        # Crustdata-first → Unipile-fallback batch enrichment: pre-resolve
+        # every viable post's author profile up front so a popular author
+        # appearing in multiple posts only costs one Crustdata credit, and
+        # Crustdata's API benefits from batching (25 URLs/call).
+        viable_posts = [
+            p for p in posts
+            if p.url and p.url not in seen_urls
+            and not _is_exhausted(db, operator_id, p.url)
+        ]
+        author_profiles: dict[str, dict[str, Any]] = {}
+        if enrich_on and viable_posts:
+            author_profiles = _enrich_authors_for_post_batch(
+                db,
+                operator_id=operator_id,
+                posts=viable_posts,
+                account_id=account_id,
+                slate_run_id=slate_run_id,
+                ttl_days=cache_ttl,
+            )
+            enriched_fetch_count += len(author_profiles)
+
         for post in posts:
             if not post.url or post.url in seen_urls:
                 continue
@@ -2546,21 +2691,7 @@ def _run_apidirect(
                     log.warning("discovery: apidirect halted (post details): %s", err)
                     return inserted
 
-            # Enrich author via Unipile profile fetch using the slug embedded
-            # in the LinkedIn post URL — gives us reliable author_location +
-            # headline so the LLM ICP gate doesn't have to infer from post text.
-            enriched_profile: dict[str, Any] | None = None
-            if enrich_on:
-                enriched_profile, wf = _enrich_via_unipile_slug(
-                    db,
-                    operator_id=operator_id,
-                    post_url=post.url,
-                    account_id=account_id,
-                    ttl_days=cache_ttl,
-                    slate_run_id=slate_run_id,
-                )
-                if wf:
-                    enriched_fetch_count += 1
+            enriched_profile: dict[str, Any] | None = author_profiles.get(post.url)
 
             # Drop posts positively identified as company-authored (LinkedIn
             # /company/ pages, brand-shaped slugs with no human signal, or
@@ -2708,26 +2839,34 @@ def _run_exa(
             log.warning("discovery: exa %r failed: %s", vendor_q, err)
             continue
 
+        # Crustdata-first → Unipile-fallback batch enrichment (same as the
+        # APIDirect path). Resolves all viable authors before the per-post
+        # iteration so a popular author appearing in multiple Exa results
+        # only costs one Crustdata credit per slate.
+        viable_posts = [
+            p for p in posts
+            if p.url and p.url not in seen_urls
+            and not _is_exhausted(db, operator_id, p.url)
+        ]
+        author_profiles: dict[str, dict[str, Any]] = {}
+        if enrich_on and viable_posts:
+            author_profiles = _enrich_authors_for_post_batch(
+                db,
+                operator_id=operator_id,
+                posts=viable_posts,
+                account_id=account_id,
+                slate_run_id=slate_run_id,
+                ttl_days=cache_ttl,
+            )
+            enriched_fetch_count += len(author_profiles)
+
         for post in posts:
             if not post.url or post.url in seen_urls:
                 continue
             if _is_exhausted(db, operator_id, post.url):
                 continue
 
-            # Same enrichment shape as APIDirect — slug from post URL → Unipile
-            # /users/{slug} → author_location for the LLM ICP gate.
-            enriched_profile: dict[str, Any] | None = None
-            if enrich_on:
-                enriched_profile, wf = _enrich_via_unipile_slug(
-                    db,
-                    operator_id=operator_id,
-                    post_url=post.url,
-                    account_id=account_id,
-                    ttl_days=cache_ttl,
-                    slate_run_id=slate_run_id,
-                )
-                if wf:
-                    enriched_fetch_count += 1
+            enriched_profile: dict[str, Any] | None = author_profiles.get(post.url)
 
             # STRICTER than the keyword-Unipile/APIDirect paths: Exa's
             # neural search surfaces many non-individual posts (brand pages,
