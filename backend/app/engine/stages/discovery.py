@@ -415,12 +415,18 @@ def _compose_discovery_query(
 
 
 def _rotate(values: list[str], n: int) -> list[str]:
-    """Pick up to N keywords with mild shuffling so successive runs vary."""
+    """Pick up to N keywords with mild shuffling so successive runs vary.
+
+    ``n <= 0`` means **no limit** — return every keyword in the pool
+    (still shuffled, so the order varies across runs). Used by tiers we
+    want to sweep exhaustively (e.g. tier_1 on Unipile + all Exa tiers)."""
     if not values:
         return []
     pool = list(values)
     random.shuffle(pool)
-    return pool[: max(0, n)]
+    if n <= 0:
+        return pool
+    return pool[:n]
 
 
 def _is_exhausted(db: Database, operator_id: ObjectId, url: str) -> bool:
