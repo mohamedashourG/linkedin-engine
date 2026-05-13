@@ -88,6 +88,22 @@ class Settings(BaseSettings):
     # anthropic when a Claude credential is configured, else openai.
     llm_provider_primary: str = "auto"
     llm_provider_cheap: str = "auto"
+    # "drafter" is a callsite-scoped tier: ONLY the comment-generation
+    # drafter (engine/stages/drafter.py) uses it. Lets an operator route
+    # comment drafting to Claude while keeping ICP scoring, the analyst
+    # gate, the reply-drafter, the voice-template builder, and the
+    # ICP-extractor on OpenAI (or any other split). Falls back to the
+    # primary-tier provider when set to "auto" or unset, so the existing
+    # behavior is unchanged for operators who never touch this knob.
+    llm_provider_drafter: str = "auto"
+    # Anthropic model id used when drafter-tier resolves to Claude. Empty
+    # string falls back to anthropic_model_primary so deploying Claude for
+    # everything works with no extra config.
+    anthropic_model_drafter: str = ""
+    # OpenAI / Azure-OpenAI deployment id used when drafter-tier resolves
+    # to OpenAI. Empty string falls back to openai_model_primary /
+    # azure_openai_deployment_primary.
+    openai_model_drafter: str = ""
 
     apidirect_api_key: str = ""
     apidirect_mock: bool = False

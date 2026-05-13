@@ -15,6 +15,18 @@ Provider selection per tier:
   - "auto":      Claude if ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN) is
                   set, otherwise OpenAI.
 
+Three tiers are recognized today:
+  - "primary": drafter, reply_drafter, auto_cr drafting, ICP scoring,
+               analyst gate, voice-template builder, ICP extractor.
+  - "cheap":   non_buyer + post_quality gates, harvester, EOD parsing.
+  - "drafter": ONLY the comment-generation drafter
+               (engine/stages/drafter.py). Lets an operator route
+               comment drafting to Claude while keeping the rest of the
+               primary-tier callers on OpenAI. When
+               `LLM_PROVIDER_DRAFTER` is unset or "auto", drafter falls
+               back to the primary-tier provider, so existing operators
+               see no behavior change.
+
 This file re-exports `parse_structured` (async) and `parse_structured_sync`
 with the same kwargs the existing callsites already use, so the switch
 is mechanical:
@@ -65,11 +77,23 @@ def _resolve_provider(tier: str) -> str:
     if not settings.llm_use_anthropic:
         return "openai"
 
-    raw = (
-        settings.llm_provider_primary if tier == "primary"
-        else settings.llm_provider_cheap if tier == "cheap"
-        else "auto"
-    )
+    # Drafter tier falls back to the primary-tier setting when set to
+    # "auto" or empty. This preserves existing behavior: operators who
+    # only set LLM_PROVIDER_PRIMARY=anthropic get drafter on Claude too;
+    # operators who want comment-only Claude set LLM_PROVIDER_DRAFTER
+    # explicitly to "anthropic" and leave PRIMARY at "openai" (or "auto").
+    if tier == "drafter":
+        raw_drafter = (settings.llm_provider_drafter or "auto").strip().lower()
+        if raw_drafter and raw_drafter != "auto":
+            raw = raw_drafter
+        else:
+            raw = settings.llm_provider_primary
+    elif tier == "primary":
+        raw = settings.llm_provider_primary
+    elif tier == "cheap":
+        raw = settings.llm_provider_cheap
+    else:
+        raw = "auto"
     pref = (raw or "auto").strip().lower()
     if pref == "auto":
         return "anthropic" if _has_anthropic_creds() else "openai"

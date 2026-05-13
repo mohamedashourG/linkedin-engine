@@ -261,8 +261,14 @@ def draft_comment(
     if feedback_hint:
         system = system + "\n\n" + _format_feedback_block(feedback_hint)
 
+    # NOTE: model_tier="drafter" is callsite-scoped. The LLM router treats
+    # this tier as a fall-through to the primary tier unless the operator
+    # explicitly sets LLM_PROVIDER_DRAFTER. That lets us route comment
+    # drafting to Claude (LLM_PROVIDER_DRAFTER=anthropic) while keeping
+    # the ICP scoring gate, analyst gate, reply drafter, voice template
+    # builder, and ICP extractor on whatever LLM_PROVIDER_PRIMARY says.
     result = parse_structured_sync(
-        model_tier="primary",
+        model_tier="drafter",
         system=system,
         user="Draft the comment now. Output the comment body only in the `comment` field.",
         schema=_Draft,

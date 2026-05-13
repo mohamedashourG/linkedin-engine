@@ -120,7 +120,15 @@ def _model_for(tier: str) -> str:
         return settings.anthropic_model_primary
     if tier == "cheap":
         return settings.anthropic_model_cheap
-    raise ValueError(f"tier must be 'primary' or 'cheap', got {tier!r}")
+    if tier == "drafter":
+        # Drafter has its own model knob; falls back to primary's so
+        # operators who don't set a drafter-specific model get the same
+        # Claude deployment for everything.
+        return (
+            settings.anthropic_model_drafter
+            or settings.anthropic_model_primary
+        )
+    raise ValueError(f"tier must be 'primary', 'cheap', or 'drafter', got {tier!r}")
 
 
 def _schema_to_tool(schema: type[BaseModel]) -> dict[str, Any]:

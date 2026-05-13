@@ -72,9 +72,25 @@ def _get_client() -> tuple[AsyncOpenAI | AsyncAzureOpenAI, Literal["azure", "ope
 
 
 def _model_for(tier: str) -> str:
-    if tier not in ("primary", "cheap"):
-        raise ValueError(f"tier must be 'primary' or 'cheap', got {tier!r}")
+    if tier not in ("primary", "cheap", "drafter"):
+        raise ValueError(f"tier must be 'primary', 'cheap', or 'drafter', got {tier!r}")
     _, provider = _get_client()
+    # Drafter falls back to primary's deployment/model when not overridden;
+    # operators get identical behavior without setting the new knob.
+    if tier == "drafter":
+        if provider == "azure":
+            # Azure model knob isn't split per-callsite — drafter uses the
+            # primary deployment unless openai_model_drafter is set
+            # explicitly (rare; only useful when the operator wants Claude
+            # via OpenAI-compatible proxy on a different model).
+            return (
+                settings.openai_model_drafter
+                or settings.azure_openai_deployment_primary
+            )
+        return (
+            settings.openai_model_drafter
+            or settings.openai_model_primary
+        )
     if provider == "azure":
         return (
             settings.azure_openai_deployment_primary
@@ -169,9 +185,20 @@ def _get_sync_client() -> tuple[OpenAI | AzureOpenAI, Literal["azure", "openai"]
 
 
 def _model_for_sync(tier: str) -> str:
-    if tier not in ("primary", "cheap"):
-        raise ValueError(f"tier must be 'primary' or 'cheap', got {tier!r}")
+    if tier not in ("primary", "cheap", "drafter"):
+        raise ValueError(f"tier must be 'primary', 'cheap', or 'drafter', got {tier!r}")
     _, provider = _get_sync_client()
+    # Drafter falls back to primary's deployment/model when not overridden.
+    if tier == "drafter":
+        if provider == "azure":
+            return (
+                settings.openai_model_drafter
+                or settings.azure_openai_deployment_primary
+            )
+        return (
+            settings.openai_model_drafter
+            or settings.openai_model_primary
+        )
     if provider == "azure":
         return (
             settings.azure_openai_deployment_primary
