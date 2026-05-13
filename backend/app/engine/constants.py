@@ -6,7 +6,10 @@ from __future__ import annotations
 # after gates → enough drafts to clear the per-cofounder floor.
 DISCOVERY_TIER_1_PER_RUN = 8
 DISCOVERY_TIER_2_PER_RUN = 5
-DISCOVERY_TIER_3_PER_RUN = 0  # tier-3 only used as last-resort fallback
+DISCOVERY_TIER_3_PER_RUN = 4  # tier_3 keywords now run on Unipile keyword
+# search as well as Exa. The broader phrases ("hospital operations",
+# "health system management") generally surface different posts than
+# tier_1/2 and feed into the same inline-rubric + LLM-gate funnel.
 
 # Exa: one API call per keyword; broader tier mix than apidirect/unipile so
 # each round retrieves enough raw candidates to survive gates and Rule 23.

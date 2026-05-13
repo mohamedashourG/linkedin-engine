@@ -147,7 +147,13 @@ def _resolve_industry_ids_for_operator(
         cached = None
     if cached:
         ttl_cutoff = utcnow() - timedelta(days=30)
-        if cached.get("fetched_at") and cached["fetched_at"] >= ttl_cutoff:
+        fetched_at = cached.get("fetched_at")
+        # Mongo stores datetimes as tz-naive by default; coerce to UTC-aware
+        # before comparing against utcnow() (tz-aware) to avoid TypeError.
+        if fetched_at is not None and getattr(fetched_at, "tzinfo", None) is None:
+            from datetime import timezone as _tz
+            fetched_at = fetched_at.replace(tzinfo=_tz.utc)
+        if fetched_at and fetched_at >= ttl_cutoff:
             return list(cached.get("ids") or [])
 
     resolved: list[str] = []
@@ -1035,6 +1041,59 @@ def _is_company_authored(
         if not has_human_signal:
             return True
     return False
+
+
+def _is_exa_non_individual_author(
+    raw_author: str | None,
+    enriched_profile: dict[str, Any] | None,
+    post_url: str | None,
+) -> tuple[bool, str | None]:
+    """STRICTER variant for Exa results. Returns ``(drop, reason)``.
+
+    Exa's neural search surfaces a lot of non-individual content — brand-
+    page posts, /pulse/ articles ghostwritten under company accounts,
+    /newsletters/, and posts where the author slug is brand-shaped but
+    Exa fills in a generic display name. The default ``_is_company_authored``
+    is permissive (drop only on positive proof), but for Exa we flip the
+    default: when we can't POSITIVELY confirm the author is a human
+    individual, drop.
+
+    Drop signals (any one):
+      - `_is_company_authored` already says it's a brand page / org.
+      - URL is ``/pulse/`` (LinkedIn long-form article — often org-authored).
+      - URL is ``/newsletters/`` (LinkedIn newsletter — usually org).
+      - URL has a brand-shaped author slug (single token, no dashes)
+        regardless of whether enrichment filled in a name — we treat
+        brand-shaped slugs as proof, since Exa's name field is unreliable.
+      - We have NO author signal at all (no raw_author, no enriched name,
+        no slug we can extract) → can't verify human → drop.
+    """
+    # _is_company_authored already covers: /company/ path, is_company flag,
+    # brand-shaped slug + no human signal. Run it first; if it confirms
+    # company → drop with its semantics preserved.
+    if _is_company_authored(raw_author, enriched_profile, post_url):
+        return True, "company_authored"
+    # Additional STRICT-only signals for Exa:
+    url_l = (post_url or "").lower()
+    if "/pulse/" in url_l:
+        return True, "linkedin_pulse_article"
+    if "/newsletters/" in url_l or "/newsletter/" in url_l:
+        return True, "linkedin_newsletter"
+    # Last-resort: if we have NO author identity at all (no name, no slug),
+    # drop. The LLM ICP gate has nothing to score against and we just burn
+    # cost. Note: a brand-shaped slug WITHOUT human signal was already
+    # caught by `_is_company_authored` above; here we only catch the
+    # complete-vacuum case where Exa returned a post but no author handle
+    # at all (rare but happens on group/share-link URLs).
+    slug = _extract_author_slug_from_post_url(post_url)
+    has_any_signal = bool(
+        (raw_author and raw_author.strip())
+        or (enriched_profile and (enriched_profile.get("name") or "").strip())
+        or slug
+    )
+    if not has_any_signal:
+        return True, "no_author_signal"
+    return False, None
 
 
 def _extract_author_slug_from_post_url(url: str | None) -> str | None:
@@ -2664,13 +2723,20 @@ def _run_exa(
                 if wf:
                     enriched_fetch_count += 1
 
-            # Drop only posts positively identified as company-authored.
-            # Keep human posts even with thin author metadata — post-relevance
-            # + LLM ICP gates decide quality.
-            if _is_company_authored(post.author, enriched_profile, post.url):
+            # STRICTER than the keyword-Unipile/APIDirect paths: Exa's
+            # neural search surfaces many non-individual posts (brand pages,
+            # /pulse/ articles, /newsletters/, brand-shaped slugs). Default
+            # is now flipped: require POSITIVE proof of an individual author
+            # before keeping. Reasons are surfaced in logs for gate-funnel
+            # observability.
+            drop_exa, exa_drop_reason = _is_exa_non_individual_author(
+                post.author, enriched_profile, post.url
+            )
+            if drop_exa:
                 log.info(
-                    "│  [DROP/exa] %s ← company-authored post (not a human)",
+                    "│  [DROP/exa] %s ← non_individual_author (%s)",
                     (post.url or "<no-url>")[:90],
+                    exa_drop_reason or "no_signal",
                 )
                 continue
 
