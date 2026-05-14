@@ -3,8 +3,8 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { ArrowLeft, ExternalLink, Mail, Send } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ArrowLeft, Activity, ExternalLink, Mail, RefreshCw, Send } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/shared/empty-state";
+import { CommentTracker } from "@/components/slate/comment-tracker";
 import { slateApi, type Candidate, type SourceStatusBucket } from "@/lib/slate";
 import { ApiError } from "@/lib/api";
 
@@ -66,10 +67,20 @@ function pivotSourceStatus(buckets: SourceStatusBucket[]) {
 export default function RunDetailPage() {
   const params = useParams<{ slate_run_id: string }>();
   const slateRunId = params?.slate_run_id ?? "";
+  const qc = useQueryClient();
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["slate-run", slateRunId],
     queryFn: () => slateApi.run(slateRunId),
     enabled: !!slateRunId,
+  });
+
+  // Tracker (engagement + replies) — pure read on mount; POST endpoint
+  // polls on-demand when the operator hits "Track now".
+  const trackerQ = useQuery({
+    queryKey: ["slate-tracker", slateRunId],
+    queryFn: () => slateApi.tracker(slateRunId),
+    enabled: !!slateRunId,
+    refetchOnWindowFocus: false,
   });
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -97,6 +108,28 @@ export default function RunDetailPage() {
     },
     onError: (err: ApiError) =>
       toast.error(err?.detail || "Failed to send email"),
+  });
+
+  // "Track now" — POST to /track-selected with whichever candidates are
+  // selected. If none selected, falls back to tracking every candidate
+  // in the run (the backend filters to status=shipped anyway).
+  const trackMut = useMutation({
+    mutationFn: () => {
+      const ids =
+        selected.size > 0
+          ? Array.from(selected)
+          : (data?.candidates ?? []).map((c) => c.id);
+      if (ids.length === 0) {
+        return Promise.reject(new Error("No candidates to track"));
+      }
+      return slateApi.trackSelected(slateRunId, ids);
+    },
+    onSuccess: (res) => {
+      qc.setQueryData(["slate-tracker", slateRunId], res);
+      toast.success(`Tracked ${res.candidates.length} candidates`);
+    },
+    onError: (err: ApiError | Error) =>
+      toast.error(("detail" in err && err.detail) || err.message || "Tracker failed"),
   });
 
   if (isLoading) {
@@ -355,20 +388,76 @@ export default function RunDetailPage() {
         </div>
       )}
 
-      {/* Sticky send bar — shows when at least one candidate is selected. */}
+      {/* Engagement & replies tracker — surfaces every-2h beat data plus
+          an on-demand "Track now" trigger for selected candidates. */}
+      {trackerQ.data && trackerQ.data.candidates.length > 0 && (
+        <div className="space-y-3 pb-24">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                Engagement &amp; replies ({trackerQ.data.candidates.length})
+              </h2>
+              <p className="text-xs text-muted-foreground">
+                Likes, replies and suggested follow-ups for shipped comments
+                in this slate. Auto-refreshed every 2 hours; click "Track now"
+                to refresh just the selected candidates.
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => trackMut.mutate()}
+              disabled={trackMut.isPending}
+            >
+              <RefreshCw
+                className={`mr-1.5 h-3.5 w-3.5 ${
+                  trackMut.isPending ? "animate-spin" : ""
+                }`}
+              />
+              {trackMut.isPending
+                ? "Polling…"
+                : selected.size > 0
+                ? `Track ${selected.size} selected`
+                : "Track all shipped"}
+            </Button>
+          </div>
+          <CommentTracker
+            items={
+              selected.size > 0
+                ? trackerQ.data.candidates.filter((c) =>
+                    selected.has(c.candidate_id),
+                  )
+                : trackerQ.data.candidates
+            }
+            emptyHint="None of the selected candidates have shipped comments yet."
+            onChanged={() => trackerQ.refetch()}
+          />
+        </div>
+      )}
+
+      {/* Sticky action bar — Track now + Send email, shown when ≥1 selected. */}
       {selected.size > 0 && (
-        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-20 w-[min(720px,calc(100vw-2rem))]">
-          <div className="rounded-xl border bg-background/95 p-3 shadow-lg backdrop-blur flex items-center gap-2">
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-20 w-[min(820px,calc(100vw-2rem))]">
+          <div className="rounded-xl border bg-background/95 p-3 shadow-lg backdrop-blur flex items-center gap-2 flex-wrap">
             <div className="flex items-center gap-2 text-sm">
               <Mail className="h-4 w-4 text-muted-foreground" />
               <span className="font-medium">{selected.size} selected</span>
             </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => trackMut.mutate()}
+              disabled={trackMut.isPending}
+            >
+              <Activity className="mr-1.5 h-3.5 w-3.5" />
+              {trackMut.isPending ? "Polling…" : "Track now"}
+            </Button>
             <Input
               type="email"
               value={emailTo}
               onChange={(e) => setEmailTo(e.target.value)}
               placeholder="leave blank → your account email"
-              className="flex-1 h-9 text-sm"
+              className="flex-1 h-9 text-sm min-w-[180px]"
             />
             <Button
               size="sm"

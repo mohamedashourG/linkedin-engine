@@ -4,8 +4,11 @@ daily_run on demand (handy for testing or recovering from a missed schedule).
 """
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, time, timezone
 from typing import Annotated, Any, Literal
+
+log = logging.getLogger(__name__)
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
@@ -723,3 +726,392 @@ async def email_selected_drafts(
         raise HTTPException(502, f"Email send failed: {err}")
 
     return EmailSelectedResponse(message_id=msg_id, count=len(rows), to=to_addr)
+
+
+# ── Comment-engagement tracker ──────────────────────────────────────────
+# Surfaces the data the every-2h engagement_poller writes (our_comments
+# snapshots + replies + reply_drafter follow-ups) so the operator can see
+# per-comment outcomes inline. GET reads existing state; POST triggers a
+# Unipile poll for the selected (shipped) candidates and returns the
+# refreshed state in one round trip.
+
+class TrackerReply(BaseModel):
+    id: str
+    text: str
+    author_name: str | None = None
+    author_linkedin_url: str | None = None
+    author_is_post_owner: bool = False
+    published_at: datetime | None = None
+    suggested_reply: str = ""
+    suggested_reply_type: str = ""
+    user_action: Literal["pending", "sent", "dismissed", "edited"] = "pending"
+
+
+class TrackerCandidate(BaseModel):
+    candidate_id: str
+    cofounder_id: str
+    status: str
+    shipped_at: datetime | None = None
+    post_url: str
+    post_text_preview: str = ""
+    author_name: str | None = None
+    our_comment_text: str = ""
+    our_comment_id: str | None = None
+    our_comment_status: str = "not_found"
+    # Per-our-comment engagement (from Unipile /posts/comments).
+    latest_reaction_count: int = 0
+    latest_reply_count: int = 0
+    latest_polled_at: datetime | None = None
+    # Parent-post (the original LinkedIn post we commented on)
+    # engagement from APIdirect /v1/linkedin/post — likes, total
+    # comments count, shares, and the LinkedIn-style reactions
+    # breakdown (like/celebrate/support/love/insightful/funny → counts).
+    post_likes: int = 0
+    post_comments_total: int = 0
+    post_shares: int = 0
+    post_reactions: dict[str, int] | None = None
+    post_polled_at: datetime | None = None
+    replies: list[TrackerReply] = Field(default_factory=list)
+
+
+class TrackerResponse(BaseModel):
+    slate_run_id: str
+    candidates: list[TrackerCandidate]
+    polled_at: datetime | None = None
+
+
+class TrackSelectedRequest(BaseModel):
+    candidate_ids: list[str] = Field(min_length=1, max_length=200)
+
+
+def _preview_text(s: str | None, limit: int = 220) -> str:
+    if not s:
+        return ""
+    t = s.strip().replace("\n", " ")
+    return t if len(t) <= limit else t[: limit - 1] + "…"
+
+
+async def _lazy_fetch_parent_post_engagement(
+    db: AsyncIOMotorDatabase,
+    *,
+    candidates: list[dict[str, Any]],
+) -> None:
+    """For each candidate with no `parent_post_polled_at`, call APIdirect
+    /v1/linkedin/post and persist the engagement (likes, comments_total,
+    shares, reactions_by_type). Caps at 20 calls per request — we don't
+    want the GET endpoint to blow through APIdirect quota on a huge
+    slate. Anything beyond the cap stays unfetched and shows zeros until
+    the every-2h beat or an explicit Track-now picks it up.
+
+    Always marks `parent_post_polled_at` (even on 404 / parse-fail) so
+    the next page load doesn't keep retrying.
+    """
+    if not candidates:
+        return
+    import asyncio
+    from pymongo import MongoClient
+    from app.config import settings as _settings
+    from app.services import apidirect as _apidirect
+
+    MAX = 20
+    targets = candidates[:MAX]
+
+    def _blocking() -> None:
+        client = MongoClient(_settings.mongodb_uri)
+        try:
+            sdb = client[_settings.mongodb_db]
+            for c in targets:
+                url = (c.get("post_url") or "").strip()
+                if not url:
+                    continue
+                try:
+                    d = _apidirect.get_linkedin_post_details(url)
+                except _apidirect.ApiDirectQuotaExhausted:
+                    log.warning("lazy_fetch: APIdirect quota exhausted")
+                    break
+                except _apidirect.ApiDirectError as err:
+                    log.warning("lazy_fetch: APIdirect error url=%s: %s", url[:60], err)
+                    d = None
+                except _apidirect.ApiDirectNotConfigured:
+                    return
+                except Exception as err:  # noqa: BLE001
+                    log.warning("lazy_fetch: unexpected: %s", err)
+                    d = None
+                now = utcnow()
+                if d is None:
+                    sdb.candidates.update_one(
+                        {"_id": c["_id"]},
+                        {"$set": {"parent_post_polled_at": now}},
+                    )
+                    continue
+                sdb.candidates.update_one(
+                    {"_id": c["_id"]},
+                    {"$set": {
+                        "parent_post_likes": int(d.likes or 0),
+                        "parent_post_comments_total": int(d.comments or 0),
+                        "parent_post_shares": int(d.shares or 0),
+                        "parent_post_reactions": d.reactions_by_type or None,
+                        "parent_post_polled_at": now,
+                    }},
+                )
+        finally:
+            client.close()
+
+    await asyncio.to_thread(_blocking)
+
+
+async def _build_tracker_response(
+    db: AsyncIOMotorDatabase,
+    *,
+    slate_run_id: ObjectId,
+    operator_id: ObjectId,
+    polled_at: datetime | None = None,
+) -> TrackerResponse:
+    """Single Mongo join over candidates × our_comments × replies for
+    a slate run, scoped to the operator. Used by both the GET (read-
+    only) and POST (after poll) endpoints so the response shape is
+    identical regardless of trigger.
+    """
+    cands = await db.candidates.find(
+        {"slate_run_id": slate_run_id, "operator_id": operator_id},
+        {
+            "cofounder_id": 1, "status": 1, "shipped_at": 1, "post_url": 1,
+            "post_text": 1, "comment_text": 1, "author_name": 1,
+            # APIdirect parent-post fields (engagement_poller writes them).
+            "parent_post_likes": 1, "parent_post_comments_total": 1,
+            "parent_post_shares": 1, "parent_post_reactions": 1,
+            "parent_post_polled_at": 1,
+        },
+    ).to_list(length=None)
+    # Restrict to candidates with a draft (drafted/slated/shipped/dropped_by_user)
+    # — the tracker has nothing to show for raw/gate_dropped/etc.
+    relevant_statuses = {"drafted", "slated", "shipped", "dropped_by_user"}
+    cands = [c for c in cands if c.get("status") in relevant_statuses]
+    if not cands:
+        return TrackerResponse(
+            slate_run_id=str(slate_run_id),
+            candidates=[],
+            polled_at=polled_at,
+        )
+
+    # Lazy-fetch APIdirect parent-post engagement for any candidate that
+    # has never been polled. Without this, the first page-load after a
+    # ship shows all zeros until either the every-2h beat runs or the
+    # operator clicks "Track now". With it, the page is fresh on
+    # first load. Cost: one APIdirect call ($0.002) per never-polled
+    # post per slate, paid once per post.
+    pending = [
+        c for c in cands
+        if not c.get("parent_post_polled_at")
+        and (c.get("post_url") or "").startswith("https://www.linkedin.com/")
+    ]
+    if pending:
+        await _lazy_fetch_parent_post_engagement(db, candidates=pending)
+        # Re-read the freshly-updated fields so the response reflects them
+        # without a full re-query.
+        refreshed = await db.candidates.find(
+            {"_id": {"$in": [c["_id"] for c in pending]}},
+            {
+                "parent_post_likes": 1, "parent_post_comments_total": 1,
+                "parent_post_shares": 1, "parent_post_reactions": 1,
+                "parent_post_polled_at": 1,
+            },
+        ).to_list(length=len(pending))
+        by_id = {r["_id"]: r for r in refreshed}
+        for c in cands:
+            r = by_id.get(c["_id"])
+            if r:
+                c.update({k: v for k, v in r.items() if k != "_id"})
+
+    cand_ids = [c["_id"] for c in cands]
+    ocs = await db.our_comments.find(
+        {"candidate_id": {"$in": cand_ids}, "operator_id": operator_id}
+    ).to_list(length=len(cand_ids))
+    oc_by_cand = {oc["candidate_id"]: oc for oc in ocs}
+
+    replies_docs = await db.replies.find(
+        {"candidate_id": {"$in": cand_ids}, "operator_id": operator_id}
+    ).sort("detected_at", 1).to_list(length=None)
+    replies_by_cand: dict[ObjectId, list[dict[str, Any]]] = {}
+    for r in replies_docs:
+        replies_by_cand.setdefault(r["candidate_id"], []).append(r)
+
+    out: list[TrackerCandidate] = []
+    for c in cands:
+        oc = oc_by_cand.get(c["_id"])
+        our_comment_text = c.get("comment_text") or (oc or {}).get("text") or ""
+        our_comment_id = (oc or {}).get("comment_id")
+        # Status derivation: if our_comments doc exists and has a Unipile
+        # comment_id, we know LinkedIn has our comment. Otherwise it's
+        # either queued (outbox waiting) or never sent.
+        if our_comment_id:
+            oc_status = "detected"
+        elif oc:
+            oc_status = (oc.get("status") or "queued")
+        else:
+            oc_status = "not_found"
+
+        rs = []
+        for r in replies_by_cand.get(c["_id"], []):
+            rs.append(TrackerReply(
+                id=str(r["_id"]),
+                text=r.get("reply_text") or "",
+                author_name=r.get("reply_author_name"),
+                author_linkedin_url=r.get("reply_author_linkedin_url"),
+                author_is_post_owner=bool(r.get("reply_author_is_post_owner")),
+                published_at=r.get("reply_published_at"),
+                suggested_reply=r.get("suggested_reply") or "",
+                suggested_reply_type=r.get("suggested_reply_type") or "",
+                user_action=(r.get("user_action") or "pending"),
+            ))
+
+        # Sanitize the parent-post reactions dict (downstream Pydantic
+        # rejects non-int values). The engagement_poller already
+        # int-coerces, but a hand-written DB row could slip through.
+        reactions_raw = c.get("parent_post_reactions")
+        reactions: dict[str, int] | None = None
+        if isinstance(reactions_raw, dict) and reactions_raw:
+            reactions = {
+                str(k): int(v)
+                for k, v in reactions_raw.items()
+                if isinstance(v, (int, float))
+            } or None
+
+        out.append(TrackerCandidate(
+            candidate_id=str(c["_id"]),
+            cofounder_id=str(c.get("cofounder_id") or ""),
+            status=c.get("status") or "",
+            shipped_at=c.get("shipped_at"),
+            post_url=c.get("post_url") or "",
+            post_text_preview=_preview_text(c.get("post_text") or "", 220),
+            author_name=c.get("author_name"),
+            our_comment_text=our_comment_text,
+            our_comment_id=our_comment_id,
+            our_comment_status=oc_status,
+            latest_reaction_count=int((oc or {}).get("latest_reaction_count") or 0),
+            latest_reply_count=int((oc or {}).get("latest_reply_count") or 0),
+            latest_polled_at=(oc or {}).get("latest_polled_at"),
+            post_likes=int(c.get("parent_post_likes") or 0),
+            post_comments_total=int(c.get("parent_post_comments_total") or 0),
+            post_shares=int(c.get("parent_post_shares") or 0),
+            post_reactions=reactions,
+            post_polled_at=c.get("parent_post_polled_at"),
+            replies=rs,
+        ))
+
+    # Stable sort: shipped first (newest shipped_at), then everyone else.
+    def _sort_key(t: TrackerCandidate):
+        shipped_rank = 0 if t.status == "shipped" else 1
+        ts = -(t.shipped_at.timestamp() if t.shipped_at else 0)
+        return (shipped_rank, ts)
+    out.sort(key=_sort_key)
+
+    return TrackerResponse(
+        slate_run_id=str(slate_run_id),
+        candidates=out,
+        polled_at=polled_at,
+    )
+
+
+@router.get(
+    "/runs/{slate_run_id}/tracker",
+    response_model=TrackerResponse,
+)
+async def read_tracker(
+    slate_run_id: Annotated[str, Path()],
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> TrackerResponse:
+    """Read the tracker state without re-polling Unipile. Returns
+    whatever the every-2h beat (or the last on-demand POST) already
+    wrote to our_comments / replies."""
+    if not ObjectId.is_valid(slate_run_id):
+        raise HTTPException(400, "Invalid slate_run_id")
+    slate = await db.slate_runs.find_one(
+        {"_id": ObjectId(slate_run_id), "operator_id": user["_id"]}, {"_id": 1}
+    )
+    if not slate:
+        raise HTTPException(404, "Run not found")
+    return await _build_tracker_response(
+        db, slate_run_id=ObjectId(slate_run_id), operator_id=user["_id"],
+    )
+
+
+@router.post(
+    "/runs/{slate_run_id}/track-selected",
+    response_model=TrackerResponse,
+)
+async def track_selected(
+    slate_run_id: Annotated[str, Path()],
+    payload: TrackSelectedRequest,
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> TrackerResponse:
+    """On-demand poll. For each selected candidate that's been shipped,
+    fetch the post's comment thread from Unipile and refresh our_comments
+    + replies. Returns the new aggregated state."""
+    if not ObjectId.is_valid(slate_run_id):
+        raise HTTPException(400, "Invalid slate_run_id")
+    slate = await db.slate_runs.find_one(
+        {"_id": ObjectId(slate_run_id), "operator_id": user["_id"]}, {"_id": 1}
+    )
+    if not slate:
+        raise HTTPException(404, "Run not found")
+
+    cand_oids: list[ObjectId] = [
+        ObjectId(s) for s in payload.candidate_ids if ObjectId.is_valid(s)
+    ]
+    if not cand_oids:
+        raise HTTPException(400, "No valid candidate ids")
+
+    # Filter to shipped + operator-scoped + matching this run.
+    shipped = await db.candidates.find({
+        "_id": {"$in": cand_oids},
+        "slate_run_id": ObjectId(slate_run_id),
+        "operator_id": user["_id"],
+        "status": "shipped",
+    }).to_list(length=len(cand_oids))
+
+    if shipped:
+        # Need cofounders to know which unipile_account_id to use.
+        cf_ids = list({c["cofounder_id"] for c in shipped})
+        cofounders = await db.cofounders.find(
+            {"_id": {"$in": cf_ids}, "operator_id": user["_id"]}
+        ).to_list(length=len(cf_ids))
+        cf_by_id = {cf["_id"]: cf for cf in cofounders}
+
+        # The poller is sync (Celery-backed). Open a per-request pymongo
+        # client and drive it from a thread so the async route doesn't
+        # block the event loop. Same pattern celery_app._sync_db() uses.
+        import asyncio
+        from pymongo import MongoClient
+        from app.config import settings as _settings
+        from app.engine.engagement_poller import poll_one_candidate
+
+        def _poll_blocking() -> None:
+            client = MongoClient(_settings.mongodb_uri)
+            try:
+                sdb = client[_settings.mongodb_db]
+                for c in shipped:
+                    cf = cf_by_id.get(c["cofounder_id"])
+                    if not cf:
+                        continue
+                    try:
+                        poll_one_candidate(
+                            sdb,
+                            operator_id=user["_id"],
+                            cofounder=cf,
+                            candidate=c,
+                        )
+                    except Exception:  # noqa: BLE001 — one bad candidate must not abort the rest
+                        log.exception("track_selected: poll_one_candidate failed for %s", c.get("_id"))
+            finally:
+                client.close()
+
+        await asyncio.to_thread(_poll_blocking)
+
+    polled_at = utcnow()
+    return await _build_tracker_response(
+        db, slate_run_id=ObjectId(slate_run_id), operator_id=user["_id"],
+        polled_at=polled_at,
+    )

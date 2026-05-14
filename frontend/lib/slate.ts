@@ -162,4 +162,59 @@ export const slateApi = {
       `/api/slate/runs/${encodeURIComponent(slateRunId)}/email-selected`,
       body,
     ),
+  tracker: (slateRunId: string) =>
+    api.get<TrackerResponse>(
+      `/api/slate/runs/${encodeURIComponent(slateRunId)}/tracker`,
+    ),
+  trackSelected: (slateRunId: string, candidateIds: string[]) =>
+    api.post<TrackerResponse>(
+      `/api/slate/runs/${encodeURIComponent(slateRunId)}/track-selected`,
+      { candidate_ids: candidateIds },
+    ),
+};
+
+// ── Tracker types (shared by past-run page + pipeline lead detail) ─────
+
+export type TrackerReply = {
+  id: string;
+  text: string;
+  author_name: string | null;
+  author_linkedin_url: string | null;
+  author_is_post_owner: boolean;
+  published_at: string | null;
+  suggested_reply: string;
+  suggested_reply_type: string;
+  user_action: "pending" | "sent" | "dismissed" | "edited";
+};
+
+export type TrackerCandidate = {
+  candidate_id: string;
+  cofounder_id: string;
+  status: string;
+  shipped_at: string | null;
+  post_url: string;
+  post_text_preview: string;
+  author_name: string | null;
+  our_comment_text: string;
+  our_comment_id: string | null;
+  our_comment_status: string;
+  latest_reaction_count: number;
+  latest_reply_count: number;
+  latest_polled_at: string | null;
+  /** Parent-post engagement from APIdirect /v1/linkedin/post. */
+  post_likes: number;
+  post_comments_total: number;
+  post_shares: number;
+  /** LinkedIn reaction breakdown by type — like, celebrate, support,
+   *  love, insightful, funny. Null when APIdirect hasn't returned data
+   *  yet (pre-track or quota exhausted). */
+  post_reactions: Record<string, number> | null;
+  post_polled_at: string | null;
+  replies: TrackerReply[];
+};
+
+export type TrackerResponse = {
+  slate_run_id: string;
+  candidates: TrackerCandidate[];
+  polled_at: string | null;
 };

@@ -3,10 +3,12 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Activity,
+  CalendarCheck,
   ExternalLink,
   KanbanSquare,
   MessageSquare,
-  CalendarCheck,
+  RefreshCw,
   X,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -15,7 +17,9 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/shared/empty-state";
+import { CommentTracker } from "@/components/slate/comment-tracker";
 import { pipelineApi, type LeadCard } from "@/lib/pipeline";
+import { ApiError } from "@/lib/api";
 
 const STAGES: { key: string; label: string; sub: string }[] = [
   { key: "S1", label: "S1", sub: "candidate" },
@@ -200,6 +204,21 @@ function LeadDetailPanel({
     onError: (err: Error) => toast.error(err.message),
   });
 
+  // On-demand poll for this lead's shipped comments. Returns the full
+  // refreshed LeadDetail; we drop it back into the query cache so the
+  // panel re-renders with new engagement/replies in one round trip.
+  const trackComments = useMutation({
+    mutationFn: () => pipelineApi.trackLeadComments(leadId),
+    onSuccess: (res) => {
+      qc.setQueryData(["lead", leadId], res);
+      toast.success(
+        `Tracked ${res.comments_engagement.length} comments for this lead`,
+      );
+    },
+    onError: (err: ApiError) =>
+      toast.error(err?.detail || "Failed to track this lead's comments"),
+  });
+
   return (
     <div className="fixed inset-0 z-50 flex items-stretch justify-end bg-black/30 backdrop-blur-[1px]">
       <div className="h-full w-full max-w-md overflow-y-auto bg-background border-l shadow-2xl">
@@ -301,6 +320,35 @@ function LeadDetailPanel({
                   </li>
                 ))}
               </ol>
+            </div>
+
+            {/* Our comments — per-comment engagement + replies + follow-ups */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="text-sm font-semibold">Our comments</h3>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  type="button"
+                  onClick={() => trackComments.mutate()}
+                  disabled={trackComments.isPending}
+                  className="h-7 text-xs"
+                >
+                  {trackComments.isPending ? (
+                    <RefreshCw className="mr-1 h-3 w-3 animate-spin" />
+                  ) : (
+                    <Activity className="mr-1 h-3 w-3" />
+                  )}
+                  {trackComments.isPending ? "Polling…" : "Track now"}
+                </Button>
+              </div>
+              <CommentTracker
+                items={data.comments_engagement ?? []}
+                emptyHint="No shipped comments for this lead yet. Mark a comment as shipped on /today to start tracking."
+                onChanged={() =>
+                  qc.invalidateQueries({ queryKey: ["lead", leadId] })
+                }
+              />
             </div>
           </div>
         )}
