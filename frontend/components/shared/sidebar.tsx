@@ -11,6 +11,8 @@ import {
   Inbox,
   KanbanSquare,
   LogOut,
+  Network,
+  Send,
   Settings,
   Sparkles,
   Users,
@@ -44,6 +46,13 @@ const NAV: NavItem[] = [
   { href: "/eod", label: "End of day", icon: CheckSquare },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/contacts", label: "Contacts", icon: Users },
+  // Manual-comment posting: upload a CSV of (post_url, comment) rows, pick a
+  // Unipile account, dry-run validate, optionally post for real. Distinct
+  // from the daily_run engine — operator-curated, not pipeline-generated.
+  { href: "/manual-comments", label: "Manual comments", icon: Send },
+  // Unipile account pool — rotation health, per-account daily usage,
+  // cooldown / re-auth status. Operator-facing infrastructure view.
+  { href: "/unipile-pool", label: "Unipile pool", icon: Network },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 

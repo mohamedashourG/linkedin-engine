@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote as _quote
 
 import httpx
 
@@ -39,60 +40,287 @@ _TIMEOUT = 30.0
 _UNIPILE_429_MAX_ATTEMPTS = 5
 _UNIPILE_429_BACKOFF_BASE_S = 4.0
 
-# Process-global throttle for `/users/{slug}` profile lookups (the "fallback"
-# path used by Crustdata-miss authors). LinkedIn's automation-detection
-# heuristics flag accounts that hit /users/ in rapid succession from the
-# same session — spacing the calls with jitter mimics human browsing
-# cadence. Only the /users/{slug} resolve path goes through here; high-
-# throughput search/post calls are unaffected.
-_UNIPILE_USERS_MIN_INTERVAL_S = 1.4   # baseline gap between consecutive calls
-_UNIPILE_USERS_JITTER_MAX_S = 0.6     # uniform 0..0.6s noise on top of baseline
-_users_throttle_lock = threading.Lock()
-_users_throttle_last_ts = 0.0
+# ─── Human-cadence throttling (anti-automation-detection) ────────────────
+#
+# LinkedIn flags accounts for automation based on (a) volume per unit time
+# and (b) the *regularity* of inter-action timing. Uniform jitter is still
+# trivially detectable as machine-paced — automation classifiers fit a
+# distribution and flag the tight variance. Real humans burst (multiple
+# fast clicks while reading a thread) then pause (read, switch tabs, walk
+# away). We mimic that with `_human_delay_seconds()` which mixes two
+# distributions: the baseline jittered range plus a 10% chance of a much
+# longer "thinking pause".
+#
+# Tightened all intervals on 2026-05-14 after three GB-proxied accounts
+# (Michael Colivet + two Nicolas Vila) hit `status=CREDENTIALS` (forced
+# re-auth from LinkedIn flagging suspicious activity). The previous
+# defaults (1.4s users, 2.0s search, 0.0s default, 0.0s post_comment)
+# were the floor of what could plausibly be human — combined with the
+# GB-proxy + parallel-workers signal stack, it tipped over.
 
-# Process-global throttle for `/linkedin/search` (people + content). Unipile
-# rate-limits ~3-4 req/s per account before issuing 429s; the RULE 24 sweep
-# can fire 100+ queries in a single discovery pass. Tightened from 1.2s →
-# 2.0s baseline + 0..0.8s jitter (= ~2.0-2.8s between calls) after the
-# previous account got quota-exhausted mid-run. This keeps cumulative
-# search-call rate around 22-30 req/min, well below any Unipile soft cap.
-_UNIPILE_SEARCH_MIN_INTERVAL_S = 2.0
-_UNIPILE_SEARCH_JITTER_MAX_S = 0.8
-_search_throttle_lock = threading.Lock()
-_search_throttle_last_ts = 0.0
+# Per-call-type throttle intervals (humanlike with heavy-tailed jitter).
+# All locks + last-call timestamps are PER-ACCOUNT — see the dict-keyed
+# structures below — so two accounts can fire in parallel without
+# contending on the same lock. This is the unlock that makes the
+# account-pool rotation actually deliver N× aggregate throughput while
+# each individual account stays under LinkedIn's per-session radar.
+
+# `/users/{slug}` — profile views (loudest signal — target sees a "X
+# viewed your profile" notification on each call).
+_UNIPILE_USERS_MIN_INTERVAL_S = 6.0
+_UNIPILE_USERS_JITTER_MAX_S = 6.0
+
+# `/linkedin/search` — keyword + people search.
+_UNIPILE_SEARCH_MIN_INTERVAL_S = 4.0
+_UNIPILE_SEARCH_JITTER_MAX_S = 4.0
+
+# Default — every other Unipile call (post details, comments listing, etc.)
+_UNIPILE_DEFAULT_MIN_INTERVAL_S = 3.0
+_UNIPILE_DEFAULT_JITTER_MAX_S = 3.0
+
+# POST `/posts/{id}/comments` — write actions. 90s baseline + 0–90s
+# jitter, occasional multi-minute "read the thread" pause.
+_UNIPILE_POST_COMMENT_MIN_INTERVAL_S = 90.0
+_UNIPILE_POST_COMMENT_JITTER_MAX_S = 90.0
+
+# POST `/users/invite` — connection requests with optional note.
+# LinkedIn's anti-automation signal is *especially* sensitive to invite
+# bursts (more than to comment bursts), and recipients see the invite
+# immediately in their notifications. 5-minute baseline + up to 5-min
+# jitter (so 5-10 min typical between invites from the same account)
+# with a 10% chance of a 15-40 min "stepped away" pause via
+# `_human_delay_seconds`. Combined with the per-account daily cap of
+# 10 and the aggregate pool-gate, this keeps invite cadence well within
+# manual-use patterns.
+_UNIPILE_INVITE_MIN_INTERVAL_S = 300.0
+_UNIPILE_INVITE_JITTER_MAX_S = 300.0
+
+# LinkedIn caps invite-note text at 200 chars on the standard
+# in-mail/network invite flow (Premium accounts get more, but we don't
+# rely on Premium). Enforced server-side too; we validate client-side
+# so we surface a clean error instead of a 4xx surprise.
+LINKEDIN_INVITE_NOTE_MAX_CHARS = 200
 
 
-def _throttle_users_call() -> None:
-    """Block briefly so consecutive `/users/{slug}` calls space out with
-    human-like cadence. Process-global lock; safe in single-worker mode
-    (the only mode the engine runs in today)."""
+# ── Per-account throttle state ──────────────────────────────────────────
+#
+# Each throttle category keeps a dict keyed by account_id → last-call
+# timestamp + a per-key lock. ``defaultdict``-style auto-creation on
+# first access via the ``_get_account_*`` helpers below.
+#
+# Note: an empty account_id ("" or None — e.g. legacy callers that
+# haven't been migrated to pass it) falls back to a shared bucket
+# keyed by "__global__". Eventually we want every call to pass an
+# explicit account_id, but the fallback bucket keeps existing callers
+# working during the migration.
+
+_FALLBACK_ACCOUNT_KEY = "__global__"
+
+_users_throttle_last_ts: dict[str, float] = {}
+_users_throttle_locks: dict[str, threading.Lock] = {}
+_users_throttle_state_lock = threading.Lock()  # guards the dict structures
+
+_search_throttle_last_ts: dict[str, float] = {}
+_search_throttle_locks: dict[str, threading.Lock] = {}
+_search_throttle_state_lock = threading.Lock()
+
+_default_throttle_last_ts: dict[str, float] = {}
+_default_throttle_locks: dict[str, threading.Lock] = {}
+_default_throttle_state_lock = threading.Lock()
+
+_post_comment_throttle_last_ts: dict[str, float] = {}
+_post_comment_throttle_locks: dict[str, threading.Lock] = {}
+_post_comment_throttle_state_lock = threading.Lock()
+
+_invite_throttle_last_ts: dict[str, float] = {}
+_invite_throttle_locks: dict[str, threading.Lock] = {}
+_invite_throttle_state_lock = threading.Lock()
+
+
+def _account_key(account_id: str | None) -> str:
+    aid = (account_id or "").strip()
+    return aid or _FALLBACK_ACCOUNT_KEY
+
+
+def _get_throttle_lock(
+    locks_dict: dict[str, threading.Lock],
+    state_lock: threading.Lock,
+    key: str,
+) -> threading.Lock:
+    """Get-or-create the per-account lock atomically."""
+    lock = locks_dict.get(key)
+    if lock is not None:
+        return lock
+    with state_lock:
+        lock = locks_dict.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            locks_dict[key] = lock
+        return lock
+
+
+def _human_delay_seconds(base_s: float, jitter_s: float) -> float:
+    """Return a wait duration that resists automation pattern-matching.
+
+    Standard mode (90% of calls): base + uniform(0, jitter) — same shape
+    as the old uniform jitter, gives most calls a predictable-ish gap.
+
+    Occasional long pause (10% of calls): uniform(base*3, base*8) — a
+    much longer "task switch / read break" that scrambles the inter-call
+    distribution so the classifier sees a heavy-tailed pattern instead
+    of a tight band of values. Empirically this is what real human
+    browsing looks like — short bursts of activity separated by long
+    irregular pauses (composing a reply, reading a thread, walking away
+    to grab coffee, etc.).
+    """
     import random as _rand
-    global _users_throttle_last_ts
-    with _users_throttle_lock:
-        now = time.monotonic()
-        elapsed = now - _users_throttle_last_ts
-        wait = _UNIPILE_USERS_MIN_INTERVAL_S - elapsed
-        wait += _rand.uniform(0, _UNIPILE_USERS_JITTER_MAX_S)
+    if _rand.random() < 0.10:
+        return _rand.uniform(base_s * 3.0, base_s * 8.0)
+    return base_s + _rand.uniform(0, jitter_s)
+
+
+def _throttle_users_call(account_id: str | None = None) -> None:
+    """Space `/users/{slug}` calls with humanlike timing — PER ACCOUNT.
+
+    Each LinkedIn-session profile view triggers a "X viewed your profile"
+    notification on the target, so this is the loudest signal we make.
+    Per-account state means two accounts in the pool can fire in parallel
+    without contending on the same lock; each individual account still
+    stays at humanlike cadence."""
+    key = _account_key(account_id)
+    lock = _get_throttle_lock(
+        _users_throttle_locks, _users_throttle_state_lock, key,
+    )
+    with lock:
+        last_ts = _users_throttle_last_ts.get(key, 0.0)
+        elapsed = time.monotonic() - last_ts
+        target_gap = _human_delay_seconds(
+            _UNIPILE_USERS_MIN_INTERVAL_S,
+            _UNIPILE_USERS_JITTER_MAX_S,
+        )
+        wait = target_gap - elapsed
         if wait > 0:
             time.sleep(wait)
-        _users_throttle_last_ts = time.monotonic()
+        _users_throttle_last_ts[key] = time.monotonic()
+    try:
+        from app.services import cost_tracker
+        cost_tracker.record_unipile_call("profile_view")
+    except Exception:  # noqa: BLE001
+        pass
 
 
-def _throttle_search_call() -> None:
-    """Block briefly so consecutive `/linkedin/search` calls space out below
-    Unipile's burst rate-limit. Used by people-search (RULE 24) and content
-    search (keyword post search). Process-global lock; safe in single-worker
-    mode."""
-    import random as _rand
-    global _search_throttle_last_ts
-    with _search_throttle_lock:
-        now = time.monotonic()
-        elapsed = now - _search_throttle_last_ts
-        wait = _UNIPILE_SEARCH_MIN_INTERVAL_S - elapsed
-        wait += _rand.uniform(0, _UNIPILE_SEARCH_JITTER_MAX_S)
+def _throttle_search_call(account_id: str | None = None) -> None:
+    """Space `/linkedin/search` calls with humanlike timing — PER ACCOUNT."""
+    key = _account_key(account_id)
+    lock = _get_throttle_lock(
+        _search_throttle_locks, _search_throttle_state_lock, key,
+    )
+    with lock:
+        last_ts = _search_throttle_last_ts.get(key, 0.0)
+        elapsed = time.monotonic() - last_ts
+        target_gap = _human_delay_seconds(
+            _UNIPILE_SEARCH_MIN_INTERVAL_S,
+            _UNIPILE_SEARCH_JITTER_MAX_S,
+        )
+        wait = target_gap - elapsed
         if wait > 0:
             time.sleep(wait)
-        _search_throttle_last_ts = time.monotonic()
+        _search_throttle_last_ts[key] = time.monotonic()
+    try:
+        from app.services import cost_tracker
+        cost_tracker.record_unipile_call("search")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _throttle_post_comment_call(account_id: str | None = None) -> None:
+    """Space write actions (POST /posts/{id}/comments) — PER ACCOUNT.
+
+    90s baseline + 0–90s jitter (1.5–3 min typical) with 10% chance of
+    a 4.5–12 min "read the thread" pause. Sequential user clicks on
+    "Send reply" on the SAME account queue behind this lock; clicks
+    using different accounts (e.g. multi-operator deployments) fire
+    in parallel."""
+    key = _account_key(account_id)
+    lock = _get_throttle_lock(
+        _post_comment_throttle_locks, _post_comment_throttle_state_lock, key,
+    )
+    with lock:
+        last_ts = _post_comment_throttle_last_ts.get(key, 0.0)
+        elapsed = time.monotonic() - last_ts
+        target_gap = _human_delay_seconds(
+            _UNIPILE_POST_COMMENT_MIN_INTERVAL_S,
+            _UNIPILE_POST_COMMENT_JITTER_MAX_S,
+        )
+        wait = target_gap - elapsed
+        if wait > 0:
+            log.info(
+                "post_comment throttle (account=%s): sleeping %.1fs",
+                key[:18], wait,
+            )
+            time.sleep(wait)
+        _post_comment_throttle_last_ts[key] = time.monotonic()
+
+
+def _throttle_invite_call(account_id: str | None = None) -> None:
+    """Space LinkedIn invite calls — PER ACCOUNT.
+
+    5min baseline + 0–5min jitter (5–10 min typical) with 10% chance of
+    a 15–40 min "stepped away" pause via ``_human_delay_seconds``. Invites
+    are the highest-risk anti-automation signal on LinkedIn (recipients
+    see them in real-time notifications), so the gap is materially
+    longer than post_comment's 90s.
+
+    Concurrent ``send_invitation`` calls on the SAME account_id queue
+    behind this lock; calls using different accounts (pool rotation)
+    fire in parallel. The aggregate pool-gate (``unipile_pool``) layers
+    on top to prevent burst across accounts.
+    """
+    key = _account_key(account_id)
+    lock = _get_throttle_lock(
+        _invite_throttle_locks, _invite_throttle_state_lock, key,
+    )
+    with lock:
+        last_ts = _invite_throttle_last_ts.get(key, 0.0)
+        elapsed = time.monotonic() - last_ts
+        target_gap = _human_delay_seconds(
+            _UNIPILE_INVITE_MIN_INTERVAL_S,
+            _UNIPILE_INVITE_JITTER_MAX_S,
+        )
+        wait = target_gap - elapsed
+        if wait > 0:
+            log.info(
+                "invite throttle (account=%s): sleeping %.1fs",
+                key[:18], wait,
+            )
+            time.sleep(wait)
+        _invite_throttle_last_ts[key] = time.monotonic()
+
+
+def _throttle_default_call(account_id: str | None = None) -> None:
+    """Universal pre-call gate fired before *every* Unipile HTTP request
+    — PER ACCOUNT.
+
+    Spaces consecutive calls per LinkedIn-session with humanlike timing
+    (3–6s typical, ~10% chance of a 9–24s pause). Stacks on top of the
+    more aggressive search/users/post_comment throttles for those
+    specific endpoints.
+    """
+    key = _account_key(account_id)
+    lock = _get_throttle_lock(
+        _default_throttle_locks, _default_throttle_state_lock, key,
+    )
+    with lock:
+        last_ts = _default_throttle_last_ts.get(key, 0.0)
+        elapsed = time.monotonic() - last_ts
+        target_gap = _human_delay_seconds(
+            _UNIPILE_DEFAULT_MIN_INTERVAL_S,
+            _UNIPILE_DEFAULT_JITTER_MAX_S,
+        )
+        wait = target_gap - elapsed
+        if wait > 0:
+            time.sleep(wait)
+        _default_throttle_last_ts[key] = time.monotonic()
 
 
 class UnipileNotConfigured(RuntimeError):
@@ -123,6 +351,27 @@ class UnipileComment:
     published_at: datetime | None
     reaction_count: int = 0
     reply_count: int = 0
+
+
+@dataclass(frozen=True)
+class UnipileCommentReply:
+    """A reply nested under one of our top-level comments.
+
+    Intentionally narrower than ``UnipileComment``: we store only the data
+    needed to render the reply thread in the manual-comments UI (author
+    name + text + time), explicitly NOT the author's profile URL or
+    public identifier — the product decision is to render replies as a
+    flat list without linking out to author profiles.
+
+    ``author_provider_id`` IS captured (as ACoAAA-form member URN) so the
+    reply-to-reply flow can post a proper @-mention back via Unipile's
+    ``mentions`` body field — the alternative (plain-text name) renders as
+    raw text on LinkedIn instead of a clickable tag."""
+    comment_id: str
+    text: str
+    author_name: str | None
+    author_provider_id: str | None
+    published_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -170,6 +419,14 @@ class UnipilePerson:
     company: str | None
     location: str | None
     network_distance: str | None  # "1", "2", "3" — LinkedIn's degree label
+    # provider_id IS already returned by Unipile's people-search response
+    # under the `id` key (ACoAA…-form member URN). Capturing it here lets
+    # `_run_unipile_title_search` skip the otherwise-redundant /users/{slug}
+    # resolve call inside `get_user_posts` — that resolve was previously
+    # consuming the whole `profile_view` daily cap AND firing a "X viewed
+    # your profile" notification on every stranger in the people-search
+    # roster (loudest automation signal on the platform). 2026-05-14 fix.
+    provider_id: str | None = None
 
 
 # RULE 24 — LinkedIn's geoUrn for the United States. Matches the audit's
@@ -206,14 +463,28 @@ def _client() -> httpx.Client:
     )
 
 
-def _request_with_429_retry(client: httpx.Client, method: str, path: str, **kwargs: Any) -> httpx.Response:
+def _request_with_429_retry(
+    client: httpx.Client,
+    method: str,
+    path: str,
+    *,
+    account_id: str | None = None,
+    **kwargs: Any,
+) -> httpx.Response:
     """Run one HTTP call; on 429 retry with exponential backoff (in-process).
+
+    Every call passes through ``_throttle_default_call(account_id)`` first —
+    per-account pacing so two accounts in the pool can fire in parallel
+    while each individual session stays humanlike.
+
+    Callers that don't pass ``account_id`` get the shared ``__global__``
+    bucket (legacy compat). New call sites should always pass the
+    account_id of the LinkedIn session they're using.
 
     Wraps httpx/httpcore transport errors (connect timeout, read timeout,
     pool full, DNS, etc.) as ``UnipileError`` so callers' existing
-    ``except UnipileError`` handlers catch them consistently. Without this
-    wrap, a raw ``httpcore.ConnectTimeout`` propagates past discovery's
-    per-query error handlers and kills the entire daily_run."""
+    ``except UnipileError`` handlers catch them consistently."""
+    _throttle_default_call(account_id)
     m = method.upper()
     last: httpx.Response | None = None
     for attempt in range(_UNIPILE_429_MAX_ATTEMPTS):
@@ -228,10 +499,41 @@ def _request_with_429_retry(client: httpx.Client, method: str, path: str, **kwar
             ) from err
         if last.status_code != 429:
             return last
+
+        # Distinguish Unipile-side 429 (their gateway limit; retrying helps)
+        # from LinkedIn-side 429 (the "provider" — Yair's account itself is
+        # being throttled by LinkedIn; retrying makes it WORSE because each
+        # retry burns more of his per-account budget and prolongs the cooldown).
+        #
+        # Unipile's response body for the LinkedIn-side variant looks like:
+        #   {"status":429,"type":"errors/too_many_requests",
+        #    "title":"Too many requests",
+        #    "detail":"The provider cannot accept any more requests at the
+        #             moment. Please try again later."}
+        # We sniff the "provider" keyword in the body to decide. On a
+        # provider-429 we fail FAST (no retry) and let the caller surface the
+        # condition; callers can then back off at the application layer
+        # (e.g. skip remaining jobs in the refresh loop) rather than us
+        # silently hammering LinkedIn harder.
+        body_lower = ""
+        try:
+            body_lower = (last.text or "").lower()
+        except Exception:
+            body_lower = ""
+        is_provider_429 = "provider" in body_lower
+        if is_provider_429:
+            log.warning(
+                "unipile 429 PROVIDER-side %s %s — failing fast (retry would "
+                "extend LinkedIn cooldown on this account)",
+                m,
+                path[:160],
+            )
+            return last  # caller will see 429 and raise UnipileError
+
         if attempt < _UNIPILE_429_MAX_ATTEMPTS - 1:
             delay = _UNIPILE_429_BACKOFF_BASE_S * (2**attempt)
             log.warning(
-                "unipile 429 %s %s attempt %d/%d, sleeping %.2fs",
+                "unipile 429 UNIPILE-side %s %s attempt %d/%d, sleeping %.2fs",
                 m,
                 path[:120],
                 attempt + 1,
@@ -523,10 +825,11 @@ def _search_posts_call(
     params: dict[str, Any] = {"account_id": account_id, "limit": limit}
     if cursor is not None and str(cursor).strip():
         params["cursor"] = cursor
-    _throttle_search_call()
+    _throttle_search_call(account_id)
     with _client() as client:
         resp = _request_with_429_retry(
-            client, "POST", "/linkedin/search", params=params, json=body
+            client, "POST", "/linkedin/search",
+            account_id=account_id, params=params, json=body,
         )
     payload = _check_resp(resp, "search_posts")
     items = payload.get("items") or payload.get("results") or []
@@ -732,7 +1035,8 @@ def search_parameter_ids(
     }
     with _client() as client:
         resp = _request_with_429_retry(
-            client, "GET", "/linkedin/search/parameters", params=params
+            client, "GET", "/linkedin/search/parameters",
+            account_id=account_id, params=params,
         )
     payload = _check_resp(resp, "search_parameter_ids")
     items = payload.get("items") or []
@@ -915,6 +1219,10 @@ def _parse_unipile_person(raw: dict[str, Any]) -> UnipilePerson | None:
         public_id = profile_url.split("/in/", 1)[1].split("/", 1)[0].split("?", 1)[0]
     if not public_id:
         return None
+    # Capture provider_id (ACoAA…-form URN). Unipile returns it inline on
+    # people-search; keeping it lets get_user_posts skip the resolve call.
+    raw_id = (raw.get("id") or raw.get("provider_id") or "").strip()
+    provider_id = raw_id if raw_id.startswith("AC") and len(raw_id) >= 30 else None
     return UnipilePerson(
         name=name or "(unknown)",
         public_identifier=public_id,
@@ -922,6 +1230,7 @@ def _parse_unipile_person(raw: dict[str, Any]) -> UnipilePerson | None:
         title=raw.get("headline") or raw.get("title") or raw.get("occupation"),
         company=raw.get("company") or raw.get("company_name"),
         location=raw.get("location"),
+        provider_id=provider_id,
         # Unipile returns "DISTANCE_1" / "DISTANCE_2" / "DISTANCE_3" /
         # "OUT_OF_NETWORK". Pass through verbatim so the caller can filter
         # without ambiguity.
@@ -976,12 +1285,13 @@ def search_people(
         body["industry"] = list(industry_ids)
     if network_distance_degrees:
         body["network_distance"] = list(network_distance_degrees)
-    _throttle_search_call()
+    _throttle_search_call(account_id)
     with _client() as client:
         resp = _request_with_429_retry(
             client,
             "POST",
             "/linkedin/search",
+            account_id=account_id,
             params={"account_id": account_id, "limit": limit},
             json=body,
         )
@@ -1018,10 +1328,11 @@ def _resolve_user_provider_id(client: httpx.Client, *, account_id: str, slug: st
     Throttled to ~1.4s+jitter between calls to mimic human cadence and
     avoid LinkedIn's automation-detection heuristics on /users/.
     """
-    _throttle_users_call()
+    _throttle_users_call(account_id)
     try:
         resp = _request_with_429_retry(
-            client, "GET", f"/users/{slug}", params={"account_id": account_id}
+            client, "GET", f"/users/{slug}",
+            account_id=account_id, params={"account_id": account_id},
         )
     except httpx.RequestError:
         return None
@@ -1073,6 +1384,7 @@ def get_user_posts(
             client,
             "GET",
             f"/users/{user_id}/posts",
+            account_id=account_id,
             params={"account_id": account_id, "limit": limit},
         )
     if resp.status_code == 404:
@@ -1148,6 +1460,7 @@ def get_post(*, account_id: str, post_id_or_url: str) -> UnipilePost | None:
             client,
             "GET",
             f"/posts/{post_id}",
+            account_id=account_id,
             params={"account_id": account_id},
         )
     if resp.status_code == 404:
@@ -1158,11 +1471,47 @@ def get_post(*, account_id: str, post_id_or_url: str) -> UnipilePost | None:
 
 # ---------------------------------------------------------------- comments
 
+def _post_urn_path(post_url_or_id: str) -> str | None:
+    """Convert a post URL or bare numeric id to the URN-encoded path segment
+    Unipile requires for nested ``/posts/{post_id}/comments`` calls.
+
+    Unipile's nested endpoint rejects bare numerics (400 'invalid post_id')
+    and only accepts ``urn:li:activity:<id>`` (URL-encoded). The flat
+    ``/posts/comments?post_url=...`` form was easier to call but is more
+    aggressively rate-limited by LinkedIn — we standardize on the nested
+    form for both stats reads (verified working against Account B even when
+    Yair's account is in cooldown)."""
+    pid = extract_post_id_from_url(post_url_or_id) if "linkedin.com" in (post_url_or_id or "") else (post_url_or_id or "").strip()
+    if not pid:
+        return None
+    # If we got a bare numeric activity id, wrap it as a URN. If it's already
+    # a urn:li:activity:/ugcPost:/share: form, keep it as-is.
+    if pid.startswith("urn:li:"):
+        urn = pid
+    elif pid.isdigit():
+        urn = f"urn:li:activity:{pid}"
+    else:
+        # Some Unipile post_ids come back as bare ugcPost/share strings
+        # without the urn prefix — leave alone for the API to handle.
+        urn = pid
+    # urllib.parse.quote with safe='' so the colons get percent-encoded
+    # exactly as Unipile expects (verified via curl 2026-05-14).
+    return _quote(urn, safe="")
+
+
 def get_post_comments(*, account_id: str, post_url: str) -> list[UnipileComment]:
-    """
-    Fetch comments on a LinkedIn post. Unipile resolves `post` from a URL or
-    LinkedIn social_id; we pass the URL directly.
-    """
+    """Fetch top-level comments on a LinkedIn post.
+
+    Uses Unipile's nested ``GET /posts/{post_urn}/comments`` endpoint (the
+    REST-canonical shape). Confirmed shape via direct curl 2026-05-14:
+    bare numeric post_id → 400 'invalid post_id'; URN-encoded path → 200.
+
+    The ``account_id`` here is the LinkedIn session whose perspective we
+    use to read — typically NOT the same account that posted the comment
+    we're tracking. Reading is a public-graph operation so any healthy
+    LinkedIn session works, which lets the manual-comments refresh route
+    use a dedicated stats account (``settings.unipile_stats_account_id``)
+    decoupled from Yair's posting account."""
     if settings.unipile_mock:
         return _MOCK_COMMENTS.get(post_url, [])
 
@@ -1170,29 +1519,112 @@ def get_post_comments(*, account_id: str, post_url: str) -> list[UnipileComment]
         raise UnipileError("get_post_comments: account_id required")
     if not post_url:
         return []
+    urn_path = _post_urn_path(post_url)
+    if not urn_path:
+        return []
     with _client() as client:
         resp = _request_with_429_retry(
             client,
             "GET",
-            "/posts/comments",
-            params={"account_id": account_id, "post_url": post_url, "limit": 100},
+            f"/posts/{urn_path}/comments",
+            account_id=account_id,
+            params={"account_id": account_id, "limit": 100},
         )
+    if resp.status_code == 404:
+        return []
     payload = _check_resp(resp, "get_post_comments")
     items = payload.get("items") or []
     out: list[UnipileComment] = []
     for raw in items:
-        author = raw.get("author") or {}
+        # Unipile returns rich nested ``author_details`` plus a flat
+        # ``author`` (display name). Older shape had ``author`` as a dict;
+        # we accept both for forward-compat.
+        author_raw = raw.get("author")
+        if isinstance(author_raw, dict):
+            author = author_raw
+            author_name = author.get("name")
+        else:
+            author = raw.get("author_details") or {}
+            author_name = author_raw if isinstance(author_raw, str) else author.get("name")
         out.append(
             UnipileComment(
                 comment_id=str(raw.get("id") or ""),
                 text=raw.get("text") or "",
-                author_name=author.get("name"),
-                author_provider_id=author.get("provider_id") or author.get("urn"),
+                author_name=author_name,
+                author_provider_id=author.get("id") or author.get("provider_id") or author.get("urn"),
                 author_public_identifier=author.get("public_identifier"),
-                author_profile_url=author.get("public_profile_url"),
+                author_profile_url=author.get("profile_url") or author.get("public_profile_url"),
                 published_at=_parse_iso(raw.get("date") or raw.get("published_at")),
                 reaction_count=_safe_int(raw.get("reaction_counter") or raw.get("num_reactions")),
                 reply_count=_safe_int(raw.get("reply_counter") or raw.get("num_replies")),
+            )
+        )
+    return out
+
+
+def get_comment_replies(
+    *,
+    account_id: str,
+    post_url: str,
+    comment_id: str,
+) -> list[UnipileCommentReply]:
+    """Fetch the replies nested under one of our previously-posted comments.
+
+    Uses ``GET /posts/{post_urn}/comments?comment_id=<parent_id>`` — the
+    same nested endpoint as ``get_post_comments``, but with ``comment_id``
+    set as a query param to scope to the replies under that thread.
+    Confirmed shape via direct curl 2026-05-14: response items have
+    ``thread_id`` matching the parent comment_id, ``reply_counter`` 0
+    (replies are leaves in our flat model).
+
+    Returns ``[]`` on any of: empty account_id/post_url/comment_id, 404,
+    or no items. ``UnipileError`` propagates so the caller's
+    rate-limit / circuit-breaker logic still applies (refresh-engagement
+    short-circuits the loop on the first provider-side 429)."""
+    if settings.unipile_mock:
+        return []
+    if not account_id or not post_url or not comment_id:
+        return []
+    urn_path = _post_urn_path(post_url)
+    if not urn_path:
+        return []
+    with _client() as client:
+        resp = _request_with_429_retry(
+            client,
+            "GET",
+            f"/posts/{urn_path}/comments",
+            account_id=account_id,
+            params={
+                "account_id": account_id,
+                "comment_id": comment_id,
+                "limit": 100,
+            },
+        )
+    if resp.status_code == 404:
+        return []
+    payload = _check_resp(resp, "get_comment_replies")
+    items = payload.get("items") or []
+    out: list[UnipileCommentReply] = []
+    for raw in items:
+        # Tolerate both shapes: ``author`` as flat string (current Unipile
+        # response) or ``author`` as dict with ``name`` (older shape).
+        author_raw = raw.get("author")
+        author_details = raw.get("author_details") or {}
+        if isinstance(author_raw, dict):
+            author_name = author_raw.get("name")
+            author_pid = author_raw.get("id") or author_raw.get("provider_id") or author_raw.get("urn")
+        else:
+            author_name = author_raw if isinstance(author_raw, str) else None
+            # `author_details.id` is the ACoAAA-form member URN we need for
+            # @-mentions when replying back to this reply.
+            author_pid = author_details.get("id") or author_details.get("provider_id") or author_details.get("urn")
+        out.append(
+            UnipileCommentReply(
+                comment_id=str(raw.get("id") or ""),
+                text=raw.get("text") or "",
+                author_name=author_name,
+                author_provider_id=(str(author_pid).strip() if author_pid else None),
+                published_at=_parse_iso(raw.get("date") or raw.get("published_at")),
             )
         )
     return out
@@ -1204,8 +1636,29 @@ def post_comment(
     post_url: str,
     text: str,
     parent_comment_id: str | None = None,
+    mentions: list[dict[str, Any]] | None = None,
 ) -> UnipileCommentPostResult:
-    """POST a top-level or threaded comment on a LinkedIn post via Unipile."""
+    """POST a top-level or threaded comment on a LinkedIn post via Unipile.
+
+    Mentions
+    --------
+    Pass ``mentions=[{"name": "Tarpan Patel", "profile_id": "ACoAAA17..."}]``
+    to render @-mentions in the resulting LinkedIn comment. The ``text``
+    field must reference each mention by index via the ``{{N}}`` placeholder
+    (Unipile substitutes the placeholder with a real LinkedIn @-tag at post
+    time). Example::
+
+        post_comment(
+            ...,
+            text="{{0}} thanks for the thoughtful reply…",
+            mentions=[{"name": "Tarpan Patel",
+                       "profile_id": "ACoAAA17lcwBbmp21rltGYgcFamfKdZfci9oojw"}],
+        )
+
+    Without ``mentions``, names are sent as plain text and LinkedIn shows
+    them un-tagged (the operator reported this on 2026-05-14 — "Michael
+    Colivet Not bad take" rendered as raw text, not a clickable mention).
+    """
     if not account_id:
         raise UnipileError("post_comment: account_id required")
     if settings.unipile_mock:
@@ -1218,23 +1671,413 @@ def post_comment(
     post_id = extract_post_id_from_url(post_url)
     if not post_id:
         raise UnipileError("post_comment: could not parse post id from URL")
-    body: dict[str, Any] = {"text": text[:8000]}
+
+    # **POST endpoint requires the real social_id URN, NOT the activity id.**
+    # LinkedIn URLs end with `activity-<N>` for ANY post — but the post's
+    # actual social_id is typically `urn:li:ugcPost:<M>` (different N vs M).
+    # Unipile's GET /posts auto-resolves activity→post; POST /posts/.../comments
+    # does NOT and returns 422 "invalid_post / Post cannot be found" on a
+    # bare or URN-wrapped activity ID. Verified live 2026-05-14 against
+    # Jason Yarbrough's `nycdoe-nychealth` post — bare and URN-activity
+    # forms both 422'd, URN-ugcPost succeeded.
+    #
+    # Resolution path:
+    #   1. extract_post_id_from_url returns the activity numeric (URL fmt).
+    #   2. GET /posts/{activity} → returns {social_id: "urn:li:ugcPost:..."}
+    #   3. POST /posts/{social_id_url_encoded}/comments → success.
+    #
+    # We use the social_id for the path. If the post was originally a
+    # ugcPost/share URL, extract_post_id_from_url already returned the
+    # URN form and we skip the resolve step.
+    resolved_social_id: str = post_id
+    needs_resolve = post_id.isdigit()  # bare numeric = activity form
+    if needs_resolve:
+        try:
+            with _client() as resolve_client:
+                resolve_resp = _request_with_429_retry(
+                    resolve_client,
+                    "GET",
+                    f"/posts/{post_id}",
+                    account_id=account_id,
+                    params={"account_id": account_id},
+                )
+            if resolve_resp.status_code == 200:
+                payload = resolve_resp.json() or {}
+                resolved = (payload.get("social_id") or "").strip()
+                if resolved:
+                    resolved_social_id = resolved
+                    log.info(
+                        "post_comment: resolved activity %s → %s",
+                        post_id, resolved,
+                    )
+                else:
+                    # Unipile returned 200 but no social_id — fall through
+                    # with the original post_id; the POST will surface the
+                    # underlying error (404/422) for the caller to handle.
+                    log.warning(
+                        "post_comment: GET /posts/%s returned no social_id; "
+                        "trying POST with activity id (likely will 422)",
+                        post_id,
+                    )
+            elif resolve_resp.status_code == 404:
+                raise UnipileError(
+                    f"post_comment: post not found ({post_id}) — "
+                    "LinkedIn URL may be private, deleted, or blocked for "
+                    "this account"
+                )
+        except UnipileError:
+            raise
+        except Exception as err:  # noqa: BLE001
+            log.warning(
+                "post_comment: resolve step failed (%s) — falling through "
+                "with activity id; POST may 422 if the post is a ugcPost",
+                err,
+            )
+
+    # URL-encode the resolved path component (URNs contain colons which
+    # need percent-encoding). Use safe='' so the colons get escaped.
+    post_path = _quote(resolved_social_id, safe="")
+
+    body: dict[str, Any] = {"account_id": account_id, "text": text[:8000]}
     if parent_comment_id:
         body["comment_id"] = parent_comment_id
+    if mentions:
+        # Filter to entries with both `name` and `profile_id` — Unipile rejects
+        # entries missing either. Silent skip so a malformed mention doesn't
+        # block the rest of the post.
+        cleaned = [
+            {"name": str(m["name"]), "profile_id": str(m["profile_id"])}
+            for m in mentions
+            if isinstance(m, dict) and m.get("name") and m.get("profile_id")
+        ]
+        if cleaned:
+            body["mentions"] = cleaned
+
+    # Humanlike pacing for write actions — 90s+ between comments PER account.
+    # Sequential user clicks queue here and drip out at a believable rate;
+    # standalone first-of-day clicks fire immediately (no gap to enforce).
+    _throttle_post_comment_call(account_id)
+
+    # Audit log — capture exactly what's about to hit the wire so we can
+    # forensically reconstruct what happened on every write. Mentions
+    # field is the one most likely to silently fail (Unipile may drop it
+    # without erroring, LinkedIn may render it as plain text). Logging
+    # the body shape here means any future "mention didn't tag" report
+    # has hard evidence within ~1 minute of the click.
+    _mentions_summary = (
+        f"mentions={len(body['mentions'])}({[m['name'] for m in body['mentions']]})"
+        if body.get("mentions") else "mentions=NONE"
+    )
+    log.warning(
+        "post_comment WIRE → path=/posts/%s/comments  account=%s  "
+        "parent=%s  text_starts=%r  text_has_placeholder=%s  %s",
+        resolved_social_id[:60],
+        account_id[:18],
+        (parent_comment_id or "")[:24],
+        body["text"][:80],
+        "{{0}}" in body["text"],
+        _mentions_summary,
+    )
+
     with _client() as client:
         resp = _request_with_429_retry(
             client,
             "POST",
-            f"/posts/{post_id}/comments",
+            f"/posts/{post_path}/comments",
+            account_id=account_id,
             params={"account_id": account_id},
             json=body,
         )
     payload = _check_resp(resp, "post_comment")
+    # Log Unipile's response so we can see if mentions echoed back or
+    # were silently dropped.
+    log.warning(
+        "post_comment RESPONSE ← status=%d  body=%s",
+        resp.status_code,
+        (resp.text or "")[:300],
+    )
     cid = str(payload.get("id") or payload.get("comment_id") or payload.get("urn") or "")
     return UnipileCommentPostResult(
         comment_id=cid,
         posted_at=_parse_iso(payload.get("date") or payload.get("created_at")),
         raw=payload,
+    )
+
+
+# ── LinkedIn invitations (connection request with optional note) ──────────
+
+
+@dataclass(frozen=True)
+class UnipileInvitationResult:
+    """Result of POST /users/invite. Unipile returns a server-side
+    invitation id we persist for later status polling, plus the raw
+    payload for forensic audit."""
+    invitation_id: str | None
+    sent_at: datetime | None
+    raw: dict[str, Any]
+
+
+def send_invitation(
+    *,
+    account_id: str,
+    provider_id: str,
+    message: str | None = None,
+) -> UnipileInvitationResult:
+    """Send a LinkedIn connection request, optionally with a note.
+
+    Unipile endpoint: ``POST /api/v1/users/invite`` with body
+    ``{account_id, provider_id, message?}``. ``provider_id`` is the
+    target's ACoAA… member URN (the same form Unipile returns from
+    people-search and ``resolve_profile``).
+
+    Args:
+        account_id: pool account that owns the LinkedIn session. The
+            caller is responsible for ensuring this is the SAME account
+            that posted the original comment the recipient replied to,
+            so the invite looks like a natural follow-up rather than a
+            stranger reaching out.
+        provider_id: LinkedIn URN of the invite target (ACoAA…).
+        message: optional invite note, ≤200 chars. LinkedIn truncates
+            silently above the cap; we validate up front so callers see
+            a clean ``ValueError`` instead.
+
+    Returns:
+        UnipileInvitationResult with the Unipile invitation_id (used for
+        status polling) and the raw response payload.
+
+    Raises:
+        ValueError: message too long or required params missing.
+        UnipileError: Unipile responded 4xx/5xx (most commonly 422 if a
+            connection / pending invite already exists, or 429 if the
+            account has hit LinkedIn's invite rate limit).
+        UnipileNotConfigured: ``UNIPILE_MOCK`` is set or credentials
+            missing.
+
+    Throttle stack applied:
+      • Layer 1 — per-account ``_throttle_invite_call`` (5–10 min gap)
+      • Layer 2 — universal ``_throttle_default_call`` (3–6 s gap, via
+        ``_request_with_429_retry``)
+      • Layer 3 — pool aggregate gate (only applies when called via
+        ``_pool_acquire("invite", …)`` — direct callers bypass it)
+    """
+    if settings.unipile_mock:
+        raise UnipileNotConfigured(
+            "send_invitation: UNIPILE_MOCK=true — refusing to issue a real "
+            "LinkedIn invite. Set UNIPILE_MOCK=false to enable."
+        )
+    if not account_id:
+        raise ValueError("send_invitation: account_id is required")
+    if not provider_id:
+        raise ValueError("send_invitation: provider_id is required")
+    pid = provider_id.strip()
+    if not (pid.startswith("AC") and len(pid) >= 30):
+        raise ValueError(
+            f"send_invitation: provider_id must be the ACoAA… member URN form "
+            f"returned by people-search / resolve_profile. Got {pid[:24]!r}"
+        )
+    note = (message or "").strip()
+    if len(note) > LINKEDIN_INVITE_NOTE_MAX_CHARS:
+        raise ValueError(
+            f"send_invitation: note length {len(note)} exceeds LinkedIn's "
+            f"{LINKEDIN_INVITE_NOTE_MAX_CHARS}-char cap. Truncate before calling."
+        )
+
+    body: dict[str, Any] = {
+        "provider_id": pid,
+        "account_id": account_id,
+    }
+    if note:
+        body["message"] = note
+
+    # Per-account invite cadence: 5-10 min typical (15-40 min on the
+    # 10% long-pause draw). Stacks under the aggregate pool gate.
+    _throttle_invite_call(account_id)
+
+    # Forensic audit — log the wire payload before issuing. Invitations
+    # are visible to the recipient immediately so any "this invite came
+    # from the wrong account" or "this note shows up garbled" reports
+    # have hard evidence within ~1 minute of the click. Note text is
+    # truncated to 80 chars to keep log lines readable; full text is
+    # already in Mongo at `linkedin_invitations.note_text`.
+    log.warning(
+        "send_invitation WIRE → path=/users/invite  account=%s  "
+        "target=%s  has_note=%s  note_len=%d  note_starts=%r",
+        account_id[:18],
+        pid[:24],
+        bool(note),
+        len(note),
+        note[:80],
+    )
+
+    with _client() as client:
+        resp = _request_with_429_retry(
+            client,
+            "POST",
+            "/users/invite",
+            account_id=account_id,
+            params={"account_id": account_id},
+            json=body,
+        )
+    payload = _check_resp(resp, "send_invitation")
+    log.warning(
+        "send_invitation RESPONSE ← status=%d  body=%s",
+        resp.status_code, (resp.text or "")[:300],
+    )
+    inv_id = str(
+        payload.get("invitation_id")
+        or payload.get("id")
+        or payload.get("urn")
+        or ""
+    ) or None
+    sent_at = _parse_iso(
+        payload.get("sent_at") or payload.get("date") or payload.get("created_at")
+    )
+    # Cost tracker: invites are read-side-free + write-side-free under
+    # Unipile's subscription pricing (we pay the seat, not the call).
+    # Still emit a count so the cost dashboard's "calls" total reflects
+    # all paid + unpaid Unipile actions.
+    try:
+        from app.services import cost_tracker as _ct
+        _ct.record_unipile_call("invite")
+    except Exception:  # noqa: BLE001
+        pass  # never let a cost-recording failure swallow a real result
+
+    return UnipileInvitationResult(
+        invitation_id=inv_id,
+        sent_at=sent_at,
+        raw=payload,
+    )
+
+
+def get_invitation_status(
+    *,
+    account_id: str,
+    provider_id: str,
+) -> dict[str, Any]:
+    """Read the current relationship state between ``account_id`` and
+    ``provider_id``. Used by the background poller to flip
+    ``linkedin_invitations.status`` from ``sent`` to ``accepted`` /
+    ``declined`` / ``withdrawn``.
+
+    Unipile exposes relationship state via
+    ``GET /api/v1/users/relations/{provider_id}?account_id=...`` —
+    response shape varies but includes a ``status``/``connection_status``
+    field with values like ``CONNECTED``, ``INVITATION_SENT``,
+    ``INVITATION_RECEIVED``, ``NOT_CONNECTED``. Callers must map those
+    to our internal ``sent | accepted | declined | withdrawn`` vocabulary.
+
+    Read-only call; bypasses the heavy invite throttle and rides only
+    the default 3-6s gate via ``_request_with_429_retry``.
+    """
+    if settings.unipile_mock:
+        raise UnipileNotConfigured("get_invitation_status: UNIPILE_MOCK=true")
+    if not account_id or not provider_id:
+        raise ValueError("get_invitation_status: account_id + provider_id required")
+    pid = provider_id.strip()
+    with _client() as client:
+        resp = _request_with_429_retry(
+            client,
+            "GET",
+            f"/users/relations/{_quote(pid, safe='')}",
+            account_id=account_id,
+            params={"account_id": account_id},
+        )
+    payload = _check_resp(resp, "get_invitation_status")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _normalize_post_social_id(post_url_or_id: str) -> str:
+    """Return a LinkedIn post URN suitable for Unipile's ``post_social_id``
+    path parameter. Unipile's DELETE route validates the path against a
+    URN pattern; bare numeric IDs return 404 (route-not-matched).
+
+    Accepts any of:
+      - ``urn:li:activity:7432779696146112512`` → returned as-is
+      - ``7432779696146112512``                → wrapped to ``urn:li:activity:...``
+      - ``https://www.linkedin.com/feed/update/urn:li:activity:7432...``
+                                               → extracted + wrapped
+      - ``https://www.linkedin.com/posts/...activity-7432...``
+                                               → extracted + wrapped
+    """
+    raw = (post_url_or_id or "").strip()
+    if raw.startswith("urn:li:"):
+        return raw
+    pid = extract_post_id_from_url(raw) or raw
+    # If the URL embedded a urn: form, extract may have returned only the
+    # numeric ID. Re-check raw for any URN substring; otherwise wrap.
+    if pid.startswith("urn:li:"):
+        return pid
+    return f"urn:li:activity:{pid}"
+
+
+def _normalize_comment_social_id(
+    comment_id_or_urn: str, *, post_id_numeric: str | None = None
+) -> str:
+    """Return a LinkedIn comment URN suitable for Unipile's
+    ``comment_social_id`` path parameter.
+
+    Accepts:
+      - ``urn:li:comment:(activity:X,Y)`` → returned as-is
+      - bare numeric comment id (``7460373062606159872``) → wrapped to the
+        full ``urn:li:comment:(activity:{post},{comment})`` form. Requires
+        the parent post's numeric id (stored on the job at post-time).
+    """
+    raw = (comment_id_or_urn or "").strip()
+    if raw.startswith("urn:li:comment:"):
+        return raw
+    if not post_id_numeric:
+        # No way to construct a valid comment URN without the parent post.
+        # Return as-is so the caller can decide whether to surface the
+        # ambiguity. Unipile will likely 404 with a clearer message.
+        return raw
+    return f"urn:li:comment:(activity:{post_id_numeric},{raw})"
+
+
+class UnipileFeatureNotSupported(UnipileError):
+    """Raised when a Unipile endpoint we'd need is not exposed by their
+    public API. Distinct from a transient ``UnipileError`` (network /
+    rate-limit / auth) so callers can surface a different message and
+    fall back to a manual workflow instead of retrying."""
+
+
+def delete_comment(
+    *,
+    account_id: str,
+    post_url_or_id: str,
+    comment_id: str,
+) -> dict[str, Any]:
+    """**Not supported by Unipile.**
+
+    Probed against Unipile's API on 2026-05-13 with 11 different URL +
+    method combinations — every single one returned an HTTP-router 404
+    ("Cannot DELETE/PATCH/PUT/POST ...") meaning no controller is
+    registered for any comment-mutation route. The endpoints Unipile
+    actually exposes for comments are:
+
+      ✅ POST  /api/v1/posts/{post}/comments        (create)
+      ✅ GET   /api/v1/posts/{post}/comments        (list)
+      ❌ DELETE/PATCH/PUT — not registered, any shape
+
+    The OPTIONS response advertises all methods in
+    ``Access-Control-Allow-Methods`` but that's the CORS gateway's
+    blanket allowlist, not actual route handlers — confirmed because
+    each method 404s identically.
+
+    To delete a comment posted via Unipile, the operator must go to
+    LinkedIn directly (the comment's URL works in any browser) and use
+    the native "Delete" affordance there. The `manual_comments` UI
+    surfaces this via a two-step "Open on LinkedIn / Mark as deleted"
+    affordance instead of a single Delete button.
+
+    Raises ``UnipileFeatureNotSupported`` so the caller can render a
+    distinct UX rather than treat this as a transient failure.
+    """
+    raise UnipileFeatureNotSupported(
+        "Unipile does not expose a comment-delete endpoint. "
+        "Delete the comment directly on LinkedIn (open the post URL in "
+        "a browser), then mark the row as deleted in the manual-comments "
+        "UI for audit. Confirmed across 11 URL + method shapes on "
+        "2026-05-13 — see app/services/unipile.py:delete_comment docstring."
     )
 
 
@@ -1250,7 +2093,10 @@ def send_invite(
     if message:
         body["message"] = message[:300]
     with _client() as client:
-        resp = _request_with_429_retry(client, "POST", "/users/invite", json=body)
+        resp = _request_with_429_retry(
+            client, "POST", "/users/invite",
+            account_id=account_id, json=body,
+        )
     payload = _check_resp(resp, "send_invite")
     return str(payload.get("invitation_id") or payload.get("id") or "")
 
@@ -1337,7 +2183,21 @@ def find_account_by_name(name: str) -> UnipileAccount | None:
 # ---------------------------------------------------------------- profile lookup
 
 def resolve_profile(*, account_id: str, public_identifier_or_url: str) -> dict[str, Any]:
-    """Resolve a LinkedIn slug or URL to provider_id + member_urn.
+    """Resolve a LinkedIn slug or URL to provider_id + member_urn + a
+    minimal-but-useful work-experience snapshot.
+
+    Sends ``linkedin_sections=experience`` so the response includes the
+    ``work_experience`` array (each entry has ``company_id`` =
+    LinkedIn company id, ``company`` name, ``position``, ``location``,
+    ``description``). Without that param, Unipile returns only
+    headline + location + names (verified via curl 2026-05-14) — which
+    silently broke the discovery code that read ``raw.get("work_experience")``
+    expecting populated entries.
+
+    With the experience section we can derive ``employer_linkedin_id``
+    from ``first_job.company_id`` and chain into APIDirect
+    ``/v1/linkedin/company`` for structured industry/size/description,
+    closing the "Unipile fallback authors have no industry" gap.
 
     Throttled with ~1.4s + 0..0.6s jitter between consecutive calls — this
     endpoint hits LinkedIn's `/users/{slug}` surface, which LinkedIn's
@@ -1354,10 +2214,18 @@ def resolve_profile(*, account_id: str, public_identifier_or_url: str) -> dict[s
     slug = public_identifier_or_url
     if "/in/" in slug:
         slug = slug.split("/in/", 1)[1].split("/", 1)[0].split("?", 1)[0]
-    _throttle_users_call()
+    _throttle_users_call(account_id)
     with _client() as client:
         resp = _request_with_429_retry(
-            client, "GET", f"/users/{slug}", params={"account_id": account_id}
+            client,
+            "GET",
+            f"/users/{slug}",
+            account_id=account_id,
+            params={
+                "account_id": account_id,
+                # See docstring — without this, work_experience is absent.
+                "linkedin_sections": "experience",
+            },
         )
     return _check_resp(resp, "resolve_profile")
 

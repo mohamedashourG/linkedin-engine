@@ -117,12 +117,18 @@ def _to_response(user: dict[str, Any]) -> SettingsResponse:
     )
 
 
-@router.get("/", response_model=SettingsResponse)
+# Routes registered at "" (matches /api/settings exactly, no trailing
+# slash). Next.js dev-server strips trailing slashes when proxying to
+# upstream, so even if the frontend calls /api/settings/ the backend
+# receives /api/settings. Registering here at "" avoids FastAPI's
+# auto-307-redirect (which sends an ABSOLUTE URL Location that crosses
+# origins from 3000 → 8000 and gets CORS-blocked).
+@router.get("", response_model=SettingsResponse)
 async def get_settings(user: CurrentUser) -> SettingsResponse:
     return _to_response(user)
 
 
-@router.put("/", response_model=SettingsResponse)
+@router.put("", response_model=SettingsResponse)
 async def update_settings(
     payload: SettingsPatch,
     user: CurrentUser,

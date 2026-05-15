@@ -13,7 +13,14 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/shared/empty-state";
 import { CommentTracker } from "@/components/slate/comment-tracker";
-import { slateApi, type Candidate, type SourceStatusBucket } from "@/lib/slate";
+import { LiveCostsPanel } from "@/components/slate/live-costs-panel";
+import { RunPoolPanel } from "@/components/slate/run-pool-panel";
+import {
+  slateApi,
+  type Candidate,
+  type CrossRunDedupSkips,
+  type SourceStatusBucket,
+} from "@/lib/slate";
 import { ApiError } from "@/lib/api";
 
 function fmtDate(iso: string | null): string {
@@ -78,6 +85,17 @@ export default function RunDetailPage() {
       q.state.data?.slate_run.status === "building" ? 3000 : false,
   });
 
+  // Live cost breakdown — polls every 3s while building, every 10s once
+  // the run lands so users opening a finished run still get a fresh read
+  // (in case more LLM/provider events arrive late from a retry).
+  const isBuilding = data?.slate_run.status === "building";
+  const costsQuery = useQuery({
+    queryKey: ["slate-run-costs", slateRunId],
+    queryFn: () => slateApi.runCosts(slateRunId),
+    enabled: !!slateRunId,
+    refetchInterval: isBuilding ? 3000 : 10000,
+  });
+
   const skipDiscoveryMut = useMutation({
     mutationFn: () => slateApi.skipDiscovery(slateRunId),
     onSuccess: () => {
@@ -98,6 +116,31 @@ export default function RunDetailPage() {
     enabled: !!slateRunId,
     refetchOnWindowFocus: false,
   });
+
+  // Skip ONLY the current discovery source (e.g. exit RULE 24 → start
+  // Unipile keyword). Distinct from skipDiscoveryMut, which abandons all
+  // remaining sources. Returns 409 from the API if no source is active.
+  const skipCurrentSourceMut = useMutation({
+    mutationFn: () => slateApi.skipCurrentSource(slateRunId),
+    onSuccess: (res) => {
+      const nextLabel = res.next_source ?? "discovery end";
+      toast.success(
+        `Skipping ${res.skipped_source} → continuing with ${nextLabel}.`,
+      );
+      queryClient.invalidateQueries({ queryKey: ["slate-run", slateRunId] });
+    },
+    onError: (err: ApiError) =>
+      toast.error(err?.detail || "Failed to skip current source"),
+  });
+
+  // Human-readable label for the live source-id stamp on the slate_run doc.
+  const SOURCE_LABELS: Record<string, string> = {
+    unipile_title_search: "RULE 24 (Unipile people search)",
+    unipile_keyword: "Unipile keyword post search",
+    apidirect: "APIDirect keyword post search",
+    exa: "Exa neural keyword search",
+  };
+
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [emailTo, setEmailTo] = useState<string>("");
@@ -218,26 +261,56 @@ export default function RunDetailPage() {
           )}
         </div>
         {data.slate_run.status === "building" && (
-          <div className="mt-3">
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => skipDiscoveryMut.mutate()}
-              disabled={
-                skipDiscoveryMut.isPending ||
-                data.slate_run.skip_remaining_discovery === true
-              }
-            >
-              <FastForward className="mr-2 h-3.5 w-3.5" />
-              {data.slate_run.skip_remaining_discovery
-                ? "Discovery skip requested — worker exiting"
-                : "Skip remaining discovery → gates"}
-            </Button>
-            {data.slate_run.skip_remaining_discovery_at && (
-              <span className="ml-2 text-xs text-muted-foreground">
-                requested {fmtDate(data.slate_run.skip_remaining_discovery_at)}
-              </span>
+          <div className="mt-3 space-y-2">
+            {data.slate_run.current_source && (
+              <div className="text-xs text-muted-foreground">
+                In source:{" "}
+                <span className="font-mono">
+                  {SOURCE_LABELS[data.slate_run.current_source] ??
+                    data.slate_run.current_source}
+                </span>
+              </div>
             )}
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => skipCurrentSourceMut.mutate()}
+                disabled={
+                  skipCurrentSourceMut.isPending ||
+                  !data.slate_run.current_source ||
+                  data.slate_run.skip_current_source ===
+                    data.slate_run.current_source ||
+                  data.slate_run.skip_remaining_discovery === true
+                }
+              >
+                <FastForward className="mr-2 h-3.5 w-3.5" />
+                {data.slate_run.skip_current_source &&
+                data.slate_run.skip_current_source ===
+                  data.slate_run.current_source
+                  ? `Skipping ${data.slate_run.current_source}…`
+                  : "Skip current source → next"}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => skipDiscoveryMut.mutate()}
+                disabled={
+                  skipDiscoveryMut.isPending ||
+                  data.slate_run.skip_remaining_discovery === true
+                }
+              >
+                <FastForward className="mr-2 h-3.5 w-3.5" />
+                {data.slate_run.skip_remaining_discovery
+                  ? "Discovery skip requested — worker exiting"
+                  : "Skip all remaining discovery → gates"}
+              </Button>
+              {data.slate_run.skip_remaining_discovery_at && (
+                <span className="text-xs text-muted-foreground">
+                  requested {fmtDate(data.slate_run.skip_remaining_discovery_at)}
+                </span>
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -264,6 +337,17 @@ export default function RunDetailPage() {
           </div>
         ))}
       </div>
+
+      {/* Live cost breakdown */}
+      <LiveCostsPanel
+        costs={costsQuery.data}
+        isLoading={costsQuery.isLoading}
+        isBuilding={isBuilding}
+      />
+
+      {/* Pool accounts that participated in THIS run — snapshot of the
+          allowlist at run start + each account's current live state. */}
+      <RunPoolPanel slateRunId={slateRunId} isBuilding={isBuilding} />
 
       {/* By source × status */}
       {sourceList.length > 0 && (
@@ -316,6 +400,17 @@ export default function RunDetailPage() {
           </div>
         </div>
       )}
+
+      {/* Cross-run dedup skips — posts re-surfaced by discovery that were
+          filtered as "already found in a previous run" within the 90-day
+          exhaustion window. Operator visibility into what the engine
+          would-have-found-again-but-correctly-skipped. */}
+      {data.cross_run_dedup_skips &&
+        data.cross_run_dedup_skips.total_count > 0 && (
+          <CrossRunDedupSkipsSection
+            skips={data.cross_run_dedup_skips}
+          />
+        )}
 
       {/* Top drop reasons */}
       {data.top_drop_reasons.length > 0 && (
@@ -515,6 +610,81 @@ export default function RunDetailPage() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * Renders the "Cross-run dedup skips" section on the run detail page.
+ * Posts that discovery re-surfaced this run but skipped because they
+ * were already inserted as candidates in a prior run within the 90-day
+ * exhaustion window. Operator-facing visibility into "what the engine
+ * would have found again but correctly didn't process twice."
+ *
+ * Layout: counter row up top with seeded-set context, then a collapsed
+ * list of canonical post URLs (click to expand). The list is capped at
+ * sample_cap on the backend so it never grows unbounded — total_count
+ * may exceed sample_urls.length.
+ */
+function CrossRunDedupSkipsSection({ skips }: { skips: CrossRunDedupSkips }) {
+  const [expanded, setExpanded] = useState(false);
+  const truncated = skips.total_count > skips.sample_urls.length;
+  return (
+    <div className="space-y-2">
+      <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+        Skipped — already found in a previous run
+      </h2>
+      <div className="rounded-lg border bg-muted/20 p-3 text-sm">
+        <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+          <div>
+            <span className="text-xl font-semibold tabular-nums">
+              {skips.total_count}
+            </span>
+            <span className="ml-1 text-muted-foreground">
+              skip{skips.total_count === 1 ? "" : "s"} this run
+            </span>
+          </div>
+          <div className="text-xs text-muted-foreground">
+            from a 90-day history of {skips.seeded_urls_count.toLocaleString()} post URL
+            {skips.seeded_urls_count === 1 ? "" : "s"}
+          </div>
+          {skips.sample_urls.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setExpanded((v) => !v)}
+              className="ml-auto text-xs font-medium text-blue-700 hover:underline"
+            >
+              {expanded
+                ? "Hide URLs"
+                : `Show ${skips.sample_urls.length} URL${skips.sample_urls.length === 1 ? "" : "s"}`}
+            </button>
+          )}
+        </div>
+        {expanded && skips.sample_urls.length > 0 && (
+          <div className="mt-3 space-y-1 border-t pt-3">
+            <ul className="max-h-72 space-y-1 overflow-y-auto pr-1 text-xs">
+              {skips.sample_urls.map((url) => (
+                <li key={url} className="truncate">
+                  <a
+                    href={url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-700 hover:underline"
+                  >
+                    {url}
+                  </a>
+                </li>
+              ))}
+            </ul>
+            {truncated && (
+              <div className="pt-1 text-[11px] italic text-muted-foreground">
+                Showing first {skips.sample_urls.length} of {skips.total_count} —
+                list capped at {skips.sample_cap} per run to keep the slate doc small.
+              </div>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

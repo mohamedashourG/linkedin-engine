@@ -8,8 +8,8 @@ from __future__ import annotations
 # capped at 10 each (per user 2026-05-13) so broader phrases get meaningful
 # rotation but wall-clock stays bounded.
 DISCOVERY_TIER_1_PER_RUN = 0
-DISCOVERY_TIER_2_PER_RUN = 10
-DISCOVERY_TIER_3_PER_RUN = 10
+DISCOVERY_TIER_2_PER_RUN = 0
+DISCOVERY_TIER_3_PER_RUN = 0
 
 # Exa: one API call per keyword. ALL tiers unlimited — Exa's neural search
 # is the broadest recall vendor and we want to sweep the full pool every

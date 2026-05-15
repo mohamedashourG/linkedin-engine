@@ -205,7 +205,22 @@ def parse_structured_sync(
                 tools=[tool],
                 tool_choice={"type": "tool", "name": "emit_result"},
             )
-            return _parse_tool_use(response, schema)
+            parsed = _parse_tool_use(response, schema)
+            # Cost accounting — Anthropic returns .usage.input_tokens /
+            # .output_tokens (different field names from OpenAI, same idea).
+            try:
+                usage = getattr(response, "usage", None)
+                if usage is not None:
+                    from app.services import cost_tracker
+                    cost_tracker.record_llm_call(
+                        model=model,
+                        prompt_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+                        completion_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+                        tier=model_tier,
+                    )
+            except Exception as err:  # noqa: BLE001
+                log.debug("anthropic_client: cost record skipped: %s", err)
+            return parsed
         except (APIConnectionError, RateLimitError) as err:
             last_err = err
             backoff = 0.5 * (2 ** (attempt - 1))

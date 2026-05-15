@@ -65,6 +65,21 @@ celery_app.conf.beat_schedule = {
     },
 }
 
+# Connection-invitation status poll — flip `linkedin_invitations.status`
+# from `sent` to `accepted` / `declined` when the target responds.
+# OPT-IN via INVITATION_POLLING_ENABLED (default off). The task itself
+# is always registered (operators can fire it manually via Flower /
+# `celery_app.send_task("engine.poll_invitations")`), but the beat
+# schedule entry is only added when the env flag is set — so a fresh
+# deploy never auto-fires LinkedIn read calls without explicit opt-in.
+# Cadence: every 6h. Invites don't need real-time status, and we don't
+# want to burn pool capacity on read-only relationship checks.
+if (settings.invitation_polling_enabled if hasattr(settings, "invitation_polling_enabled") else False):
+    celery_app.conf.beat_schedule["poll-invitations-every-6h"] = {
+        "task": "engine.poll_invitations",
+        "schedule": crontab(minute=15, hour="*/6"),
+    }
+
 
 # ---------------------------------------------------------------- dispatcher
 
@@ -149,6 +164,139 @@ def poll_replies() -> dict:
         return poll_replies_for_all_operators(db)
     finally:
         client.close()
+
+
+@celery_app.task(name="engine.poll_invitations")
+def poll_invitations() -> dict:
+    """Status-poll every open LinkedIn connection invite older than 1h.
+
+    Scans `linkedin_invitations` for `status=sent` rows that haven't been
+    polled in the last hour, calls Unipile to read each (account, target)
+    relationship, and flips status to `accepted` / `declined` / leaves as
+    `sent` accordingly. Does NOT fire on `queued` (those are still
+    pre-send) or `dry_run` / `failed` / `withdrawn` (terminal-ish).
+
+    Cadence-gated to every ~6h via beat. Run manually for debugging via
+    `celery_app.send_task('engine.poll_invitations')`.
+
+    Bounds:
+      • max 200 invites scanned per call (prevents a 1k-old-invite scan
+        from blocking the worker for hours)
+      • skips invites in `unipile_account_pool` cooldown — the relation
+        read still consumes one HTTP call against that account's session
+      • aggregate pool gate via _pool_acquire applies; if the pool is
+        cap-pressured the poll silently skips (status updates can wait
+        for the next tick)
+
+    Output dict: counts of polled / accepted / declined / unchanged /
+    errored, so beat logs surface trends.
+    """
+    from datetime import datetime, timedelta, timezone
+    from app.services.unipile import (
+        get_invitation_status, UnipileError, UnipileNotConfigured,
+    )
+
+    client, db = _sync_db()
+    n_polled = n_accepted = n_declined = n_unchanged = n_error = 0
+    try:
+        invites_coll = db.linkedin_invitations
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        # 1-hour grace after send before first poll, so we don't hammer
+        # Unipile for invites that LinkedIn hasn't even broadcast to the
+        # recipient's feed yet.
+        cutoff_send = now - timedelta(hours=1)
+        cursor = invites_coll.find(
+            {
+                "status": "sent",
+                "sent_at": {"$lt": cutoff_send},
+                "$or": [
+                    {"status_polled_at": None},
+                    {"status_polled_at": {"$lt": now - timedelta(hours=5)}},
+                ],
+            },
+            sort=[("sent_at", 1)],
+        ).limit(200)
+        for inv in cursor:
+            n_polled += 1
+            try:
+                relation = get_invitation_status(
+                    account_id=inv["sent_via_account_id"],
+                    provider_id=inv["target_provider_id"],
+                )
+            except (UnipileError, UnipileNotConfigured) as err:
+                n_error += 1
+                invites_coll.update_one(
+                    {"_id": inv["_id"]},
+                    {"$set": {
+                        "status_polled_at": now,
+                        "error": f"poll_unipile_error: {str(err)[:300]}",
+                        "updated_at": now,
+                    }},
+                )
+                continue
+
+            # Map Unipile's vocabulary onto our internal one. Unipile's
+            # `connection_status` / `status` field varies; we accept any
+            # of the documented strings. Anything else → leave as `sent`
+            # and try again next tick.
+            raw_status = (
+                relation.get("connection_status")
+                or relation.get("status")
+                or relation.get("relationship")
+                or ""
+            )
+            raw_status_norm = str(raw_status).upper()
+            update: dict = {"status_polled_at": now, "updated_at": now}
+            if raw_status_norm in ("CONNECTED", "ACCEPTED", "FIRST_DEGREE"):
+                update["status"] = "accepted"
+                update["accepted_at"] = (
+                    _parse_date_safe(relation.get("accepted_at"))
+                    or _parse_date_safe(relation.get("connected_at"))
+                    or now
+                )
+                n_accepted += 1
+            elif raw_status_norm in ("DECLINED", "REJECTED", "INVITATION_DECLINED"):
+                update["status"] = "declined"
+                n_declined += 1
+            else:
+                # Still pending — leave status=sent, just bump polled_at.
+                n_unchanged += 1
+            invites_coll.update_one({"_id": inv["_id"]}, {"$set": update})
+    finally:
+        client.close()
+    result = {
+        "polled": n_polled,
+        "accepted": n_accepted,
+        "declined": n_declined,
+        "unchanged": n_unchanged,
+        "errored": n_error,
+    }
+    log.info("poll_invitations: %s", result)
+    return result
+
+
+def _parse_date_safe(v) -> "datetime | None":  # type: ignore[no-untyped-def]
+    """Best-effort ISO-string → naive UTC datetime. Returns None on miss.
+
+    Used by poll_invitations to coerce Unipile's variable
+    `accepted_at` / `connected_at` shapes into our Mongo datetime
+    column.
+    """
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.replace(tzinfo=None) if v.tzinfo else v
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s).astimezone(timezone.utc).replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return None
 
 
 @celery_app.task(name="engine.process_outbox")

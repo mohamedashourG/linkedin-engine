@@ -35,9 +35,10 @@ import logging
 import random
 import re
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Iterator
 
 from bson import ObjectId
 from pymongo.database import Database
@@ -96,6 +97,252 @@ from app.services.crustdata import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# ── Pool-rotated Unipile acquire (context manager) ──────────────────────
+#
+# Every Unipile call in this module routes through this helper so the
+# account_id parameter rotates LRU across the discovery pool instead of
+# concentrating all load on one LinkedIn session (the cofounder's pinned
+# account, which is what previous versions used).
+#
+# Anti-leakage contract (verified test cases, 2026-05-14):
+#   - When a slate_run has an allowlist set on its contextvar (via
+#     `daily_run.run_for_operator` + worker-thread re-attachment), the
+#     pool's atomic Mongo filter only returns accounts in that list. No
+#     code path inside this CM can bypass that.
+#   - When the allowlist is set AND the pool is exhausted (all eligible
+#     accounts in cooldown or over their daily cap), this CM **PAUSES**:
+#     it sleeps in a poll loop and retries until either (a) an account
+#     becomes available, (b) the user cancels via skip-discovery, or (c)
+#     the per-acquire max-wait budget elapses (default 1h). The discovery
+#     run does NOT fail — it waits, then resumes from where it was.
+#   - When NO allowlist is set (operator hasn't configured a selection),
+#     PoolExhausted → fall back to `fallback` (typically the cofounder's
+#     pinned account). Preserves pre-pool behavior for unmigrated setups.
+#
+# Success/error reporting happens automatically on context exit so the
+# pool's per-account health state (cooldown after 429, etc.) stays
+# accurate regardless of which call site we wrap.
+
+# How long any single _pool_acquire call will wait for the pool to recover
+# before giving up. Cooldowns are 20–60min for 429s, so 1h covers the
+# typical case. Beyond that, something is wrong (daily caps too low,
+# all accounts simultaneously flagged) and a hard error is better than
+# silently waiting longer.
+_POOL_EXHAUSTED_MAX_WAIT_S = 60 * 60
+# How often we re-attempt acquire + re-check the user-cancel signal.
+_POOL_EXHAUSTED_POLL_S = 15.0
+
+
+@contextmanager
+def _pool_acquire(
+    capability: str, *, fallback: str | None = None, no_wait: bool = False,
+) -> Iterator[str]:
+    from app.services.unipile_pool import (
+        get_pool, get_pool_account_filter, PoolExhausted,
+    )
+    from app.services import cost_tracker as _ct
+
+    pool = None
+    acct_id: str | None = None
+    from_pool = False
+
+    # Try the immediate acquire. If pool is exhausted and an allowlist
+    # is active, enter the pause loop. Without an allowlist, fall through
+    # to the cofounder fallback as before.
+    wait_start = time.monotonic()
+    poll_count = 0
+    while True:
+        try:
+            pool = get_pool()
+            acct_id = pool.acquire(capability=capability)
+            from_pool = True
+            break
+        except PoolExhausted:
+            if get_pool_account_filter() is None:
+                # No allowlist set → preserve pre-pool behavior.
+                acct_id = fallback
+                break
+
+            # ── no_wait carve-out ──────────────────────────────────────
+            # Enrichment callers (Pass 4 Unipile fallback in Wiza→Crust
+            # →Unipile chain) pass no_wait=True. Operator contract: "use
+            # Unipile only if pool has free budget; never pause-and-wait
+            # for enrichment." If exhausted, raise immediately so the
+            # caller can treat the author as a permanent miss and tag
+            # the candidate `pending_enrichment_review`. The pause-and-
+            # wait path below is only correct for critical-path source
+            # calls (search/post_fetch on title_search + unipile_keyword)
+            # where the pool will recover within the run's wall clock.
+            if no_wait:
+                raise
+
+            # Allowlist active → strict no-leakage; pause the job rather
+            # than failing. Bail conditions:
+            #   1. User cancels via the skip-discovery endpoint
+            #      (slate_runs.skip_remaining_discovery = true), OR
+            #   2. slate_run.status flipped to force_aborted, OR
+            #   3. Total wait elapsed > _POOL_EXHAUSTED_MAX_WAIT_S
+            elapsed = time.monotonic() - wait_start
+
+            # Check user-cancel signal via the slate_run doc. We use the
+            # cost_tracker's slate-run contextvar to know WHICH run, and
+            # cost_tracker's sync pymongo handle to read.
+            slate_run_id = _ct.get_current_slate_run()
+            if slate_run_id is not None:
+                sync_db = _ct._db()
+                if sync_db is not None:
+                    try:
+                        slate = sync_db.slate_runs.find_one(
+                            {"_id": slate_run_id},
+                            {"skip_remaining_discovery": 1, "status": 1},
+                        )
+                        if slate and (
+                            slate.get("skip_remaining_discovery")
+                            or slate.get("status") == "force_aborted"
+                        ):
+                            log.warning(
+                                "discovery: user cancelled run while pool was "
+                                "exhausted (capability=%s, waited=%.0fs) — "
+                                "aborting acquire",
+                                capability, elapsed,
+                            )
+                            raise  # re-raise PoolExhausted so caller falls through
+                    except PoolExhausted:
+                        raise
+                    except Exception:  # noqa: BLE001
+                        # Mongo blip — keep waiting; better to retry than abort.
+                        pass
+
+            if elapsed >= _POOL_EXHAUSTED_MAX_WAIT_S:
+                log.error(
+                    "discovery: pool exhausted for capability=%s after %.0fmin "
+                    "of waiting — giving up; consider raising daily caps OR "
+                    "reconnecting CREDENTIALS-flagged accounts in the pool",
+                    capability, elapsed / 60,
+                )
+                raise
+
+            # Surface a status line periodically so the operator can see
+            # in logs why the run looks stalled. Log on every poll for
+            # the first minute, then every 4th poll (~1min cadence).
+            poll_count += 1
+            if poll_count <= 4 or poll_count % 4 == 0:
+                log.info(
+                    "discovery: pool exhausted for %s — pausing %ds then "
+                    "retrying (waited %.0fs / %dmin budget)",
+                    capability,
+                    int(_POOL_EXHAUSTED_POLL_S),
+                    elapsed,
+                    _POOL_EXHAUSTED_MAX_WAIT_S // 60,
+                )
+            # Persist a hint on the slate_run so the UI can show
+            # "paused — waiting for pool" without parsing logs.
+            if slate_run_id is not None:
+                sync_db = _ct._db()
+                if sync_db is not None:
+                    try:
+                        sync_db.slate_runs.update_one(
+                            {"_id": slate_run_id},
+                            {"$set": {
+                                "discovery_paused_pool_exhausted_at": utcnow(),
+                                "discovery_paused_pool_capability": capability,
+                                "discovery_paused_pool_waited_s": int(elapsed),
+                            }},
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            time.sleep(_POOL_EXHAUSTED_POLL_S)
+            # Loop back to retry the acquire.
+            continue
+        except Exception as err:  # noqa: BLE001
+            # ── Anti-leakage guard ─────────────────────────────────────
+            # If an allowlist is active, we MUST NOT use a fallback that
+            # isn't on it. The user's contract is "only these N accounts
+            # can run for this slate" — falling back to a non-allowlisted
+            # account on a transient pool error (import bug, Mongo blip,
+            # whatever) is exactly the leakage scenario they flagged.
+            #
+            # Historical bug 2026-05-14: a stale Celery worker subprocess
+            # raised `cannot import name '_human_delay_seconds'` when
+            # pool.acquire tried to use the aggregate-gate helper.  The
+            # old code caught that and silently fell back to the operator
+            # default account (KW0q8A9jTaSeuL9Bf_EtTA — flagged + in
+            # CREDENTIALS state + outside the Taiga allowlist), producing
+            # a wave of 401s on the wrong account.  Hard-fail instead.
+            allowlist = get_pool_account_filter()
+            if allowlist is not None:
+                if fallback in (allowlist or set()):
+                    log.warning(
+                        "discovery: pool.acquire(%s) failed (%s); fallback "
+                        "%r IS in the allowlist — using it",
+                        capability, err, (fallback or "")[:18],
+                    )
+                    acct_id = fallback
+                    break
+                log.error(
+                    "discovery: pool.acquire(%s) failed (%s); fallback "
+                    "%r is NOT in the operator allowlist — REFUSING to "
+                    "leak. Raising so this source aborts (the rest of "
+                    "the run can continue).",
+                    capability, err, (fallback or "")[:18],
+                )
+                raise RuntimeError(
+                    f"pool.acquire({capability}) failed and fallback is "
+                    f"not in the operator allowlist; refusing to leak"
+                ) from err
+
+            # No allowlist active — preserve pre-pool behavior.
+            log.warning(
+                "discovery: pool.acquire(%s) failed (%s); no allowlist "
+                "active, falling back to single-account path",
+                capability, err,
+            )
+            acct_id = fallback
+            break
+
+    if not acct_id:
+        raise RuntimeError(
+            f"_pool_acquire: no account available for capability={capability}",
+        )
+
+    # If we exited the pause loop with a successful acquire, clear the
+    # paused-state hint on the slate_run so the UI flips back to running.
+    if poll_count > 0:
+        slate_run_id = _ct.get_current_slate_run()
+        if slate_run_id is not None:
+            sync_db = _ct._db()
+            if sync_db is not None:
+                try:
+                    sync_db.slate_runs.update_one(
+                        {"_id": slate_run_id},
+                        {"$unset": {
+                            "discovery_paused_pool_exhausted_at": "",
+                            "discovery_paused_pool_capability": "",
+                            "discovery_paused_pool_waited_s": "",
+                        }},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+    try:
+        yield acct_id
+    except Exception as err:
+        if from_pool and pool is not None:
+            try:
+                pool.report_error(acct_id, err)
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+    else:
+        if from_pool and pool is not None:
+            try:
+                pool.report_success(acct_id)
+            except Exception:  # noqa: BLE001
+                pass
+
 
 _SENIORITY_HINT_RE = re.compile(
     r"\b(?:c[\s]?suite|chief|evp|svp|vp|vice\s+president|director|head|partner|"
@@ -159,12 +406,30 @@ def _resolve_industry_ids_for_operator(
     seen: set[str] = set()
     for term in target_inds[:max_terms]:
         try:
-            hits = search_parameter_ids(
-                account_id=account_id, type="INDUSTRY", keywords=term, limit=max_ids_per_term
-            )
+            # no_wait=True: industry-ID resolution is cheap-or-skip — if
+            # search pool is capped, we just run title_search without the
+            # industry filter rather than pausing the whole run.
+            with _pool_acquire("search", fallback=account_id, no_wait=True) as _acct:
+                hits = search_parameter_ids(
+                    account_id=_acct, type="INDUSTRY", keywords=term, limit=max_ids_per_term
+                )
         except (UnipileError, UnipileNotConfigured) as err:
             log.warning("discovery: industry lookup failed for term=%r: %s", term, err)
             continue
+        except Exception as err:  # noqa: BLE001
+            # PoolExhausted / RuntimeError on the no_wait acquire: skip
+            # this industry term (and likely the rest will fail too).
+            # title_search will still run, just without the server-side
+            # industry filter — strictly better than crashing the source.
+            from app.services.unipile_pool import PoolExhausted as _PE_ind
+            if isinstance(err, (_PE_ind, RuntimeError)):
+                log.warning(
+                    "discovery: industry-ID resolver pool exhausted/refused "
+                    "(%s) — proceeding without industry filter",
+                    str(err)[:80],
+                )
+                break
+            raise
         for h in hits[:max_ids_per_term]:
             sid = str(h.id).strip() if hasattr(h, "id") else ""
             if sid and sid not in seen:
@@ -613,6 +878,58 @@ def _should_skip_remaining_discovery(
     return doc is not None
 
 
+# Canonical source-id strings. Used for both `slate_runs.current_source`
+# (so the UI can label the in-flight source) and for the per-source skip
+# flag (`slate_runs.skip_current_source == <one of these>`).
+SOURCE_UNIPILE_TITLE_SEARCH = "unipile_title_search"
+SOURCE_UNIPILE_KEYWORD = "unipile_keyword"
+SOURCE_APIDIRECT = "apidirect"
+SOURCE_EXA = "exa"
+SOURCE_CONTACT_SEEDS = "contact_seeds"
+
+
+def _set_current_source(
+    db: Database, slate_run_id: ObjectId, source_id: str
+) -> None:
+    """Stamp the discovery source the worker is currently iterating so the
+    UI can label progress + the operator can use 'skip current source'."""
+    try:
+        db.slate_runs.update_one(
+            {"_id": slate_run_id},
+            {"$set": {"current_source": source_id, "updated_at": utcnow()}},
+        )
+    except Exception:
+        log.warning("discovery: failed to stamp current_source=%s", source_id)
+
+
+def _should_skip_current_source(
+    db: Database, slate_run_id: ObjectId, source_id: str
+) -> bool:
+    """Atomically consume a `skip_current_source` flag if it matches the
+    source the worker is iterating. Returns True ONLY when the flag
+    matched and was cleared by this call — so the source loop breaks once
+    and subsequent sources start clean.
+
+    Implemented with findAndModify so we don't race with a second skip
+    click coming in just after this query but before the clear write."""
+    try:
+        doc = db.slate_runs.find_one_and_update(
+            {"_id": slate_run_id, "skip_current_source": source_id},
+            {
+                "$set": {
+                    "skip_current_source_consumed_at": utcnow(),
+                    "skip_current_source_consumed_for": source_id,
+                    "updated_at": utcnow(),
+                },
+                "$unset": {"skip_current_source": ""},
+            },
+            projection={"_id": 1},
+        )
+    except Exception:
+        return False
+    return doc is not None
+
+
 def _seen_post_urls(db: Database, operator_id: ObjectId) -> set[str]:
     """All post URLs we've already inserted as candidates within the lookback
     window. Used to prevent re-discovery of the same post across runs (the
@@ -980,14 +1297,25 @@ class _CanonicalUrlSet:
     check. Lets every legacy ``post.url in seen_urls`` / ``seen_urls.add(...)``
     callsite in this module stay as-is while still deduping against tracking-
     param-stripped canonical URLs. Implements the subset of ``set`` the
-    engine actually uses (``in``, ``add``, ``__len__``, ``__iter__``)."""
+    engine actually uses (``in``, ``add``, ``__len__``, ``__iter__``).
 
-    __slots__ = ("_set",)
+    Also tracks dedup-skip hits: every ``__contains__`` that returns True
+    (i.e. a URL discovered this run was already-seen from a prior run)
+    increments ``skip_count`` and appends to ``skip_samples`` up to
+    ``SAMPLE_CAP``. Discovery flushes these to ``slate_runs.
+    cross_run_dedup_skips`` at the end of the run so the UI can show the
+    operator which posts got filtered out as "already discovered before".
+    """
+
+    __slots__ = ("_set", "skip_count", "skip_samples")
+    SAMPLE_CAP = 200
 
     def __init__(self, initial=()) -> None:
         self._set: set[str] = set()
         for u in initial:
             self.add(u)
+        self.skip_count: int = 0
+        self.skip_samples: list[str] = []
 
     def add(self, url: str | None) -> None:
         if not url:
@@ -997,7 +1325,18 @@ class _CanonicalUrlSet:
     def __contains__(self, url: object) -> bool:
         if not isinstance(url, str) or not url:
             return False
-        return _canonical_post_url(url) in self._set
+        hit = _canonical_post_url(url) in self._set
+        if hit:
+            self.skip_count += 1
+            # Cap the sample to avoid unbounded growth on noisy harvesters.
+            # First-N policy: keeps the earliest skips which are usually
+            # the most informative (later skips tend to be the same posts
+            # surfacing from multiple vendors).
+            if len(self.skip_samples) < self.SAMPLE_CAP:
+                canon = _canonical_post_url(url)
+                if canon not in self.skip_samples:
+                    self.skip_samples.append(canon)
+        return hit
 
     def __len__(self) -> int:
         return len(self._set)
@@ -1201,11 +1540,27 @@ def _get_cached_unipile_author_profile_by_slug(
     ):
         return None, False
 
+    from app.services.unipile_pool import PoolExhausted as _PE_enrich
     try:
-        raw = unipile_resolve_profile(account_id=account_id, public_identifier_or_url=slug)
+        # no_wait=True: enrichment is a "use pool if free, skip if exhausted"
+        # call per operator contract (2026-05-14). If profile_view is capped
+        # across the pool, raise immediately and let the caller mark the
+        # candidate `pending_enrichment_review` instead of pausing for 1h.
+        with _pool_acquire("profile_view", fallback=account_id, no_wait=True) as _acct:
+            raw = unipile_resolve_profile(account_id=_acct, public_identifier_or_url=slug)
     except (UnipileError, UnipileNotConfigured) as err:
         log.debug("unipile: profile fetch failed for slug=%s: %s", slug[:40], err)
         return None, True
+    except (_PE_enrich, RuntimeError) as err:
+        # Pool gave up on profile_view (exhausted or allowlist refusal).
+        # Caller treats (None, False) the same as cache miss → no fetch
+        # happened, no profile available, candidate falls through to
+        # the pending_enrichment_review path.
+        log.debug(
+            "unipile: profile fetch skipped (pool exhausted/refused) "
+            "slug=%s: %s", slug[:40], str(err)[:80],
+        )
+        return None, False
     if not raw:
         return None, True
 
@@ -1217,6 +1572,10 @@ def _get_cached_unipile_author_profile_by_slug(
         or " ".join(filter(None, [raw.get("first_name"), raw.get("last_name")])).strip()
         or None
     )
+    employer_linkedin_id = _extract_employer_linkedin_id(first_job)
+    company_details = _fetch_company_industry_for_unipile_author(
+        db, operator_id=operator_id, employer_linkedin_id=employer_linkedin_id,
+    )
     doc = {
         "operator_id": operator_id,
         "provider_id": provider_id,
@@ -1225,7 +1584,18 @@ def _get_cached_unipile_author_profile_by_slug(
         "headline": raw.get("headline") or "",
         "location": raw.get("location") or "",
         "company": (first_job.get("company") or first_job.get("company_name") or ""),
-        "title": (first_job.get("title") or first_job.get("role") or ""),
+        "title": (first_job.get("position") or first_job.get("title") or first_job.get("role") or ""),
+        "employer_linkedin_id": employer_linkedin_id or "",
+        "employer_description": first_job.get("description") or "",
+        # APIDirect /v1/linkedin/company fields (None when no employer id /
+        # APIDirect call failed). Same schema as the Crustdata path so the
+        # downstream LLM ICP gate reads `company_industry` uniformly.
+        "company_industry": (company_details or {}).get("industry"),
+        "company_description": (company_details or {}).get("description"),
+        "company_employee_range": (company_details or {}).get("employee_range"),
+        "company_employees": (company_details or {}).get("employees"),
+        "company_founded_year": (company_details or {}).get("founded_year"),
+        "company_specialities": (company_details or {}).get("specialities") or [],
         "source": "unipile",
         "fetched_at": now,
     }
@@ -1235,6 +1605,52 @@ def _get_cached_unipile_author_profile_by_slug(
         upsert=True,
     )
     return doc, True
+
+
+def _extract_employer_linkedin_id(first_job: dict[str, Any]) -> str | None:
+    """Pull the LinkedIn company id out of a Unipile work_experience entry.
+
+    Unipile uses ``company_id`` (string of digits, e.g. "11032149") in the
+    response when ``linkedin_sections=experience`` is requested. Returns
+    None when the field is missing/empty — caller treats that as "no
+    structured company lookup possible" and skips the APIDirect chain.
+
+    Defensive against shape drift: accepts a couple of likely alternative
+    field names in case Unipile renames in a future version."""
+    if not isinstance(first_job, dict):
+        return None
+    for k in ("company_id", "company_linkedin_id", "company_provider_id"):
+        v = first_job.get(k)
+        if v is None:
+            continue
+        sv = str(v).strip()
+        if sv:
+            return sv
+    return None
+
+
+def _fetch_company_industry_for_unipile_author(
+    db: Database,
+    *,
+    operator_id: ObjectId,
+    employer_linkedin_id: str | None,
+) -> dict[str, Any] | None:
+    """Wrapper around ``_get_cached_company_details`` that no-ops when the
+    operator disabled APIDirect company-details fetching or when we don't
+    have an employer id to look up. Mirrors the Crustdata path's existing
+    APIDirect chain so Unipile-fallback authors get the same downstream
+    industry signal as Crustdata-matched ones."""
+    if not employer_linkedin_id:
+        return None
+    if not settings.apidirect_fetch_company_details:
+        return None
+    company_url = f"https://www.linkedin.com/company/{employer_linkedin_id}"
+    return _get_cached_company_details(
+        db,
+        operator_id=operator_id,
+        company_linkedin_id=employer_linkedin_id,
+        company_url=company_url,
+    )
 
 
 def _get_cached_unipile_author_profile(
@@ -1281,15 +1697,33 @@ def _get_cached_unipile_author_profile(
         return None, False
 
     try:
-        raw = unipile_resolve_profile(
-            account_id=account_id, public_identifier_or_url=provider_id
-        )
+        # no_wait=True: enrichment is a "use pool if free, skip if exhausted"
+        # call per operator contract (2026-05-14). If profile_view is capped
+        # across the pool, raise immediately and let the caller mark the
+        # candidate `pending_enrichment_review` instead of pausing for 1h.
+        with _pool_acquire("profile_view", fallback=account_id, no_wait=True) as _acct:
+            raw = unipile_resolve_profile(
+                account_id=_acct, public_identifier_or_url=provider_id
+            )
     except (UnipileError, UnipileNotConfigured) as err:
         log.debug(
             "unipile: profile fetch failed for provider_id=%s: %s",
             provider_id[:40], err,
         )
         return None, True  # API was attempted, just failed
+    except Exception as err:  # noqa: BLE001
+        # PoolExhausted / RuntimeError (allowlist refusal) when pool is
+        # capped. Same behavior as the slug-keyed helper above: return
+        # (None, False) so the caller sees a clean miss and routes the
+        # candidate to pending_enrichment_review.
+        from app.services.unipile_pool import PoolExhausted as _PE_enrich2
+        if isinstance(err, (_PE_enrich2, RuntimeError)):
+            log.debug(
+                "unipile: profile fetch skipped (pool exhausted/refused) "
+                "provider_id=%s: %s", provider_id[:40], str(err)[:80],
+            )
+            return None, False
+        raise
     if not raw:
         return None, True
 
@@ -1302,6 +1736,10 @@ def _get_cached_unipile_author_profile(
         ).strip()
         or None
     )
+    employer_linkedin_id = _extract_employer_linkedin_id(first_job)
+    company_details = _fetch_company_industry_for_unipile_author(
+        db, operator_id=operator_id, employer_linkedin_id=employer_linkedin_id,
+    )
     doc = {
         "operator_id": operator_id,
         "provider_id": provider_id,
@@ -1310,7 +1748,18 @@ def _get_cached_unipile_author_profile(
         "headline": raw.get("headline") or "",
         "location": raw.get("location") or "",
         "company": (first_job.get("company") or first_job.get("company_name") or ""),
-        "title": (first_job.get("title") or first_job.get("role") or ""),
+        "title": (first_job.get("position") or first_job.get("title") or first_job.get("role") or ""),
+        "employer_linkedin_id": employer_linkedin_id or "",
+        "employer_description": first_job.get("description") or "",
+        # Same APIDirect chain as the slug-keyed sibling — Unipile-fallback
+        # authors now carry structured industry/size/description through to
+        # the LLM ICP gate just like Crustdata-matched ones.
+        "company_industry": (company_details or {}).get("industry"),
+        "company_description": (company_details or {}).get("description"),
+        "company_employee_range": (company_details or {}).get("employee_range"),
+        "company_employees": (company_details or {}).get("employees"),
+        "company_founded_year": (company_details or {}).get("founded_year"),
+        "company_specialities": (company_details or {}).get("specialities") or [],
         "source": "unipile",
         "fetched_at": now,
     }
@@ -1484,6 +1933,117 @@ def _get_cached_company_details(
         "name": details.name,
         "website": details.website,
     }
+
+
+def _enrich_via_wiza(
+    db: Database,
+    *,
+    operator_id: ObjectId,
+    posts_pending: list[Any],
+) -> dict[str, dict[str, Any]]:
+    """First-tier author enrichment via Wiza Person Enrich.
+
+    Wiza at ``enrichment_level: "none"`` returns the full person + company
+    snapshot for 1 credit (free on miss). Critically it returns
+    ``company_industry`` inline, so successful matches DO NOT need a follow-up
+    APIDirect ``/v1/linkedin/company`` call — the persisted cache doc carries
+    structured industry/size/description directly from the Wiza response.
+
+    Returns ``{author_profile_url: profile_dict}`` for the matched subset.
+    Same return shape and persistence target (``unipile_author_cache``) as
+    ``_enrich_via_crustdata`` so the caller can union the two dicts.
+
+    Unlike the Crustdata path, URN-form slugs are NOT skipped — Wiza handles
+    those correctly (verified via curl against Tarpan Patel + Yair Lurie on
+    2026-05-14)."""
+    if not settings.enrich_with_wiza:
+        return {}
+    from app.services.wiza_enrich import (
+        enrich_profiles as wiza_enrich_profiles,
+        WizaEnrichError,
+        WizaEnrichNotConfigured,
+        WizaEnrichQuotaExhausted,
+    )
+    from app.services.crustdata_enrich import is_likely_person_slug
+
+    unique_urls: dict[str, str] = {}  # url -> slug
+    for post in posts_pending:
+        url = (getattr(post, "author_profile_url", "") or "").strip()
+        if not url:
+            post_url = (getattr(post, "url", "") or "").strip()
+            derived_slug = _extract_author_slug_from_post_url(post_url)
+            if derived_slug:
+                url = f"https://www.linkedin.com/in/{derived_slug}"
+        if not url or url in unique_urls:
+            continue
+        if not is_likely_person_slug(url):
+            continue
+        slug = _public_identifier_from_url(url) or ""
+        if not slug:
+            continue
+        unique_urls[url] = slug
+
+    if not unique_urls:
+        return {}
+
+    urls = list(unique_urls.keys())
+    try:
+        enriched = wiza_enrich_profiles(urls)
+    except (WizaEnrichNotConfigured, WizaEnrichQuotaExhausted) as err:
+        log.warning(
+            "│  [wiza-enrich] disabled/quota exhausted: %s — falling through to Crustdata",
+            err,
+        )
+        return {}
+    except WizaEnrichError as err:
+        log.warning(
+            "│  [wiza-enrich] error: %s — falling through to Crustdata",
+            err,
+        )
+        return {}
+
+    out: dict[str, dict[str, Any]] = {}
+    now = utcnow()
+    for url, profile in enriched.items():
+        slug = unique_urls.get(url) or _public_identifier_from_url(url) or ""
+        if not slug:
+            continue
+        doc = {
+            "operator_id": operator_id,
+            "provider_id": None,  # Wiza, like Crustdata, doesn't expose a Unipile URN
+            "public_identifier": slug,
+            "name": profile.name or "",
+            "headline": profile.headline or "",
+            "location": profile.location or "",
+            "company": profile.employer_name or "",
+            "title": profile.title or "",
+            "employer_description": profile.employer_description or "",
+            "employer_linkedin_id": profile.employer_linkedin_id or "",
+            # Wiza populates these directly — no APIDirect follow-up needed.
+            # The downstream LLM ICP gate reads `company_industry` etc.
+            # without caring whether Wiza or APIDirect filled them.
+            "company_industry": profile.company_industry,
+            "company_description": profile.employer_description,
+            "company_employee_range": profile.company_size_range,
+            "company_employees": profile.company_size,
+            "company_founded_year": profile.company_founded,
+            # Wiza doesn't expose specialities; keep field for schema parity.
+            "company_specialities": [],
+            "source": "wiza",
+            "fetched_at": now,
+        }
+        db.unipile_author_cache.update_one(
+            {"operator_id": operator_id, "public_identifier": slug},
+            {"$set": doc},
+            upsert=True,
+        )
+        out[url] = doc
+
+    log.info(
+        "│  [wiza-enrich] requested=%d matched=%d (1 credit/match, no APIDirect needed)",
+        len(urls), len(out),
+    )
+    return out
 
 
 def _enrich_via_crustdata(
@@ -2425,6 +2985,7 @@ def discover_for_operator(
                 slate_run_id=slate_run_id,
                 tier_1=tier_1,
                 tier_2=tier_2,
+                tier_3=tier_3,
                 seen_urls=seen_urls,
                 seen_authors_shipped=seen_authors_shipped,
                 account_id=cofounder.get("unipile_account_id"),
@@ -2487,6 +3048,30 @@ def discover_for_operator(
         operator_id,
         len(cofounders),
     )
+
+    # Flush cross-run dedup-skip stats to the slate_run doc so the Runs UI
+    # can show the operator which posts were filtered as "already discovered
+    # in a previous run". The seen_urls set was pre-seeded with every post
+    # URL this operator has touched in the 90-day exhaustion window; every
+    # ``post.url in seen_urls`` hit during this run was a re-surface from a
+    # prior run that we correctly skipped. Capped at SAMPLE_CAP to keep the
+    # slate_run doc small.
+    try:
+        db.slate_runs.update_one(
+            {"_id": slate_run_id},
+            {"$set": {
+                "cross_run_dedup_skips": {
+                    "total_count": int(seen_urls.skip_count),
+                    "sample_urls": list(seen_urls.skip_samples),
+                    "sample_cap": _CanonicalUrlSet.SAMPLE_CAP,
+                    "seeded_urls_count": len(seen_urls),
+                    "captured_at": utcnow(),
+                },
+            }},
+        )
+    except Exception:  # noqa: BLE001 — telemetry shouldn't fail the run
+        log.exception("discovery: failed to write cross_run_dedup_skips for slate=%s", slate_run_id)
+
     return inserted
 
 
@@ -2506,16 +3091,25 @@ def _enrich_authors_for_post_batch(
     Returns a dict keyed by **post.url** so the caller can look up the
     enriched profile per post: ``profiles[post.url]`` → dict or absent.
 
-    Three passes, identical semantics to the inline chain in `_run_unipile`:
+    Four passes (current default; 2026-05-14 reorder):
 
-    1. **Cache** — `unipile_author_cache` by (operator_id, public_identifier).
+    1. **Cache** — ``unipile_author_cache`` by (operator_id, public_identifier).
        Free.
-    2. **Crustdata batch** — only when ``enrichment_strategy`` permits it
-       (crustdata_first / crustdata_only) and the slug is likely a person.
-       URN-form slugs are skipped (Crustdata's index isn't URN-aware).
-    3. **Unipile `/users/{slug}` fallback** — for posts still unenriched
-       after passes 1+2. Slate-wide atomic budget enforced. Skipped under
-       ``crustdata_only``.
+    2. **Wiza Person Enrich** — first paid tier. 1 credit/match, free on miss,
+       returns ``company_industry`` inline so the downstream cache-writer skips
+       APIDirect ``/v1/linkedin/company``. Runs on every still-pending post.
+       Gated by ``settings.enrich_with_wiza``.
+    3. **Crustdata Person Enrich** — backstop for the (small) subset Wiza can't
+       match. 3 credits/match. APIDirect company-industry follow-up still fires
+       for these because Crustdata's response lacks industry. URN-form slugs
+       are skipped here (Crustdata fuzzy-matches them to wrong people; Wiza
+       already covered them at pass 2). Gated by the existing
+       ``enrichment_strategy`` knob.
+    4. **Unipile ``/users/{slug}`` last-resort** — capped at
+       ``settings.discovery_unipile_author_fallback_cap_per_run`` per call
+       (default 100) because each fetch rides a connected LinkedIn session
+       and burns rate-limit budget on that account (observed cooldown event
+       2026-05-14 from aggressive reads). Skipped under ``crustdata_only``.
 
     Failures are silent: callers receive an absent key and fall back to
     "no enriched profile available"."""
@@ -2523,17 +3117,24 @@ def _enrich_authors_for_post_batch(
         return {}
 
     enrichment_strategy = settings.discovery_unipile_enrichment_strategy
+    wiza_enabled = bool(settings.enrich_with_wiza)
     crustdata_enabled = enrichment_strategy in ("crustdata_first", "crustdata_only")
     unipile_fallback_allowed = (
         enrichment_strategy in ("crustdata_first", "unipile_only")
         and bool(account_id)
     )
+    # Same per-run cap setting the inline `_run_unipile` path uses, so both
+    # orchestrators share one budget knob (raised 50→100 in 2026-05-14
+    # reorder).
+    unipile_cap = int(getattr(
+        settings, "discovery_unipile_fallback_max_fetches_per_run", 100,
+    ) or 0)
 
     out: dict[str, dict[str, Any]] = {}
 
     # PASS 1: cache lookup
-    pending_for_crustdata: list[Any] = []
-    pending_for_unipile: list[tuple[Any, str]] = []
+    pending_after_cache: list[Any] = []
+    slug_by_post: dict[int, str] = {}  # id(post) -> slug
     for post in posts:
         post_url = (getattr(post, "url", "") or "").strip()
         if not post_url:
@@ -2551,23 +3152,55 @@ def _enrich_authors_for_post_batch(
         if cached is not None:
             out[post_url] = cached
             continue
-        pending_for_crustdata.append(post)
-        pending_for_unipile.append((post, slug))
+        pending_after_cache.append(post)
+        slug_by_post[id(post)] = slug
 
-    # PASS 2: Crustdata batch
-    if crustdata_enabled and pending_for_crustdata:
+    # PASS 2: Wiza batch (NEW — first paid tier; replaces Crustdata as the
+    # primary enrichment source per 2026-05-14 reorder)
+    pending_after_wiza: list[Any] = pending_after_cache
+    if wiza_enabled and pending_after_cache:
+        wz_results = _enrich_via_wiza(
+            db,
+            operator_id=operator_id,
+            posts_pending=pending_after_cache,
+        )
+        if wz_results:
+            still_pending: list[Any] = []
+            for post in pending_after_cache:
+                post_url = (getattr(post, "url", "") or "").strip()
+                if not post_url:
+                    continue
+                slug = slug_by_post.get(id(post)) or ""
+                if not slug:
+                    still_pending.append(post)
+                    continue
+                derived_url = f"https://www.linkedin.com/in/{slug}"
+                prof = wz_results.get(derived_url) or wz_results.get(
+                    getattr(post, "author_profile_url", "") or ""
+                )
+                if prof is not None:
+                    out[post_url] = prof
+                else:
+                    still_pending.append(post)
+            pending_after_wiza = still_pending
+
+    # PASS 3: Crustdata batch — backstop for Wiza misses only
+    pending_after_crustdata: list[Any] = pending_after_wiza
+    if crustdata_enabled and pending_after_wiza:
         cd_results = _enrich_via_crustdata(
             db,
             operator_id=operator_id,
-            posts_pending=pending_for_crustdata,
+            posts_pending=pending_after_wiza,
         )
         if cd_results:
-            for post in pending_for_crustdata:
+            still_pending = []
+            for post in pending_after_wiza:
                 post_url = (getattr(post, "url", "") or "").strip()
-                if not post_url or post_url in out:
+                if not post_url:
                     continue
-                slug = _extract_author_slug_from_post_url(post_url) or ""
+                slug = slug_by_post.get(id(post)) or ""
                 if not slug:
+                    still_pending.append(post)
                     continue
                 derived_url = f"https://www.linkedin.com/in/{slug}"
                 prof = cd_results.get(derived_url) or cd_results.get(
@@ -2575,23 +3208,83 @@ def _enrich_authors_for_post_batch(
                 )
                 if prof is not None:
                     out[post_url] = prof
+                else:
+                    still_pending.append(post)
+            pending_after_crustdata = still_pending
 
-    # PASS 3: Unipile fallback (per-post; throttle enforced inside resolve_profile)
-    if unipile_fallback_allowed:
-        for post, slug in pending_for_unipile:
+    # PASS 4: Unipile /users/{slug} last-resort, capped per-run.
+    # Each call rides Yair's (or the connected account's) LinkedIn session
+    # and burns rate-limit budget — the cap prevents a single discovery
+    # batch with many novel authors from tripping account-level cooldowns.
+    #
+    # GRACEFUL DEGRADATION (2026-05-14): if the pool's profile_view budget
+    # is exhausted (PoolExhausted / RuntimeError from _pool_acquire), we
+    # log and STOP firing Pass 4 for the rest of this batch instead of
+    # crashing the discovery worker. Operator contract: "do wiza then
+    # crustdata if unipile is exhausted, don't stop." Wiza+Crustdata
+    # results already in `out` are preserved; the unenriched posts flow
+    # to the LLM gates, which can still decide on post-content alone.
+    from app.services.unipile_pool import PoolExhausted as _PoolExhausted
+    if unipile_fallback_allowed and pending_after_crustdata:
+        n_unipile_fetched = 0
+        n_unipile_skipped_cap = 0
+        n_unipile_skipped_exhausted = 0
+        pool_exhausted_for_run = False
+        for post in pending_after_crustdata:
             post_url = (getattr(post, "url", "") or "").strip()
             if not post_url or post_url in out:
                 continue
-            profile, _was_fetched = _get_cached_unipile_author_profile_by_slug(
-                db,
-                operator_id=operator_id,
-                slug=slug,
-                account_id=account_id or "",
-                ttl_days=ttl_days,
-                slate_run_id=slate_run_id,
-            )
+            if unipile_cap > 0 and n_unipile_fetched >= unipile_cap:
+                n_unipile_skipped_cap += 1
+                continue
+            if pool_exhausted_for_run:
+                n_unipile_skipped_exhausted += 1
+                continue
+            slug = slug_by_post.get(id(post)) or ""
+            if not slug:
+                continue
+            try:
+                profile, was_fetched = _get_cached_unipile_author_profile_by_slug(
+                    db,
+                    operator_id=operator_id,
+                    slug=slug,
+                    account_id=account_id or "",
+                    ttl_days=ttl_days,
+                    slate_run_id=slate_run_id,
+                )
+            except (_PoolExhausted, RuntimeError) as err:
+                # profile_view budget exhausted across the pool (all 5
+                # accounts capped or in cooldown). Latch the flag so we
+                # don't retry per-post for the rest of this batch.
+                log.warning(
+                    "│  [unipile-author-fallback] pool exhausted for "
+                    "profile_view (%s) — skipping remainder; "
+                    "Wiza+Crustdata results stay; unenriched posts "
+                    "continue to gates",
+                    str(err)[:120],
+                )
+                pool_exhausted_for_run = True
+                n_unipile_skipped_exhausted += 1
+                continue
+            if was_fetched:
+                n_unipile_fetched += 1
             if profile is not None:
                 out[post_url] = profile
+        if n_unipile_skipped_cap:
+            log.info(
+                "│  [unipile-author-fallback] cap=%d hit; skipped %d post(s) "
+                "(both Wiza+Crustdata missed). Raise "
+                "DISCOVERY_UNIPILE_AUTHOR_FALLBACK_CAP_PER_RUN with care — "
+                "each call burns rate-limit budget on the connected account.",
+                unipile_cap, n_unipile_skipped_cap,
+            )
+        if n_unipile_skipped_exhausted:
+            log.info(
+                "│  [unipile-author-fallback] pool exhausted; skipped %d "
+                "post(s). Unenriched posts will fall through to LLM gates "
+                "with post-content signal only.",
+                n_unipile_skipped_exhausted,
+            )
 
     return out
 
@@ -2633,6 +3326,7 @@ def _run_apidirect(
     slate_run_id: ObjectId,
     tier_1: list[str],
     tier_2: list[str],
+    tier_3: list[str],
     seen_urls: set[str],
     seen_authors_shipped: set[str],
     account_id: str | None = None,
@@ -2641,12 +3335,16 @@ def _run_apidirect(
     we just stop calling it for the rest of the run.
 
     Builds the plan straight from the operator's tier pools — no no-repeat
-    ledger, so the same keyword can run every day."""
+    ledger, so the same keyword can run every day. Sweeps tier_1 + tier_2 +
+    tier_3 unbounded (per operator request 2026-05-15) so the full curated
+    keyword pool fires through APIDirect each run."""
     plan: list[tuple[str, str]] = []
     for kw in _rotate(tier_1, DISCOVERY_TIER_1_PER_RUN):
         plan.append((kw, "A"))
     for kw in _rotate(tier_2, DISCOVERY_TIER_2_PER_RUN):
         plan.append((kw, "B"))
+    for kw in _rotate(tier_3, DISCOVERY_TIER_3_PER_RUN):
+        plan.append((kw, "C"))
 
     if not plan:
         log.warning(
@@ -2664,9 +3362,13 @@ def _run_apidirect(
     t_ap = time.monotonic()
 
     inserted = 0
+    _set_current_source(db, slate_run_id, SOURCE_APIDIRECT)
     for query, classification in plan:
         if _should_skip_remaining_discovery(db, slate_run_id):
             log.info("│  [apidirect]   skip_remaining_discovery flag set — exiting")
+            break
+        if _should_skip_current_source(db, slate_run_id, SOURCE_APIDIRECT):
+            log.info("│  [apidirect]   skip_current_source flag matched — exiting apidirect, continuing to next source")
             break
         if _discovery_wall_clock_exceeded(
             t_ap, settings.discovery_wall_clock_cap_seconds_apidirect
@@ -2791,6 +3493,26 @@ def _run_apidirect(
                 details=details,
                 enriched_profile=enriched_profile,
             )
+            # ── No-enrichment carve-out (operator contract 2026-05-14) ──
+            # If Wiza + Crustdata + (capped) Unipile all missed for this
+            # author, we have no profile metadata. Don't pass to the LLM
+            # gates — set aside with status=pending_enrichment_review so
+            # the UI surfaces them for human triage instead. Same status
+            # used by the unipile_keyword path's no_profile carve-out.
+            if enriched_profile is None:
+                ap_doc["status"] = "pending_enrichment_review"
+                ap_doc["drop_reason"] = (
+                    "no_profile (apidirect: wiza+crustdata+unipile all missed "
+                    "or pool exhausted)"
+                )
+                db.candidates.insert_one(ap_doc)
+                _discovery_record_insert(db, ap_doc)
+                log.info(
+                    "│  [REVIEW/apidirect] %s ← no enrichment from any provider",
+                    (post.url or "<no-url>")[:90],
+                )
+                inserted += 1
+                continue
             # Mark `geo_verified_at_source=True` when the resolver confirmed
             # US — saves the LLM ICP gate from re-scoring geography on a
             # candidate we already verified deterministically.
@@ -2851,9 +3573,13 @@ def _run_exa(
     t_ex = time.monotonic()
 
     inserted = 0
+    _set_current_source(db, slate_run_id, SOURCE_EXA)
     for query, classification in plan:
         if _should_skip_remaining_discovery(db, slate_run_id):
             log.info("│  [exa]         skip_remaining_discovery flag set — exiting")
+            break
+        if _should_skip_current_source(db, slate_run_id, SOURCE_EXA):
+            log.info("│  [exa]         skip_current_source flag matched — exiting exa")
             break
         if _discovery_wall_clock_exceeded(
             t_ex, settings.discovery_wall_clock_cap_seconds_exa
@@ -2926,22 +3652,49 @@ def _run_exa(
                 )
                 continue
 
+            # ── No-enrichment carve-out (operator contract 2026-05-14) ──
+            # Capture the pre-injection state: if cache/Wiza/Crustdata/
+            # (capped) Unipile all missed, enriched_profile is None right
+            # now. Set aside as pending_enrichment_review instead of
+            # injecting synthetic geo + flowing to LLM gates.
+            had_real_enrichment = enriched_profile is not None
+            if not had_real_enrichment:
+                seen_urls.add(post.url)
+                exa_doc = _doc_from_exa(
+                    post,
+                    operator_id=operator_id,
+                    cofounder_id=cofounder_id,
+                    slate_run_id=slate_run_id,
+                    source_keyword=query,
+                    source_classification=classification,
+                    enriched_profile=None,
+                )
+                exa_doc["status"] = "pending_enrichment_review"
+                exa_doc["drop_reason"] = (
+                    "no_profile (exa: wiza+crustdata+unipile all missed or "
+                    "pool exhausted)"
+                )
+                db.candidates.insert_one(exa_doc)
+                _discovery_record_insert(db, exa_doc)
+                log.info(
+                    "│  [REVIEW/exa] %s ← no enrichment from any provider",
+                    (post.url or "<no-url>")[:90],
+                )
+                inserted += 1
+                continue
+
             # Default location for Exa: Exa's API doesn't return a `location`
-            # field, and many Exa-surfaced authors won't be in Unipile's
-            # /users/{slug} resolver (e.g. /pulse/ articles, authors with
-            # unusual slugs). Without a Location string the LLM ICP gate
-            # falls back to inferring geography from post text alone, which
-            # most often scores G=0 → drop. Since Exa's keyword pool is
-            # operator-geo biased anyway, treat Exa results as
-            # operator-primary-geo by default and let the LLM override via
-            # POST-EXPLICIT when the post text clearly indicates otherwise.
-            if not (enriched_profile and (enriched_profile.get("location") or "").strip()):
+            # field, so Wiza/Crustdata may have given us everything except
+            # location. Inject synthetic geo only when real enrichment was
+            # found but its location is empty — saves the LLM ICP gate from
+            # G=0-dropping a properly enriched candidate just because Wiza
+            # didn't have a location string. This injection no longer runs
+            # for None-enriched candidates (they're now in the review queue
+            # above).
+            if not (enriched_profile.get("location") or "").strip():
                 primary_geo = _operator_primary_geography(operator)
                 if primary_geo:
-                    if enriched_profile is None:
-                        enriched_profile = {}
-                    else:
-                        enriched_profile = dict(enriched_profile)
+                    enriched_profile = dict(enriched_profile)
                     enriched_profile["location"] = primary_geo
                     enriched_profile["_location_source"] = "exa_default"
 
@@ -3049,16 +3802,27 @@ def _run_unipile(
     )
     enrichment_counters = {
         "cache_hit": 0,
-        "crustdata_matched": 0,
-        "unipile_fallback": 0,
+        "wiza_matched": 0,       # first paid tier (1 credit, returns industry)
+        "crustdata_matched": 0,  # backstop tier (3 credits, no industry)
+        "unipile_fallback": 0,   # last-resort /users/{slug} (capped per run)
         "no_profile": 0,
     }
 
+    # Local import for the search-exhaustion graceful-degradation handler
+    # below (operator contract 2026-05-14: if Unipile search is exhausted
+    # for the day, the source should exit cleanly so the outer cofounder
+    # loop hands off to APIDirect + Exa instead of crashing the run).
+    from app.services.unipile_pool import PoolExhausted as _PoolExhausted_kw
+
     t_kw = time.monotonic()
+    _set_current_source(db, slate_run_id, SOURCE_UNIPILE_KEYWORD)
     for kind, payload, source, classification in plan:
         assert kind == "kw"
         if _should_skip_remaining_discovery(db, slate_run_id):
             log.info("│  [unipile-kw]  skip_remaining_discovery flag set — exiting keyword source")
+            break
+        if _should_skip_current_source(db, slate_run_id, SOURCE_UNIPILE_KEYWORD):
+            log.info("│  [unipile-kw]  skip_current_source flag matched — exiting keyword source, continuing to next source")
             break
         if _discovery_wall_clock_exceeded(
             t_kw, settings.discovery_wall_clock_cap_seconds_unipile_keyword
@@ -3091,21 +3855,26 @@ def _run_unipile(
                 "│  [unipile-kw] query=%r (bare keyword; geo enforced post-fetch by inline rubric, not by server)",
                 payload,
             )
-            posts = search_posts_pages(
-                account_id=account_id,
-                query=payload,
-                max_pages=settings.discovery_unipile_post_max_pages,
-                per_page=settings.discovery_unipile_post_limit,
-                sort_by=settings.discovery_unipile_post_sort_by or None,
-                date_posted=settings.discovery_unipile_post_date_window or None,
-                content_type=(
-                    settings.discovery_unipile_post_content_type.strip()
-                    if settings.discovery_unipile_post_content_type.strip()
-                    else None
-                ),
-                author_keywords=settings.discovery_unipile_post_author_filter or None,
-                location_ids=None,  # see comment above — body filter doesn't work on content search
-            )
+            # no_wait=True: per operator contract, if Unipile search is
+            # exhausted we MOVE ON to next source (APIDirect + Exa). The
+            # PoolExhausted handler below catches the immediate raise and
+            # breaks the keyword loop cleanly.
+            with _pool_acquire("search", fallback=account_id, no_wait=True) as _acct:
+                posts = search_posts_pages(
+                    account_id=_acct,
+                    query=payload,
+                    max_pages=settings.discovery_unipile_post_max_pages,
+                    per_page=settings.discovery_unipile_post_limit,
+                    sort_by=settings.discovery_unipile_post_sort_by or None,
+                    date_posted=settings.discovery_unipile_post_date_window or None,
+                    content_type=(
+                        settings.discovery_unipile_post_content_type.strip()
+                        if settings.discovery_unipile_post_content_type.strip()
+                        else None
+                    ),
+                    author_keywords=settings.discovery_unipile_post_author_filter or None,
+                    location_ids=None,  # see comment above — body filter doesn't work on content search
+                )
             log.info(
                 "│  [unipile-kw] result query=%r posts=%d source=%s",
                 payload, len(posts), source,
@@ -3116,6 +3885,34 @@ def _run_unipile(
         except UnipileError as err:
             log.warning("discovery: unipile kw failed for %r: %s", payload, err)
             continue
+        except _PoolExhausted_kw as err:
+            # ── Graceful degradation on search-capacity exhaustion ─────
+            # All allowlist accounts hit their `search` daily cap (80/day
+            # each) or are in cooldown. EVERY subsequent keyword on this
+            # source would fail the same way, so break out cleanly and
+            # let the outer cofounder loop hand off to APIDirect + Exa.
+            # Operator contract (2026-05-14): "if unipile search is
+            # reached, it should automatically go to apidirect and exa."
+            log.warning(
+                "│  [unipile-kw]  pool exhausted for SEARCH (%s) — "
+                "exiting unipile_keyword and handing off to apidirect + exa",
+                str(err)[:120],
+            )
+            break
+        except RuntimeError as err:
+            # _pool_acquire raises this when the allowlist excludes the
+            # fallback account (anti-leakage guard). Same handoff
+            # behaviour — the operator's allowlist is wrong but we
+            # shouldn't crash the task.
+            msg = str(err)
+            if "refusing to leak" in msg or "no account available" in msg.lower():
+                log.warning(
+                    "│  [unipile-kw]  pool gate refused acquire (%s) — "
+                    "exiting unipile_keyword, handing off to apidirect + exa",
+                    msg[:120],
+                )
+                break
+            raise
 
         # Tag content-search hits with source_channel for downstream routing.
         if source in ("tier_1_kw", "tier_2_kw", "tier_3_kw"):
@@ -3152,10 +3949,35 @@ def _run_unipile(
                 enrichment_counters["cache_hit"] += 1
             viable.append((post, cached))
 
+        # ── PASS 1.5: Wiza Person Enrich (NEW — first paid tier) ─────────
+        # 1 credit/match, free on miss. Returns company_industry inline so
+        # APIDirect /v1/linkedin/company is NOT needed for Wiza hits. Runs
+        # before Crustdata in the 2026-05-14 reorder.
+        if use_inline_rubric and settings.enrich_with_wiza:
+            pending_for_wiza = [post for post, prof in viable if prof is None]
+            if pending_for_wiza:
+                wz_results = _enrich_via_wiza(
+                    db,
+                    operator_id=operator_id,
+                    posts_pending=pending_for_wiza,
+                )
+                if wz_results:
+                    enrichment_counters["wiza_matched"] = (
+                        enrichment_counters.get("wiza_matched", 0) + len(wz_results)
+                    )
+                    new_viable: list[tuple[UnipilePost, dict[str, Any] | None]] = []
+                    for post, prof in viable:
+                        if prof is None:
+                            url = post.author_profile_url or ""
+                            prof = wz_results.get(url)
+                        new_viable.append((post, prof))
+                    viable = new_viable
+
         # ── PASS 2: Crustdata batch enrichment for cache misses ─────────
         # Only attempted when strategy ∈ {crustdata_first, crustdata_only}.
         # `_enrich_via_crustdata` filters out URN-form slugs internally so
         # we don't waste credits on guaranteed-miss URLs.
+        # After the Wiza pass this only fires for posts Wiza couldn't match.
         if use_inline_rubric and crustdata_enabled:
             pending_for_crustdata = [post for post, prof in viable if prof is None]
             if pending_for_crustdata:
@@ -3268,15 +4090,38 @@ def _run_unipile(
                             f"rubric T={author_score['title']} I={author_score['industry']} "
                             f"G={author_score['geo']} post={post_score} → no path"
                         )
-                    log.info(
-                        "│  [DROP/unipile] %s  ←  %s",
-                        (post.url or "<no-url>")[:90],
-                        reason,
-                    )
-                    # Persist the rejected post so the gate-funnel UI can
-                    # surface which Unipile posts fell out at discovery and
-                    # why. Mark with status=rejected_inline + structured
-                    # drop_reason so downstream stages skip it.
+                    # ── Human-review carve-out for no_profile ──────────────
+                    # Operator contract (2026-05-14): if Wiza + Crustdata
+                    # both miss AND Unipile fallback is unavailable
+                    # (capped, allowlist-blocked, or pool exhausted), we
+                    # CANNOT decide ICP fit from author data alone — but
+                    # the post itself may still be worth engaging. Set
+                    # these aside as status="pending_enrichment_review"
+                    # so the UI can surface them for human triage instead
+                    # of silently dropping them with the failed-rubric
+                    # rejections. Downstream gate stages key off
+                    # status="verified" → "cheap_gate_passed" → "gate_passed"
+                    # so this new status is naturally inert in the pipeline
+                    # without needing skip-logic changes.
+                    if reason_key == "inline_no_profile":
+                        review_status = "pending_enrichment_review"
+                        log.info(
+                            "│  [REVIEW/unipile] %s  ←  %s  (set aside for "
+                            "human triage; not dropped)",
+                            (post.url or "<no-url>")[:90],
+                            reason,
+                        )
+                    else:
+                        review_status = "rejected_inline"
+                        log.info(
+                            "│  [DROP/unipile] %s  ←  %s",
+                            (post.url or "<no-url>")[:90],
+                            reason,
+                        )
+                    # Persist the post. status differentiates the two
+                    # downstream behaviors: rejected_inline → permanent
+                    # drop visible only in funnel audits; pending_enrichment_review
+                    # → surfaces in a human-review UI for operator triage.
                     rejected_doc = _doc_from_unipile(
                         post,
                         operator_id=operator_id,
@@ -3289,7 +4134,7 @@ def _run_unipile(
                         enriched_profile=enriched_profile,
                         unipile_rubric=rubric_snapshot,
                     )
-                    rejected_doc["status"] = "rejected_inline"
+                    rejected_doc["status"] = review_status
                     rejected_doc["drop_reason"] = f"{reason_key}: {reason}"
                     try:
                         db.candidates.insert_one(rejected_doc)
@@ -3400,9 +4245,19 @@ def _run_unipile_title_search(
 
     inserted = 0
     t_ts = time.monotonic()
+    # Sentinel: set by the inner post_fetch exception handler so the
+    # outer query loop can break cleanly without re-raising up the stack
+    # (which would crash daily_run instead of handing off to next source).
+    pool_exhausted_handoff = False
+    _set_current_source(db, slate_run_id, SOURCE_UNIPILE_TITLE_SEARCH)
     for query in plan:
+        if pool_exhausted_handoff:
+            break
         if _should_skip_remaining_discovery(db, slate_run_id):
             log.info("│  [unipile-people] skip_remaining_discovery flag set — exiting title_search")
+            break
+        if _should_skip_current_source(db, slate_run_id, SOURCE_UNIPILE_TITLE_SEARCH):
+            log.info("│  [unipile-people] skip_current_source flag matched — exiting title_search, continuing to next source")
             break
         if _discovery_wall_clock_exceeded(
             t_ts, settings.discovery_wall_clock_cap_seconds_unipile_keyword
@@ -3436,19 +4291,40 @@ def _run_unipile_title_search(
         # ceiling for SEARCH-source accounts when the cofounder's network
         # doesn't overlap the ICP cluster yet.
         try:
-            people = search_people(
-                account_id=account_id,
-                query=vendor_q,
-                limit=DISCOVERY_TITLE_SEARCH_PEOPLE_PER_QUERY,
-                industry_ids=industry_ids or None,
-                network_distance_degrees=(),
-            )
+            # no_wait=True: title_search search-pool exhausted → raise
+            # immediately, handler below breaks the query loop and the
+            # outer source-loop hands off to unipile_keyword / APIDirect /
+            # Exa per operator contract.
+            with _pool_acquire("search", fallback=account_id, no_wait=True) as _acct:
+                people = search_people(
+                    account_id=_acct,
+                    query=vendor_q,
+                    limit=DISCOVERY_TITLE_SEARCH_PEOPLE_PER_QUERY,
+                    industry_ids=industry_ids or None,
+                    network_distance_degrees=(),
+                )
         except UnipileNotConfigured as err:
             log.warning("discovery: title_search unipile unconfigured: %s", err)
             return inserted
         except UnipileError as err:
             log.warning("discovery: title_search %r failed: %s", query, err)
             continue
+        except Exception as err:  # noqa: BLE001
+            # Graceful degradation on PoolExhausted / RuntimeError from
+            # _pool_acquire. Same contract as unipile_keyword: when all
+            # allowlist accounts hit their daily SEARCH cap (80/day) or
+            # are in cooldown, every subsequent query on this source will
+            # fail identically — break out and let the outer cofounder
+            # loop hand off to APIDirect + Exa.
+            from app.services.unipile_pool import PoolExhausted as _PE
+            if isinstance(err, (_PE, RuntimeError)):
+                log.warning(
+                    "│  [unipile-people]  pool exhausted/refused for SEARCH "
+                    "(%s) — exiting title_search and handing off",
+                    str(err)[:120],
+                )
+                break
+            raise
 
         # Step 2 — for each person, walk recent activity.
         for person in people:
@@ -3458,11 +4334,28 @@ def _run_unipile_title_search(
             if author_url and _is_exhausted(db, operator_id, author_url):
                 continue
             try:
-                posts = get_user_posts(
-                    account_id=account_id,
-                    public_identifier_or_url=person.public_identifier or author_url,
-                    limit=DISCOVERY_TITLE_SEARCH_POSTS_PER_PERSON,
-                )
+                # no_wait=True: post_fetch pool exhausted → raise
+                # immediately, sentinel-flag handler below routes to
+                # next source per operator contract.
+                with _pool_acquire("post_fetch", fallback=account_id, no_wait=True) as _acct:
+                    # Pass provider_id (URN) when Unipile gave us one inline
+                    # in the people-search response. get_user_posts then
+                    # SKIPS the /users/{slug} resolve step — saves one full
+                    # Unipile round-trip per person AND, more importantly,
+                    # stops firing a "X viewed your profile" notification
+                    # on every stranger in the roster. Without this we burn
+                    # the entire profile_view daily cap on people we
+                    # haven't even decided to engage with yet (the loudest
+                    # automation signal on the platform).
+                    posts = get_user_posts(
+                        account_id=_acct,
+                        public_identifier_or_url=(
+                            person.provider_id
+                            or person.public_identifier
+                            or author_url
+                        ),
+                        limit=DISCOVERY_TITLE_SEARCH_POSTS_PER_PERSON,
+                    )
             except UnipileError as err:
                 log.warning(
                     "discovery: title_search recent-activity for %s failed: %s",
@@ -3470,6 +4363,22 @@ def _run_unipile_title_search(
                     err,
                 )
                 continue
+            except Exception as err:  # noqa: BLE001
+                # PoolExhausted / RuntimeError on post_fetch: handoff via
+                # the `pool_exhausted_handoff` sentinel so the outer query
+                # loop breaks at its top-of-iteration check without
+                # propagating the exception up the stack (which would
+                # crash daily_run instead of handing off to next source).
+                from app.services.unipile_pool import PoolExhausted as _PE2
+                if isinstance(err, (_PE2, RuntimeError)):
+                    log.warning(
+                        "│  [unipile-people]  pool exhausted/refused for "
+                        "POST_FETCH (%s) — exiting title_search, handing off",
+                        str(err)[:120],
+                    )
+                    pool_exhausted_handoff = True
+                    break
+                raise
 
             # Build a synthetic "enriched_profile" from the UnipilePerson
             # fields so the candidate doc gets `author_location` set and the
@@ -3847,11 +4756,15 @@ def _run_contact_seeds_unipile(
         company = seed.get("extracted_company") or ""
 
         try:
-            posts = get_user_posts(
-                account_id=account_id,
-                public_identifier_or_url=linkedin_url,
-                limit=posts_per_contact,
-            )
+            # no_wait=True: contact-seed walk is "use pool if free, skip if
+            # exhausted". The per-seed except below catches PoolExhausted/
+            # RuntimeError as a normal "skip this seed and move on" miss.
+            with _pool_acquire("post_fetch", fallback=account_id, no_wait=True) as _acct:
+                posts = get_user_posts(
+                    account_id=_acct,
+                    public_identifier_or_url=linkedin_url,
+                    limit=posts_per_contact,
+                )
         except (UnipileError, UnipileNotConfigured) as err:
             log.warning(
                 "discovery: contact_seeds_unipile %r failed: %s",
@@ -3859,6 +4772,19 @@ def _run_contact_seeds_unipile(
                 err,
             )
             continue
+        except Exception as err:  # noqa: BLE001
+            # PoolExhausted / RuntimeError on the no_wait acquire above:
+            # contact-seed walk skips this seed and moves on. Same intent
+            # as the UnipileError branch but distinguishable in logs.
+            from app.services.unipile_pool import PoolExhausted as _PE_seed
+            if isinstance(err, (_PE_seed, RuntimeError)):
+                log.warning(
+                    "discovery: contact_seeds_unipile pool exhausted/refused "
+                    "for %r (%s) — skipping seed, continuing",
+                    linkedin_url, str(err)[:80],
+                )
+                continue
+            raise
 
         for post in posts:
             # Pass through every post URL the contact actually has — no

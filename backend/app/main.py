@@ -10,11 +10,13 @@ from app.routes.analytics import router as analytics_router
 from app.routes.contacts import router as contacts_router
 from app.routes.crustdata import router as crustdata_router
 from app.routes.eod import router as eod_router
+from app.routes.manual_comments import router as manual_comments_router
 from app.routes.onboarding import router as onboarding_router
 from app.routes.pipeline import router as pipeline_router
 from app.routes.replies import router as replies_router
 from app.routes.settings import router as settings_router
 from app.routes.slate import router as slate_router
+from app.routes.unipile_pool import router as unipile_pool_router
 from app.routes.webhooks import router as webhooks_router
 
 
@@ -50,6 +52,8 @@ app.include_router(webhooks_router)
 app.include_router(analytics_router)
 app.include_router(settings_router)
 app.include_router(crustdata_router)
+app.include_router(manual_comments_router)
+app.include_router(unipile_pool_router)
 
 
 @app.get("/healthz")

@@ -135,6 +135,45 @@ def run_for_operator(db: Database, operator_id: ObjectId) -> dict[str, Any]:
     pipeline_t0 = utcnow()
     log.info("┌── daily_run start  operator=%s  slate=%s", operator_id, slate_run_id)
 
+    # Activate the cost-tracker context for this slate run. Every paid
+    # surface called from here on (Wiza, Crustdata, APIDirect, LLM)
+    # records into `slate_runs.cost_breakdown` keyed by this id, so the
+    # runs UI can poll the doc mid-flight and see the dollar total climb
+    # in real time.
+    try:
+        from app.services import cost_tracker
+        cost_tracker.set_current_slate_run(slate_run_id)
+    except Exception as err:  # noqa: BLE001
+        log.debug("daily_run: cost_tracker.set_current_slate_run skipped: %s", err)
+
+    # Snapshot the operator's saved pool-account selection onto the
+    # slate_run document AND activate the allowlist contextvar so every
+    # discovery `pool.acquire()` from here on is filtered to ONLY this
+    # subset. The Mongo filter inside `acquire()` enforces this at the
+    # atomic-claim level — no call site can leak to non-allowed accounts.
+    #
+    # Semantics:
+    #   operator.pool_account_ids = None  → no filter (all OK accounts)
+    #   operator.pool_account_ids = []    → empty allowlist → pool blocked
+    #   operator.pool_account_ids = [...] → strict allowlist
+    pool_account_ids = operator.get("pool_account_ids")
+    try:
+        from app.services.unipile_pool import set_pool_account_filter
+        set_pool_account_filter(pool_account_ids)
+    except Exception as err:  # noqa: BLE001
+        log.debug("daily_run: pool filter activation skipped: %s", err)
+    # Persist the snapshot on the slate_run so the UI can show which
+    # accounts participated in THIS run (the operator might change their
+    # selection later and we want the run page to reflect what was
+    # actually allowed when the run kicked off).
+    try:
+        db.slate_runs.update_one(
+            {"_id": slate_run_id},
+            {"$set": {"pool_account_ids": pool_account_ids}},
+        )
+    except Exception as err:  # noqa: BLE001
+        log.debug("daily_run: slate_run pool snapshot skipped: %s", err)
+
     try:
         # 1-5. Discovery → verification → gates → allocator → drafter.
         # In streaming mode (default) all five stages run as concurrent
@@ -545,7 +584,23 @@ def _run_gates(
     started = stage_started_at or utcnow()
     PROGRESS_EVERY = 5
 
+    # ── Cost-tracker context propagation ─────────────────────────────────
+    # _evaluate_cheap_gates and _evaluate_expensive_gates make LLM calls
+    # that call cost_tracker.record_llm_call(). That reads slate_run_id
+    # from a ContextVar + threading.local that does NOT propagate into
+    # ThreadPoolExecutor sub-threads. Result before this fix: most LLM
+    # call costs were being silently dropped (only serial calls from the
+    # parent thread were counted). Capture once; re-attach inside each
+    # worker via a wrapper. Same pattern as wiza_enrich.py:_enrich_with_ctx.
+    from app.services.cost_tracker import (
+        get_current_slate_run as _get_sid,
+        set_current_slate_run as _set_sid,
+    )
+    _parent_sid = _get_sid()
+
     def _eval(c: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        if _parent_sid is not None:
+            _set_sid(_parent_sid)
         if phase == "cheap":
             return _evaluate_cheap_gates(
                 c,
@@ -1047,6 +1102,20 @@ def _discovery_thread(
     errors_lock: threading.Lock,
 ) -> None:
     try:
+        # contextvars + threading.local don't auto-propagate across raw
+        # `threading.Thread(target=…)` spawns. Re-attach the slate-run
+        # context AND the pool allowlist here so any paid call inside
+        # discovery (Wiza/Crustdata/APIDirect/LLM) records into the right
+        # slate_runs.cost_breakdown AND every pool.acquire() obeys the
+        # operator's account selection.
+        from app.services import cost_tracker as _ct
+        from app.services.unipile_pool import set_pool_account_filter as _set_pool
+        _ct.set_current_slate_run(slate_run_id)
+        # Re-read the snapshot from Mongo so worker threads see the same
+        # allowlist even if the operator's user.pool_account_ids changed
+        # mid-run (snapshotted at run start; immutable here).
+        _slate = db.slate_runs.find_one({"_id": slate_run_id}, {"pool_account_ids": 1})
+        _set_pool((_slate or {}).get("pool_account_ids"))
         t = utcnow()
         log.info("│  [stream.discovery] start (concurrent with process/allocator/drafter)")
         discovered = discovery.discover_for_operator(
@@ -1083,6 +1152,13 @@ def _process_thread(
     using a small thread pool. Exit when discovery_done AND no raw remaining.
     """
     try:
+        # Re-attach cost-tracker slate context AND pool allowlist for
+        # this worker thread.
+        from app.services import cost_tracker as _ct
+        from app.services.unipile_pool import set_pool_account_filter as _set_pool
+        _ct.set_current_slate_run(slate_run_id)
+        _slate = db.slate_runs.find_one({"_id": slate_run_id}, {"pool_account_ids": 1})
+        _set_pool((_slate or {}).get("pool_account_ids"))
         max_age_days = settings.discovery_max_age_days
         cutoff: datetime | None = (
             utcnow() - timedelta(days=max_age_days) if max_age_days > 0 else None
@@ -1098,6 +1174,21 @@ def _process_thread(
         max_workers = max(1, int(settings.pipeline_process_max_workers))
         poll_sleep = max(0.05, float(settings.pipeline_poll_interval_seconds))
         processed_total = 0
+
+        # ── Cost-tracker context propagation ─────────────────────────
+        # _process_one calls verify + cheap_gates + expensive_gates, all
+        # of which trigger LLM calls that record cost via cost_tracker.
+        # Sub-threads spawned by ThreadPoolExecutor don't inherit the
+        # parent's ContextVar / threading.local — without this wrapper,
+        # every LLM call from _process_one would be recorded against
+        # slate_run_id=None and silently no-op. Same pattern fix as
+        # _run_gates and wiza_enrich.enrich_profiles.
+        _parent_sid_stream = _ct.get_current_slate_run()
+
+        def _process_one_with_ctx(*args, **kwargs):
+            if _parent_sid_stream is not None:
+                _ct.set_current_slate_run(_parent_sid_stream)
+            return _process_one(*args, **kwargs)
 
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="stream.process") as pool:
             while True:
@@ -1116,7 +1207,7 @@ def _process_thread(
 
                 futures = [
                     pool.submit(
-                        _process_one,
+                        _process_one_with_ctx,
                         db,
                         cid,
                         cutoff=cutoff,
@@ -1157,6 +1248,11 @@ def _allocator_thread(
     existing allocations and only picks the remaining headroom per cofounder.
     """
     try:
+        from app.services import cost_tracker as _ct
+        from app.services.unipile_pool import set_pool_account_filter as _set_pool
+        _ct.set_current_slate_run(slate_run_id)
+        _slate = db.slate_runs.find_one({"_id": slate_run_id}, {"pool_account_ids": 1})
+        _set_pool((_slate or {}).get("pool_account_ids"))
         buffer_min = max(1, int(settings.pipeline_buffer_min))
         poll_sleep = max(0.05, float(settings.pipeline_poll_interval_seconds))
         wave = 0
@@ -1245,6 +1341,11 @@ def _drafter_thread(
     Exit when allocator_done AND no allocated left.
     """
     try:
+        from app.services import cost_tracker as _ct
+        from app.services.unipile_pool import set_pool_account_filter as _set_pool
+        _ct.set_current_slate_run(slate_run_id)
+        _slate = db.slate_runs.find_one({"_id": slate_run_id}, {"pool_account_ids": 1})
+        _set_pool((_slate or {}).get("pool_account_ids"))
         cofounder_by_id = {cf["_id"]: cf for cf in cofounders}
         poll_sleep = max(0.05, float(settings.pipeline_poll_interval_seconds))
         drafted_total = 0

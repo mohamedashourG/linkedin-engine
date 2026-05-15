@@ -49,3 +49,11 @@ yarn-error.log*
 # celery
 backend/celerybeat-schedule
 celerybeat-schedule
+
+# operator-side exports / ad-hoc data dumps (not source code)
+exports/
+CARDIOWELL_*.csv
+CARDIOWELL_*.xlsx
+backend/_cw_*.json
+backend/_cw_*.csv
+backend/_edge_*.csv

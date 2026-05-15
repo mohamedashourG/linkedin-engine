@@ -26,9 +26,14 @@ class Settings(BaseSettings):
     # Global defaults apply to beat dispatchers, outbox drain, poll_replies, etc.
     celery_task_soft_time_limit_s: int = Field(default=1500, ge=1)
     celery_task_time_limit_s: int = Field(default=1800, ge=2)
-    # daily_run / nightly_run can exceed a single discovery+gates cycle; keep higher.
-    celery_pipeline_soft_time_limit_s: int = Field(default=3600, ge=1)
-    celery_pipeline_time_limit_s: int = Field(default=3900, ge=2)
+    # daily_run / nightly_run can exceed a single discovery+gates cycle; keep
+    # effectively unbounded so long-tail discovery + analyst stages on large
+    # operator inventories don't force-abort the slate. The 65-min ceiling
+    # that was hit on Edge's 2026-05-15 streaming run is what these defaults
+    # replace. Still capped at 24h as a sanity bound to catch truly stuck
+    # workers — override per-operator via env if you need shorter.
+    celery_pipeline_soft_time_limit_s: int = Field(default=86400, ge=1)
+    celery_pipeline_time_limit_s: int = Field(default=86700, ge=2)
 
     jwt_secret: str = "change-me-in-prod"
     jwt_algorithm: str = "HS256"
@@ -221,7 +226,13 @@ class Settings(BaseSettings):
     # hard ceiling on the slate_runs.fetch_budget_remaining counter; this
     # fallback cap is checked in addition for the Crustdata-first flow so
     # the LinkedIn-account call budget stays small even on high-yield runs.
-    discovery_unipile_fallback_max_fetches_per_run: int = 50
+    # Bumped 50→100 on 2026-05-14 when Wiza became the first-tier enrichment
+    # provider — Wiza catches most authors, so the Unipile /users/{slug}
+    # last-resort path now handles a smaller residual set per run and can
+    # afford a higher per-run ceiling. Each call still burns rate-limit
+    # budget on the connected LinkedIn account (cooldown observed
+    # 2026-05-14 from aggressive reads); raise only with care.
+    discovery_unipile_fallback_max_fetches_per_run: int = 100
     # Override of the vendor Crustdata batch size (server hard-caps at 25).
     # Lower values amortize cost over more requests in case of slowness.
     discovery_unipile_crustdata_batch_size: int = 25
@@ -352,6 +363,15 @@ class Settings(BaseSettings):
     enrich_with_pdl: bool = False
     enrich_with_crustdata: bool = True
 
+    # Wiza Person Enrich — first-tier enrichment provider in discovery's
+    # 4-pass chain (cache → Wiza → Crustdata → Unipile /users/{slug}).
+    # 1 credit per matched profile; free on miss. Returns company_industry
+    # inline so we can skip APIDirect /v1/linkedin/company on Wiza hits.
+    wiza_api_key: str = ""
+    wiza_mock: bool = False
+    enrich_with_wiza: bool = True
+    wiza_max_concurrent_reveals: int = 5
+
     unipile_api_key: str = ""
     unipile_subdomain: str = ""
     unipile_port: int = 443
@@ -359,6 +379,17 @@ class Settings(BaseSettings):
     # RULE 24 people search: default LinkedIn geoUrn id(s), comma-separated.
     # Empty string → single US urn ``103644278`` (see unipile.LINKEDIN_GEO_URN_US).
     unipile_rule24_location_ids: str = ""
+    # Dedicated Unipile account used for READ-ONLY engagement-tracking calls
+    # (comments + replies under our manual-comments). Decouples reads from
+    # the account doing the posting (Yair's) so a LinkedIn-side rate-limit
+    # on the posting account doesn't block engagement refresh. If unset,
+    # the refresh-engagement route falls back to the posting account.
+    unipile_stats_account_id: str = ""
+    # Off-by-default: when true, the beat schedule includes the periodic
+    # poll_invitations task which hits Unipile to check connection status
+    # of open invitations. Keep off until the invitation feature is
+    # actively in use.
+    invitation_polling_enabled: bool = False
 
     resend_api_key: str = ""
     resend_from_email: str = "hello@example.com"

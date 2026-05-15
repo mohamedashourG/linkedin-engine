@@ -36,6 +36,13 @@ export type SlateRun = {
   stage_note: string | null;
   skip_remaining_discovery?: boolean;
   skip_remaining_discovery_at?: string | null;
+  /** Source-id the discovery worker is iterating right now (one of
+   *  "unipile_title_search" | "unipile_keyword" | "apidirect" | "exa")
+   *  or null when discovery is between sources / not started / done. */
+  current_source?: string | null;
+  skip_current_source?: string | null;
+  skip_current_source_consumed_at?: string | null;
+  skip_current_source_consumed_for?: string | null;
 };
 
 export type SlateCofounder = {
@@ -116,6 +123,23 @@ export type DropReasonBucket = {
   count: number;
 };
 
+/** Posts surfaced by discovery this run that were filtered as "already
+ *  found in a previous run" (90-day exhaustion window). Null when the
+ *  run started before this telemetry shipped. */
+export type CrossRunDedupSkips = {
+  /** Total times a re-surfaced URL was skipped (one URL may have been
+   *  re-surfaced by multiple vendors in the same run — each is counted). */
+  total_count: number;
+  /** First-N unique skipped canonical post URLs (capped at sample_cap).
+   *  Used by the UI to render a "show skipped" list without unbounded growth. */
+  sample_urls: string[];
+  sample_cap: number;
+  /** Size of the seen-urls set when the run started (i.e. the operator's
+   *  90-day post history). For context vs total_count. */
+  seeded_urls_count: number;
+  captured_at: string | null;
+};
+
 export type RunDetailResponse = {
   slate_run: SlateRun;
   runtime_seconds: number | null;
@@ -128,6 +152,39 @@ export type RunDetailResponse = {
   top_drop_reasons: DropReasonBucket[];
   candidates: Candidate[];
   cofounders: { id: string; display_name: string; active: boolean }[];
+  cross_run_dedup_skips: CrossRunDedupSkips | null;
+};
+
+/** Per-line-item bucket as written by the backend `cost_tracker`. */
+export type CostLineItem = {
+  count?: number;
+  dollars?: number;
+  /** LLM-only — prompt/completion token counters. */
+  prompt_tokens?: number;
+  completion_tokens?: number;
+};
+
+/** Per-provider section under `cost_breakdown`. */
+export type CostProvider = {
+  totals?: CostLineItem;
+  line_items?: Record<string, CostLineItem>;
+  last_at?: string | null;
+};
+
+export type RunCostsResponse = {
+  slate_run_id: string;
+  updated_at: string | null;
+  /** Grand totals across every provider + LLM. */
+  totals: {
+    calls?: number;
+    dollars?: number;
+    /** Aggregate LLM token usage when present. */
+    prompt_tokens?: number;
+    completion_tokens?: number;
+  };
+  /** Per-provider sections — keys include: wiza, crustdata, apidirect,
+   * unipile, llm. */
+  providers: Record<string, CostProvider>;
 };
 
 export const slateApi = {
@@ -151,6 +208,21 @@ export const slateApi = {
       status: string;
       current_stage: string | null;
     }>(`/api/slate/runs/${encodeURIComponent(slateRunId)}/skip-discovery`),
+  /**
+   * Skip ONLY the discovery source the worker is iterating right now,
+   * then continue with the next source in order:
+   *   unipile_title_search → unipile_keyword → apidirect → exa
+   * Differs from skipDiscovery (which abandons ALL remaining sources).
+   * Returns 409 if no source is currently active.
+   */
+  skipCurrentSource: (slateRunId: string) =>
+    api.post<{
+      slate_run_id: string;
+      skipped_source: string;
+      next_source: string | null;
+      status: string;
+      current_stage: string | null;
+    }>(`/api/slate/runs/${encodeURIComponent(slateRunId)}/skip-current-source`),
   runs: (opts?: { limit?: number; before?: string }) => {
     const qs = new URLSearchParams();
     if (opts?.limit) qs.set("limit", String(opts.limit));
@@ -163,6 +235,23 @@ export const slateApi = {
   run: (slateRunId: string) =>
     api.get<RunDetailResponse>(
       `/api/slate/runs/${encodeURIComponent(slateRunId)}`,
+    ),
+  /**
+   * Live cost breakdown for an in-flight or completed slate run.
+   * Returns running totals from `slate_runs.cost_breakdown` — every paid
+   * provider call (Wiza / Crustdata / APIDirect) and LLM round-trip
+   * (OpenAI / Anthropic) increments this subdoc as the run executes, so
+   * polling mid-flight shows the dollars climb in real time.
+   *
+   * Shape:
+   *   totals.calls / totals.dollars  — grand totals across everything
+   *   providers.<name>.totals.{count, dollars}
+   *   providers.<name>.line_items.<key>.{count, dollars, ...}
+   *   providers.llm.line_items.<model:tier>.{prompt_tokens, completion_tokens, ...}
+   */
+  runCosts: (slateRunId: string) =>
+    api.get<RunCostsResponse>(
+      `/api/slate/runs/${encodeURIComponent(slateRunId)}/costs`,
     ),
   emailSelected: (
     slateRunId: string,

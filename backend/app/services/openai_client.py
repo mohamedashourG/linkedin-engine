@@ -241,6 +241,20 @@ def parse_structured_sync(
             parsed = choice.message.parsed
             if parsed is None:
                 raise RuntimeError("chat.completions.parse returned no parsed output.")
+            # Cost accounting — capture token usage so the run-level
+            # dollar total includes LLM spend alongside provider fees.
+            try:
+                usage = getattr(response, "usage", None)
+                if usage is not None:
+                    from app.services import cost_tracker
+                    cost_tracker.record_llm_call(
+                        model=model,
+                        prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+                        completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+                        tier=model_tier,
+                    )
+            except Exception as err:  # noqa: BLE001 — never let cost tracking block an LLM result
+                log.debug("openai_client: cost record skipped: %s", err)
             return parsed
         except (APIConnectionError, RateLimitError) as err:
             last_err = err

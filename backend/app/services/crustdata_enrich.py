@@ -101,6 +101,20 @@ def _trip_circuit() -> None:
 
 @dataclass(frozen=True)
 class EnrichedProfile:
+    """Common author-enrichment shape produced by all enrichment providers.
+
+    Origin (``source`` field) is one of:
+      * ``"crustdata"`` (default) — Crustdata Person Enrich.
+      * ``"wiza"``     — Wiza Person Enrich at ``enrichment_level="none"``.
+      * ``"unipile"``  — Unipile ``/users/{slug}`` last-resort fallback.
+
+    The ``company_*`` fields are populated by Wiza (which returns structured
+    industry/size/location inline) and are ``None`` for Crustdata results
+    (Crustdata's Person Enrich doesn't expose industry — discovery's
+    cache-writer falls through to APIDirect ``/v1/linkedin/company`` in
+    that case). On Wiza hits, having these fields populated lets discovery
+    skip the APIDirect call entirely.
+    """
     linkedin_url: str
     name: str | None
     title: str | None
@@ -112,6 +126,16 @@ class EnrichedProfile:
     location: str | None
     num_connections: int | None
     raw: dict[str, Any]
+    # ── Provider provenance + optional structured company fields ─────────
+    source: str = "crustdata"
+    company_industry: str | None = None
+    company_subindustry: str | None = None
+    company_size: int | None = None
+    company_size_range: str | None = None
+    company_country: str | None = None
+    company_region: str | None = None
+    company_location: str | None = None
+    company_founded: int | None = None
 
 
 def is_likely_person_slug(linkedin_url: str | None) -> bool:
@@ -214,6 +238,18 @@ def enrich_profiles(linkedin_urls: list[str]) -> dict[str, EnrichedProfile]:
         for i in range(0, len(linkedin_urls), _BATCH_SIZE):
             batch = linkedin_urls[i : i + _BATCH_SIZE]
             _process_batch(client, batch, out, slug_to_input, depth=0)
+
+    # Cost accounting — 3 credits per matched profile (per Crustdata's
+    # billing contract; no charge for no-match). Recorded once per batch
+    # so the per-event count in the slate_runs doc equals "matches" not
+    # "requests" — matches are what cost money.
+    if out:
+        try:
+            from app.services import cost_tracker
+            for _ in range(len(out)):
+                cost_tracker.record_crustdata_match()
+        except Exception as err:  # noqa: BLE001
+            log.debug("crustdata.enrich: cost record skipped: %s", err)
     return out
 
 

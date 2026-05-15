@@ -31,6 +31,11 @@ log = logging.getLogger(__name__)
 
 _BASE_URL = "https://apidirect.io"
 _TIMEOUT = 45.0
+# 3 concurrent per endpoint is APIDirect's hard server-side cap — exceeding
+# it returns HTTP 429 `concurrency_limit_exceeded` (verified live 2026-05-14
+# when we briefly tested with 8 workers and got 12/15 jobs back as 429).
+# Our local semaphore must equal or be below the server's cap to avoid
+# self-inflicted 429s.
 _MAX_CONCURRENCY = 3
 
 _concurrency = threading.Semaphore(_MAX_CONCURRENCY)
@@ -292,6 +297,13 @@ def search_linkedin_posts(query: str, *, page: int = 1) -> list[LinkedInPost]:
             out.append(LinkedInPost.from_api(raw))
         except (KeyError, TypeError) as err:
             log.warning("apidirect post parse skipped: %s (raw=%r)", err, raw)
+    # Cost accounting — one billable call per search page, regardless of
+    # how many posts came back.
+    try:
+        from app.services import cost_tracker
+        cost_tracker.record_apidirect_call("search")
+    except Exception as err:  # noqa: BLE001
+        log.debug("apidirect.search: cost record skipped: %s", err)
     return out
 
 
@@ -365,10 +377,17 @@ def get_linkedin_post_details(url: str) -> LinkedInPostDetails | None:
     if not isinstance(raw, dict):
         return None
     try:
-        return LinkedInPostDetails.from_api(raw)
+        details = LinkedInPostDetails.from_api(raw)
     except (KeyError, TypeError) as err:
         log.warning("apidirect post details parse skipped: %s url=%s", err, url[:120])
         return None
+    # Cost accounting — one billable call per 2xx response (we got data).
+    try:
+        from app.services import cost_tracker
+        cost_tracker.record_apidirect_call("post")
+    except Exception as err:  # noqa: BLE001
+        log.debug("apidirect.post: cost record skipped: %s", err)
+    return details
 
 
 def get_linkedin_company_details(url: str) -> LinkedInCompanyDetails | None:
@@ -427,10 +446,17 @@ def get_linkedin_company_details(url: str) -> LinkedInCompanyDetails | None:
     if not isinstance(raw, dict):
         return None
     try:
-        return LinkedInCompanyDetails.from_api(raw)
+        details = LinkedInCompanyDetails.from_api(raw)
     except (KeyError, TypeError) as err:
         log.warning("apidirect company parse skipped: %s url=%s", err, url[:120])
         return None
+    # Cost accounting — $0.006 per successful company fetch.
+    try:
+        from app.services import cost_tracker
+        cost_tracker.record_apidirect_call("company")
+    except Exception as err:  # noqa: BLE001
+        log.debug("apidirect.company: cost record skipped: %s", err)
+    return details
 
 
 # ---------------------------------------------------------------- mock mode

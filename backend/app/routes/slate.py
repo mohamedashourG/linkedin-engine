@@ -65,6 +65,17 @@ class SlateRunPublic(BaseModel):
     # gates/allocator/drafter finish on already-found candidates.
     skip_remaining_discovery: bool = False
     skip_remaining_discovery_at: datetime | None = None
+    # Per-source "skip current source → next" support. `current_source` is
+    # the source-id the discovery worker is iterating right now (set when
+    # a `_run_*` function enters its loop). `skip_current_source` is the
+    # source-id the operator clicked to skip — when it matches what the
+    # worker is iterating, the worker breaks out and the engine moves on
+    # to the next source in the fixed order
+    # (unipile_title_search → unipile_keyword → apidirect → exa).
+    current_source: str | None = None
+    skip_current_source: str | None = None
+    skip_current_source_consumed_at: datetime | None = None
+    skip_current_source_consumed_for: str | None = None
 
 
 class PipelinePostRef(BaseModel):
@@ -162,6 +173,10 @@ def _slate_to_public(doc: dict[str, Any]) -> SlateRunPublic:
         stage_note=doc.get("stage_note"),
         skip_remaining_discovery=bool(doc.get("skip_remaining_discovery", False)),
         skip_remaining_discovery_at=doc.get("skip_remaining_discovery_at"),
+        current_source=doc.get("current_source"),
+        skip_current_source=doc.get("skip_current_source"),
+        skip_current_source_consumed_at=doc.get("skip_current_source_consumed_at"),
+        skip_current_source_consumed_for=doc.get("skip_current_source_consumed_for"),
     )
 
 
@@ -418,6 +433,93 @@ async def skip_remaining_discovery(
     }
 
 
+# Canonical discovery-source order. Mirrors the order in
+# `discovery.discover_for_operator`. Used to compute "next source" labels
+# for the UI and to validate the skip-target.
+_DISCOVERY_SOURCE_ORDER = (
+    "unipile_title_search",
+    "unipile_keyword",
+    "apidirect",
+    "exa",
+)
+
+
+def _next_discovery_source(current: str | None) -> str | None:
+    """Return the source-id that comes after `current` in the fixed
+    discovery order, or None if `current` is the last source or unknown."""
+    if not current:
+        return _DISCOVERY_SOURCE_ORDER[0] if _DISCOVERY_SOURCE_ORDER else None
+    try:
+        idx = _DISCOVERY_SOURCE_ORDER.index(current)
+    except ValueError:
+        return None
+    if idx + 1 >= len(_DISCOVERY_SOURCE_ORDER):
+        return None
+    return _DISCOVERY_SOURCE_ORDER[idx + 1]
+
+
+@router.post("/runs/{slate_run_id}/skip-current-source")
+async def skip_current_source_endpoint(
+    slate_run_id: str,
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> dict[str, Any]:
+    """Skip the discovery source the worker is currently iterating, then
+    continue with the next source in the fixed order:
+        unipile_title_search → unipile_keyword → apidirect → exa.
+
+    Reads `current_source` from the slate_run, stamps `skip_current_source`
+    with that value. The worker consumes the flag (atomic find_one_and_update
+    in `_should_skip_current_source`) and breaks out of the current source's
+    per-query loop. The flag self-clears on consume, so a follow-up click
+    while a new source is running will skip that one too.
+
+    Returns the source being skipped + the source the worker will move to
+    next. 409 if there's no active discovery source (run sealed / aborted
+    / between sources)."""
+    try:
+        run_oid = ObjectId(slate_run_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(400, "Invalid slate_run_id")
+
+    # Read current_source first so the API can tell the operator what's
+    # being skipped + what comes next. Atomic update happens worker-side
+    # via _should_skip_current_source.
+    sr = await db.slate_runs.find_one(
+        {"_id": run_oid, "operator_id": user["_id"]},
+        projection={"current_source": 1, "status": 1, "current_stage": 1},
+    )
+    if not sr:
+        raise HTTPException(404, "Slate run not found")
+    current = sr.get("current_source")
+    if not current:
+        raise HTTPException(
+            409,
+            "No discovery source is currently active. Either discovery hasn't "
+            "started, has already finished, or the worker is between sources.",
+        )
+
+    next_src = _next_discovery_source(current)
+
+    await db.slate_runs.update_one(
+        {"_id": run_oid},
+        {
+            "$set": {
+                "skip_current_source": current,
+                "skip_current_source_requested_at": utcnow(),
+                "updated_at": utcnow(),
+            }
+        },
+    )
+    return {
+        "slate_run_id": str(run_oid),
+        "skipped_source": current,
+        "next_source": next_src,
+        "status": sr.get("status"),
+        "current_stage": sr.get("current_stage"),
+    }
+
+
 # ── Past-runs viewer ─────────────────────────────────────────────────────
 # Operator-scoped list + per-run detail for browsing historical slate runs.
 
@@ -456,6 +558,24 @@ class DropReasonBucket(BaseModel):
     count: int
 
 
+class CrossRunDedupSkips(BaseModel):
+    """Discovery-stage skip telemetry: how many posts surfaced this run
+    were filtered as "already found in a previous run within the 90-day
+    exhaustion window". Populated by ``discovery.discover_for_operator``
+    on completion. Empty for runs that started before the feature shipped.
+
+    `sample_urls` is capped at `sample_cap` (200) — the first N unique
+    skipped canonical URLs, in surface order. Used by the UI to show the
+    operator which posts got filtered without rendering a list of
+    thousands. `total_count` is the unrelated count of dedup hits during
+    the run (one URL may have been re-surfaced by multiple vendors)."""
+    total_count: int = 0
+    sample_urls: list[str] = Field(default_factory=list)
+    sample_cap: int = 200
+    seeded_urls_count: int = 0
+    captured_at: datetime | None = None
+
+
 class RunDetailResponse(BaseModel):
     slate_run: SlateRunPublic
     runtime_seconds: float | None = None
@@ -471,6 +591,8 @@ class RunDetailResponse(BaseModel):
     # The drafted / slated / shipped candidates for this run (UI table).
     candidates: list[CandidatePublic]
     cofounders: list[dict[str, Any]]
+    # Cross-run dedup skip telemetry (null on runs that predate the feature).
+    cross_run_dedup_skips: CrossRunDedupSkips | None = None
 
 
 def _run_list_item(doc: dict[str, Any]) -> RunListItem:
@@ -617,6 +739,11 @@ async def run_detail(
         except (TypeError, AttributeError):
             runtime = None
 
+    skips_raw = slate.get("cross_run_dedup_skips")
+    cross_run_dedup_skips = (
+        CrossRunDedupSkips(**skips_raw) if isinstance(skips_raw, dict) else None
+    )
+
     return RunDetailResponse(
         slate_run=_slate_to_public(slate),
         runtime_seconds=runtime,
@@ -629,6 +756,67 @@ async def run_detail(
         top_drop_reasons=top_drop_reasons,
         candidates=candidates,
         cofounders=cofounders,
+        cross_run_dedup_skips=cross_run_dedup_skips,
+    )
+
+
+class RunCostsResponse(BaseModel):
+    """Live cost-breakdown payload for a slate run.
+
+    Shape mirrors the ``slate_runs.cost_breakdown`` Mongo subdoc 1:1 so the
+    UI can render whatever structure it cares about without the route
+    making display decisions. ``totals.dollars`` is the running grand total
+    (provider fees + LLM token cost). ``llm.totals.prompt_tokens`` /
+    ``completion_tokens`` show aggregate LLM usage.
+    """
+    slate_run_id: str
+    updated_at: datetime | None = None
+    totals: dict[str, Any] = Field(default_factory=dict)
+    providers: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.get("/runs/{slate_run_id}/costs", response_model=RunCostsResponse)
+async def run_costs(
+    slate_run_id: Annotated[str, Path()],
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> RunCostsResponse:
+    """Live cost breakdown for one slate run.
+
+    Reads ``slate_runs.cost_breakdown`` — every paid provider call
+    (Wiza, Crustdata, APIDirect) and every LLM round-trip (OpenAI,
+    Anthropic) records a ``$inc`` event into this subdoc as the run
+    progresses, so polling this endpoint mid-flight returns a running
+    tally without waiting for the slate to close.
+
+    Response shape:
+      totals.calls         — running count across every paid surface
+      totals.dollars       — running grand total in USD
+      providers.<name>     — per-provider breakdown:
+        totals.{count, dollars}
+        line_items.<key>.{count, dollars, ...}
+        last_at            — wall-clock of the most recent event
+      providers.llm.line_items.<model>.{prompt_tokens,completion_tokens,...}
+    """
+    try:
+        slate_oid = ObjectId(slate_run_id)
+    except Exception:
+        raise HTTPException(400, "Invalid slate_run_id")
+    slate = await db.slate_runs.find_one(
+        {"_id": slate_oid, "operator_id": user["_id"]},
+        {"cost_breakdown": 1, "_id": 1},
+    )
+    if not slate:
+        raise HTTPException(404, "Slate run not found")
+    breakdown = slate.get("cost_breakdown") or {}
+    return RunCostsResponse(
+        slate_run_id=str(slate_oid),
+        updated_at=breakdown.get("updated_at"),
+        totals=breakdown.get("totals") or {},
+        providers={
+            k: v for k, v in breakdown.items()
+            if k not in ("totals", "updated_at")
+        },
     )
 
 

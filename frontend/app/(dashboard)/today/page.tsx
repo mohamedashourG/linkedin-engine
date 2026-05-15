@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Play, RefreshCw, Sparkles } from "lucide-react";
+import { FastForward, Play, RefreshCw, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -11,7 +11,18 @@ import { EmptyState } from "@/components/shared/empty-state";
 import { SlateCard } from "@/components/slate/slate-card";
 import { PipelineBreakdownView } from "@/components/slate/pipeline-breakdown";
 import { RunProgress } from "@/components/slate/run-progress";
+import { LiveCostsPanel } from "@/components/slate/live-costs-panel";
+import { PoolSelectionPanel } from "@/components/slate/pool-selection-panel";
 import { slateApi } from "@/lib/slate";
+
+// Human-readable labels for the live discovery source. Mirrors the
+// constants used in backend/app/engine/stages/discovery.py.
+const SOURCE_LABELS: Record<string, string> = {
+  unipile_title_search: "RULE 24 (Unipile people search)",
+  unipile_keyword: "Unipile keyword post search",
+  apidirect: "APIDirect keyword post search",
+  exa: "Exa neural keyword search",
+};
 
 export default function TodayPage() {
   const qc = useQueryClient();
@@ -28,6 +39,50 @@ export default function TodayPage() {
       setTimeout(() => qc.invalidateQueries({ queryKey: ["slate-today"] }), 1500);
     },
     onError: (err: Error) => toast.error(err.message),
+  });
+
+  // Skip-buttons need a slate_run_id, only relevant while status=building.
+  const slateRunId = data?.slate_run?.id;
+  const isBuilding = data?.slate_run?.status === "building";
+
+  // Live cost poll — separate query, scoped to the current slate_run.
+  // Polls every 3s while the run is building (matches the worker's
+  // wave cadence — each refresh catches a fresh batch of LLM /
+  // provider events) and slows to 10s once the run lands so a user
+  // who opens Today after the slate seals still sees fresh data
+  // (late retries can still increment counters post-seal).
+  const costsQuery = useQuery({
+    queryKey: ["slate-run-costs", slateRunId],
+    queryFn: () => slateApi.runCosts(slateRunId!),
+    enabled: !!slateRunId,
+    refetchInterval: isBuilding ? 3000 : 10000,
+  });
+
+  const skipCurrentSourceMut = useMutation({
+    mutationFn: () => slateApi.skipCurrentSource(slateRunId!),
+    onSuccess: (res) => {
+      const nextLabel = res.next_source
+        ? SOURCE_LABELS[res.next_source] ?? res.next_source
+        : "discovery end";
+      const skippedLabel =
+        SOURCE_LABELS[res.skipped_source] ?? res.skipped_source;
+      toast.success(`Skipping ${skippedLabel} → continuing with ${nextLabel}.`);
+      qc.invalidateQueries({ queryKey: ["slate-today"] });
+    },
+    onError: (err: Error) =>
+      toast.error(err?.message || "Failed to skip current source"),
+  });
+
+  const skipDiscoveryMut = useMutation({
+    mutationFn: () => slateApi.skipDiscovery(slateRunId!),
+    onSuccess: () => {
+      toast.success(
+        "Skip-discovery flag set. Worker will exit remaining sources within a few seconds; gates and drafter keep running.",
+      );
+      qc.invalidateQueries({ queryKey: ["slate-today"] });
+    },
+    onError: (err: Error) =>
+      toast.error(err?.message || "Failed to skip discovery"),
   });
 
   return (
@@ -79,8 +134,89 @@ export default function TodayPage() {
         </div>
       </div>
 
+      {/* Skip controls — visible only while a run is in progress. The
+          worker reads the `skip_*` flags every per-query iteration, so a
+          click takes effect within ~2 seconds. */}
+      {isBuilding && slateRunId && (
+        <div className="rounded-lg border bg-card p-4">
+          <div className="text-xs uppercase tracking-wide text-muted-foreground">
+            Discovery controls
+          </div>
+          {data!.slate_run!.current_source && (
+            <div className="mt-1 text-sm">
+              In source:{" "}
+              <span className="font-mono">
+                {SOURCE_LABELS[data!.slate_run!.current_source!] ??
+                  data!.slate_run!.current_source}
+              </span>
+            </div>
+          )}
+          {!data!.slate_run!.current_source && (
+            <div className="mt-1 text-sm text-muted-foreground">
+              Worker is between sources or hasn&apos;t started discovery yet — buttons
+              activate once a source is in flight.
+            </div>
+          )}
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => skipCurrentSourceMut.mutate()}
+              disabled={
+                skipCurrentSourceMut.isPending ||
+                !data!.slate_run!.current_source ||
+                data!.slate_run!.skip_current_source ===
+                  data!.slate_run!.current_source ||
+                data!.slate_run!.skip_remaining_discovery === true
+              }
+              title="Exit the source the worker is iterating, then continue with the next source in order: unipile_title_search → unipile_keyword → apidirect → exa"
+            >
+              <FastForward className="mr-2 h-3.5 w-3.5" />
+              {data!.slate_run!.skip_current_source &&
+              data!.slate_run!.skip_current_source ===
+                data!.slate_run!.current_source
+                ? `Skipping ${data!.slate_run!.current_source}…`
+                : "Skip current source → next"}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => skipDiscoveryMut.mutate()}
+              disabled={
+                skipDiscoveryMut.isPending ||
+                data!.slate_run!.skip_remaining_discovery === true
+              }
+              title="Exit ALL remaining discovery sources and let gates → allocator → drafter finish on what's already been found"
+            >
+              <FastForward className="mr-2 h-3.5 w-3.5" />
+              {data!.slate_run!.skip_remaining_discovery
+                ? "Discovery skip requested — worker exiting"
+                : "Skip all remaining discovery → gates"}
+            </Button>
+          </div>
+        </div>
+      )}
+
       {/* Pipeline progress + stepper (stays visible after seal) */}
       {data?.slate_run && <RunProgress slate={data.slate_run} />}
+
+      {/* Pool selection — operator picks which Unipile accounts are
+          eligible for FUTURE discovery runs. Snapshotted onto each new
+          slate_run at creation; enforced at the pool's atomic-claim
+          level so no leakage to non-selected accounts is possible. */}
+      <PoolSelectionPanel />
+
+      {/* Live cost breakdown — appears as soon as we have a slate_run id,
+          even before any paid call has fired (shows zeros + an empty
+          state). Lets the operator monitor spend climb mid-run. */}
+      {slateRunId && (
+        <LiveCostsPanel
+          costs={costsQuery.data}
+          isLoading={costsQuery.isLoading}
+          isBuilding={isBuilding}
+          variant="today"
+        />
+      )}
 
       {/* Per-step post lists — same data after the run completes */}
       {!isLoading && data?.pipeline && data.slate_run && (
