@@ -1,4 +1,5 @@
 import { api } from "./api";
+import type { TrackerCandidate } from "./slate";
 
 export type LeadCard = {
   id: string;
@@ -26,6 +27,7 @@ export type TimelineEntry = {
 export type LeadDetail = {
   lead: LeadCard;
   timeline: TimelineEntry[];
+  comments_engagement: TrackerCandidate[];
 };
 
 export type PipelineResponse = {
@@ -37,4 +39,6 @@ export const pipelineApi = {
   lead: (id: string) => api.get<LeadDetail>(`/api/pipeline/leads/${id}`),
   setStage: (id: string, stage: string) =>
     api.put<{ ok: boolean }>(`/api/pipeline/leads/${id}/stage`, { stage }),
+  trackLeadComments: (id: string) =>
+    api.post<LeadDetail>(`/api/pipeline/leads/${id}/track-comments`),
 };
