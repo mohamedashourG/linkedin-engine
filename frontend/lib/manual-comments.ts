@@ -281,6 +281,38 @@ export const manualCommentsApi = {
       `/api/manual-comments/jobs/${encodeURIComponent(jobId)}/replies/${encodeURIComponent(replyCommentId)}/invite`,
       body,
     ),
+
+  /**
+   * Fetch the current DM state for one (job, reply) pair.
+   * `dm === null` means no DM has ever been sent to this target — the
+   * UI should render the "Send DM" button. Otherwise the response
+   * shape carries the DmPublic so the UI can show a status badge.
+   */
+  getDm: (jobId: string, replyCommentId: string) =>
+    api.get<GetDmResponse>(
+      `/api/manual-comments/jobs/${encodeURIComponent(jobId)}/replies/${encodeURIComponent(replyCommentId)}/dm`,
+    ),
+
+  /**
+   * Send (or dry-run validate) a first-touch DM to the author of a
+   * specific reply. Used after the recipient accepts the connection
+   * request — operator types the DM body manually, no LLM-suggested
+   * text path (matches the operator's product decision for invites).
+   *
+   * Safety semantics mirror sendInvite: dry_run defaults TRUE on the
+   * server, account-match is enforced (DM goes from the same Unipile
+   * account that posted the comment + sent the invite), and a per-
+   * target unique index in Mongo blocks duplicate DMs.
+   */
+  sendDm: (
+    jobId: string,
+    replyCommentId: string,
+    body: { message_text: string; unipile_account_id: string; dry_run: boolean },
+  ) =>
+    api.post<SendDmResponse>(
+      `/api/manual-comments/jobs/${encodeURIComponent(jobId)}/replies/${encodeURIComponent(replyCommentId)}/dm`,
+      body,
+    ),
 };
 
 // ─── Invitation types ───────────────────────────────────────────────────
@@ -339,3 +371,61 @@ export type SendInvitationResponse = {
 
 /** LinkedIn-enforced cap for invitation notes. */
 export const LINKEDIN_INVITE_NOTE_MAX_CHARS = 200;
+
+// ─── DM types ─────────────────────────────────────────────────────────
+
+/** Status vocabulary for a LinkedIn direct message (chat first-touch).
+ * Mirrors backend `DmStatusValue`. Narrower than the invite vocabulary
+ * because we don't poll for read/accept on DMs (operator watches the
+ * chat thread directly). */
+export type DmStatus =
+  | "dry_run"
+  | "queued"
+  | "sent"
+  | "failed";
+
+export type DmPublic = {
+  id: string;
+  operator_id: string;
+  source_job_id: string;
+  source_reply_comment_id: string;
+  target_provider_id: string;
+  target_name: string;
+  target_public_identifier: string | null;
+  /** Operator-typed DM body. ≤1500 chars. */
+  message_text: string;
+  /** The pool account that did the send. */
+  sent_via_account_id: string;
+  status: DmStatus;
+  /** Unipile's chat id — used for any follow-up sends on the same thread. */
+  chat_id: string | null;
+  /** Unipile's first-message id from the chat-creation response. */
+  message_id: string | null;
+  sent_at: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type GetDmResponse = {
+  job_id: string;
+  parent_reply_comment_id: string;
+  dm: DmPublic | null;
+};
+
+export type SendDmResponse = {
+  job_id: string;
+  parent_reply_comment_id: string;
+  target_provider_id: string;
+  status: DmStatus;
+  dry_run: boolean;
+  chat_id: string | null;
+  message_id: string | null;
+  sent_at: string | null;
+  error: string | null;
+};
+
+/** Local cap mirroring backend LINKEDIN_DM_TEXT_MAX_CHARS. UI uses
+ * this for the textarea counter; backend enforces it again on the
+ * Pydantic SendDmRequest. */
+export const LINKEDIN_DM_TEXT_MAX_CHARS = 1500;

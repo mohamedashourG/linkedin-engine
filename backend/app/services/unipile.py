@@ -101,6 +101,24 @@ _UNIPILE_INVITE_JITTER_MAX_S = 300.0
 # so we surface a clean error instead of a 4xx surprise.
 LINKEDIN_INVITE_NOTE_MAX_CHARS = 200
 
+# POST `/chats` — first-touch DM to a (typically just-accepted)
+# 1st-degree connection. DMs are LOWER flag-risk than invites (recipient
+# expects messages from connections) but burst-sending still trips
+# LinkedIn's anti-automation classifier. 3-minute baseline + up to 3-min
+# jitter (so 3-6 min typical between DMs from the same account) with a
+# 10% chance of a 9-24 min long-pause draw via `_human_delay_seconds`.
+# Combined with the per-account daily cap of 25 DMs and the aggregate
+# pool-gate, this stays inside the published "safe daily" envelope.
+_UNIPILE_DM_MIN_INTERVAL_S = 180.0
+_UNIPILE_DM_JITTER_MAX_S = 180.0
+
+# LinkedIn messaging has no documented hard char cap on direct messages
+# but the practical operational ceiling is ~8000 chars (anything longer
+# gets truncated or rejected by some clients). We cap at 1500 to keep
+# DMs in normal cold-outreach range — anything longer is almost certainly
+# a copy/paste error.
+LINKEDIN_DM_TEXT_MAX_CHARS = 1500
+
 
 # ── Per-account throttle state ──────────────────────────────────────────
 #
@@ -135,6 +153,10 @@ _post_comment_throttle_state_lock = threading.Lock()
 _invite_throttle_last_ts: dict[str, float] = {}
 _invite_throttle_locks: dict[str, threading.Lock] = {}
 _invite_throttle_state_lock = threading.Lock()
+
+_dm_throttle_last_ts: dict[str, float] = {}
+_dm_throttle_locks: dict[str, threading.Lock] = {}
+_dm_throttle_state_lock = threading.Lock()
 
 
 def _account_key(account_id: str | None) -> str:
@@ -295,6 +317,41 @@ def _throttle_invite_call(account_id: str | None = None) -> None:
             )
             time.sleep(wait)
         _invite_throttle_last_ts[key] = time.monotonic()
+
+
+def _throttle_dm_call(account_id: str | None = None) -> None:
+    """Space LinkedIn DM (chat-message) calls — PER ACCOUNT.
+
+    3min baseline + 0-3min jitter (3-6 min typical) with 10% chance of a
+    9-24 min long-pause via ``_human_delay_seconds``. DMs are lower
+    flag-risk than invites since the recipient expects messages from
+    1st-degree connections, but burst-sending still trips LinkedIn's
+    anti-automation classifier so the gap is tighter than invite but
+    looser than post_comment.
+
+    Same lock pattern as the other per-account throttles. The aggregate
+    pool-gate (``unipile_pool``) layers on top to prevent cross-account
+    bursts when multiple accounts run concurrent DM batches.
+    """
+    key = _account_key(account_id)
+    lock = _get_throttle_lock(
+        _dm_throttle_locks, _dm_throttle_state_lock, key,
+    )
+    with lock:
+        last_ts = _dm_throttle_last_ts.get(key, 0.0)
+        elapsed = time.monotonic() - last_ts
+        target_gap = _human_delay_seconds(
+            _UNIPILE_DM_MIN_INTERVAL_S,
+            _UNIPILE_DM_JITTER_MAX_S,
+        )
+        wait = target_gap - elapsed
+        if wait > 0:
+            log.info(
+                "dm throttle (account=%s): sleeping %.1fs",
+                key[:18], wait,
+            )
+            time.sleep(wait)
+        _dm_throttle_last_ts[key] = time.monotonic()
 
 
 def _throttle_default_call(account_id: str | None = None) -> None:
@@ -1984,6 +2041,165 @@ def get_invitation_status(
         )
     payload = _check_resp(resp, "get_invitation_status")
     return payload if isinstance(payload, dict) else {}
+
+
+# ── First-touch DM (chat-start with initial message) ──────────────────────
+#
+# After an invite is accepted, the operator typically wants to send a
+# first-touch DM that references the comment-thread context. Unipile's
+# `POST /api/v1/chats` creates a new chat between the sending account and
+# a list of attendees (passed as `attendees_ids`) and posts the supplied
+# `text` as the first message in that chat. If a chat already exists with
+# this attendee on this account, Unipile returns the existing chat_id
+# rather than creating a duplicate — so this endpoint is idempotent
+# enough for first-touch (we still dedup at the route layer to avoid
+# burning a Unipile call).
+#
+# Throttle stack matches the invite path:
+#   • per-account `_throttle_dm_call` (3-6 min between same-account DMs,
+#     10% long-pause draw)
+#   • universal `_throttle_default_call` (3-6s gap via _request_with_429_retry)
+#   • pool aggregate gate (only when called via _pool_acquire("dm", …))
+#
+@dataclass(frozen=True)
+class UnipileChatMessageResult:
+    """Result of POST /chats. Unipile returns a chat_id (used for any
+    follow-up messages in the same thread) and a message_id (the first
+    message we just posted as part of chat creation). Both are kept on
+    the linkedin_dms record for forensic audit + downstream reply polling."""
+    chat_id: str | None
+    message_id: str | None
+    sent_at: datetime | None
+    raw: dict[str, Any]
+
+
+def send_dm(
+    *,
+    account_id: str,
+    provider_id: str,
+    text: str,
+) -> UnipileChatMessageResult:
+    """Send a first-touch DM to a LinkedIn 1st-degree connection.
+
+    Unipile endpoint: ``POST /api/v1/chats`` with body
+    ``{attendees_ids: [provider_id], text}`` and the sending account
+    passed in the ``account_id`` query param. Unipile creates the chat
+    if it doesn't exist OR posts to the existing chat with that attendee.
+
+    Args:
+        account_id: pool account that owns the LinkedIn session. The
+            caller is responsible for ensuring this is the SAME account
+            the recipient connected with (typically the one that posted
+            the original comment and sent the invite).
+        provider_id: LinkedIn URN of the DM recipient (ACoAA…).
+        text: message body, ≤``LINKEDIN_DM_TEXT_MAX_CHARS`` chars (1500).
+
+    Returns:
+        UnipileChatMessageResult with chat_id + message_id from Unipile.
+
+    Raises:
+        ValueError: text too long / empty, or provider_id malformed.
+        UnipileError: Unipile responded 4xx/5xx (most commonly 403 if the
+            account-target pair is not yet 1st-degree connected, or 429 if
+            the account has hit LinkedIn's daily messaging cap).
+        UnipileNotConfigured: ``UNIPILE_MOCK`` is set or credentials missing.
+
+    Safety: refuses to fire if ``UNIPILE_MOCK=true`` — mirrors the same
+    safety contract as ``send_invitation``. The route layer adds dry-run
+    default + per-target dedup + atomic claim on top.
+    """
+    if settings.unipile_mock:
+        raise UnipileNotConfigured(
+            "send_dm: UNIPILE_MOCK=true — refusing to issue a real DM. "
+            "Set UNIPILE_MOCK=false to enable."
+        )
+    if not account_id:
+        raise ValueError("send_dm: account_id is required")
+    if not provider_id:
+        raise ValueError("send_dm: provider_id is required")
+    pid = provider_id.strip()
+    if not (pid.startswith("AC") and len(pid) >= 30):
+        raise ValueError(
+            f"send_dm: provider_id must be the ACoAA… member URN form. "
+            f"Got {pid[:24]!r}"
+        )
+    body_text = (text or "").strip()
+    if not body_text:
+        raise ValueError("send_dm: text is required (non-empty)")
+    if len(body_text) > LINKEDIN_DM_TEXT_MAX_CHARS:
+        raise ValueError(
+            f"send_dm: text length {len(body_text)} exceeds "
+            f"{LINKEDIN_DM_TEXT_MAX_CHARS}-char cap. Truncate before calling."
+        )
+
+    body: dict[str, Any] = {
+        "attendees_ids": [pid],
+        "text": body_text,
+    }
+
+    # Per-account DM cadence: 3-6 min typical, occasional 9-24 min long
+    # pause. Stacks under the aggregate pool gate.
+    _throttle_dm_call(account_id)
+
+    # Forensic audit — log the wire payload before issuing. DMs are
+    # visible to the recipient immediately so any "this DM went to the
+    # wrong person" or "the text shows up garbled" report has hard
+    # evidence within ~1 minute of the click. Text truncated to 80 chars
+    # in the log for readability; full text is in Mongo at
+    # `linkedin_dms.message_text`.
+    log.warning(
+        "send_dm WIRE → path=/chats  account=%s  target=%s  text_len=%d  text_starts=%r",
+        account_id[:18],
+        pid[:24],
+        len(body_text),
+        body_text[:80],
+    )
+
+    with _client() as client:
+        resp = _request_with_429_retry(
+            client,
+            "POST",
+            "/chats",
+            account_id=account_id,
+            params={"account_id": account_id},
+            json=body,
+        )
+    payload = _check_resp(resp, "send_dm")
+    log.warning(
+        "send_dm RESPONSE ← status=%d  body=%s",
+        resp.status_code, (resp.text or "")[:300],
+    )
+
+    chat_id = str(
+        payload.get("chat_id")
+        or payload.get("id")
+        or payload.get("urn")
+        or ""
+    ) or None
+    message_id = str(
+        payload.get("message_id")
+        or payload.get("message", {}).get("id") if isinstance(payload.get("message"), dict) else ""
+        or ""
+    ) or None
+    sent_at = _parse_iso(
+        payload.get("sent_at") or payload.get("date") or payload.get("created_at")
+    )
+
+    # Cost tracker: same convention as invite — count the call so the
+    # cost dashboard's total reflects all Unipile actions even though
+    # DMs are seat-priced (no per-call fee).
+    try:
+        from app.services import cost_tracker as _ct
+        _ct.record_unipile_call("dm")
+    except Exception:  # noqa: BLE001
+        pass
+
+    return UnipileChatMessageResult(
+        chat_id=chat_id,
+        message_id=message_id,
+        sent_at=sent_at,
+        raw=payload,
+    )
 
 
 def _normalize_post_social_id(post_url_or_id: str) -> str:
