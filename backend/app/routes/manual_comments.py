@@ -2866,3 +2866,159 @@ async def send_dm_to_replier(
         sent_at=sent_at,
         error=None,
     )
+
+
+# ─── Reconcile invitation statuses against Unipile relations ─────────────
+#
+# Background: our `/invite` route can fail with Unipile 422
+# `already_invited_recently` when the operator (or another tool) already
+# sent that person an invite from the same account through a different
+# channel (LinkedIn web UI, a prior batch via direct Unipile call, etc).
+# Our DB then stores `status=failed` even though the recipient may have
+# already ACCEPTED that out-of-band invite and become a 1st-degree
+# connection.
+#
+# This reconcile route walks every `linkedin_invitations` row with
+# status=failed AND error containing "already_invited" and calls
+# Unipile's relations endpoint to find out the real connection state.
+# If Unipile reports CONNECTED / ACCEPTED, we flip our row's status
+# accordingly so the UI + downstream reports reflect reality.
+
+
+class ReconcileInvitationsResponse(BaseModel):
+    """Result of the reconcile sweep. Frontend admin panel can use this
+    to surface how many rows got patched and what they flipped to."""
+    scanned: int
+    accepted: int   # flipped failed → accepted
+    pending: int    # flipped failed → sent (invite is still pending; will accept later)
+    unchanged: int  # Unipile reports NOT_CONNECTED — original failed status was correct
+    errored: int    # the Unipile lookup itself failed
+
+
+@router.post(
+    "/admin/reconcile-invitations",
+    response_model=ReconcileInvitationsResponse,
+)
+async def reconcile_invitations(
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> ReconcileInvitationsResponse:
+    """Walk failed-with-`already_invited` invitation rows and reconcile
+    them against Unipile's current relationship state.
+
+    Operator-scoped: only touches rows for the current user's operator
+    id. Idempotent: re-running it costs nothing if everything's already
+    in sync.
+
+    Calls `get_invitation_status` (read-only Unipile endpoint, bypasses
+    write throttles) which returns the current `connection_status`
+    field. Maps to our internal vocabulary:
+      CONNECTED / FIRST_DEGREE / ACCEPTED → status=accepted
+      INVITATION_SENT / PENDING            → status=sent (still pending)
+      anything else                        → leave as failed
+    """
+    from app.services.unipile import (
+        get_invitation_status,
+        UnipileError as _UE,
+        UnipileNotConfigured as _UNC,
+    )
+
+    scanned = accepted = pending = unchanged = errored = 0
+    cursor = db.linkedin_invitations.find({
+        "operator_id": user["_id"],
+        "status": InvitationStatusValue.FAILED,
+        "$or": [
+            {"error": {"$regex": "already_invited", "$options": "i"}},
+            {"error": {"$regex": "already_connected", "$options": "i"}},
+        ],
+    })
+    async for inv in cursor:
+        scanned += 1
+        try:
+            relation = get_invitation_status(
+                account_id=inv["sent_via_account_id"],
+                provider_id=inv["target_provider_id"],
+            )
+        except (_UE, _UNC) as err:
+            errored += 1
+            log.warning(
+                "reconcile_invitations: Unipile lookup failed for "
+                "target=%s account=%s — %s",
+                inv.get("target_provider_id", "")[:24],
+                inv.get("sent_via_account_id", "")[:18],
+                str(err)[:120],
+            )
+            continue
+        except Exception as err:  # noqa: BLE001
+            errored += 1
+            log.exception(
+                "reconcile_invitations: unexpected lookup error for %s",
+                inv.get("_id"),
+            )
+            continue
+
+        raw_status = str(
+            relation.get("connection_status")
+            or relation.get("status")
+            or ""
+        ).upper()
+
+        now = utcnow()
+        if raw_status in ("CONNECTED", "ACCEPTED", "FIRST_DEGREE", "FIRST"):
+            await db.linkedin_invitations.update_one(
+                {"_id": inv["_id"]},
+                {"$set": {
+                    "status": InvitationStatusValue.ACCEPTED,
+                    "accepted_at": (
+                        _parse_date_or_none(relation.get("accepted_at"))
+                        or _parse_date_or_none(relation.get("connected_at"))
+                        or now
+                    ),
+                    "status_polled_at": now,
+                    "error": None,
+                    "updated_at": now,
+                }},
+            )
+            accepted += 1
+        elif raw_status in ("INVITATION_SENT", "PENDING", "PENDING_INVITATION"):
+            await db.linkedin_invitations.update_one(
+                {"_id": inv["_id"]},
+                {"$set": {
+                    "status": InvitationStatusValue.SENT,
+                    "status_polled_at": now,
+                    "error": None,
+                    "updated_at": now,
+                }},
+            )
+            pending += 1
+        else:
+            unchanged += 1
+
+    log.info(
+        "reconcile_invitations: scanned=%d accepted=%d pending=%d "
+        "unchanged=%d errored=%d",
+        scanned, accepted, pending, unchanged, errored,
+    )
+    return ReconcileInvitationsResponse(
+        scanned=scanned,
+        accepted=accepted,
+        pending=pending,
+        unchanged=unchanged,
+        errored=errored,
+    )
+
+
+def _parse_date_or_none(v: Any) -> datetime | None:
+    """Lenient ISO-8601 parser for Unipile date strings. Used by the
+    reconcile route to extract `accepted_at` / `connected_at` from the
+    relations payload."""
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.replace(tzinfo=None) if v.tzinfo else v
+    if not isinstance(v, str):
+        return None
+    try:
+        return datetime.fromisoformat(v.replace("Z", "+00:00")).replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return None
