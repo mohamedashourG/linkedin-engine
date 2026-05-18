@@ -143,7 +143,7 @@ def clear_pool_account_filter() -> None:
 # rather than Unipile's raw `sources` field, so we can change the
 # underlying account-source check without breaking callers.
 Capability = Literal[
-    "search", "profile_view", "post_fetch", "post_comment", "invite",
+    "search", "profile_view", "post_fetch", "post_comment", "invite", "dm",
 ]
 
 # Default daily caps per account. Conservative — tuned for 5-6 account pool
@@ -164,6 +164,14 @@ DEFAULT_DAILY_CAPS: dict[str, int] = {
     # producing meaningful weekly invite volume. Bump cautiously via
     # operator settings rather than this default.
     "invite": 10,
+    # dm (first-touch direct messages to 1st-degree connections):
+    # LinkedIn's documented safe daily ceiling is ~25 DMs to 1st-degree
+    # connections (above which the anti-automation classifier engages).
+    # Combined with the per-account 3-6 min throttle in unipile.py
+    # `_throttle_dm_call`, this keeps cadence inside published safe
+    # envelopes. Bump cautiously per account if a sender is paying for
+    # LinkedIn Sales Navigator (which lifts caps).
+    "dm": 25,
 }
 
 # Cooldown window after a LinkedIn-provider 429. Randomized to avoid the
@@ -301,6 +309,20 @@ class UnipileAccountPool:
             },
             {"$addToSet": {"capabilities": "invite"}},
         )
+        # The "dm" capability rides the same MESSAGING-tier authentication
+        # as post_comment + invite — any LINKEDIN account with an active
+        # session can hit `POST /chats`. Backfill the same way so existing
+        # accounts that pre-date this capability get it without manual
+        # intervention.
+        self.coll.update_many(
+            {
+                "$and": [
+                    {"capabilities": "post_comment"},
+                    {"capabilities": {"$ne": "dm"}},
+                ],
+            },
+            {"$addToSet": {"capabilities": "dm"}},
+        )
 
     # ── Bootstrap / sync ────────────────────────────────────────────────
 
@@ -363,6 +385,8 @@ class UnipileAccountPool:
                     # the same /api/v1/users/invite endpoint for any
                     # LINKEDIN-typed account with an active session.
                     caps.append("invite")
+                    # DMs (chat-message sends) ride the same session.
+                    caps.append("dm")
             # If nothing was tagged SEARCH but status=OK, allow search
             # optimistically — Unipile's labeling is inconsistent.
             if "search" not in caps and any(s == "OK" for s in source_statuses):
@@ -400,6 +424,7 @@ class UnipileAccountPool:
                     "profile_view": 0,
                     "post_fetch": 0,
                     "invite": 0,
+                    "dm": 0,
                     "reset_at": _next_reset_at(now),
                 },
                 "last_used_at": now,
@@ -694,6 +719,7 @@ class UnipileAccountPool:
                     "daily_usage.profile_view": 0,
                     "daily_usage.post_fetch": 0,
                     "daily_usage.invite": 0,
+                    "daily_usage.dm": 0,
                     "daily_usage.reset_at": next_reset,
                     "updated_at": now,
                 },

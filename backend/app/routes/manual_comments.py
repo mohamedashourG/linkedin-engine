@@ -385,6 +385,93 @@ class GetInvitationResponse(BaseModel):
     invitation: InvitationPublic | None = None
 
 
+# ─── DM schemas ──────────────────────────────────────────────────────────
+
+
+class DmStatusValue:
+    """Status vocabulary for `linkedin_dms.status`."""
+    DRY_RUN = "dry_run"          # operator clicked send with dry_run=true; no Unipile call
+    QUEUED = "queued"            # claim issued, Unipile call about to fire
+    SENT = "sent"                # Unipile returned 200/201; DM is live on LinkedIn
+    FAILED = "failed"            # Unipile returned 4xx/5xx; see `error` for detail
+
+
+# LinkedIn DM cap — mirrors the LINKEDIN_DM_TEXT_MAX_CHARS in
+# services/unipile.py. Re-declared here so the Pydantic model can use it
+# without an inter-module import cycle.
+LINKEDIN_DM_TEXT_MAX_CHARS = 1500
+
+
+class DmPublic(BaseModel):
+    """API-shaped view of a `linkedin_dms` document. Frontend reads this
+    to render the per-reply DM-status badge ("DM sent ✓", "DM failed",
+    etc.) and to disable the Send-DM button when a DM has already been
+    sent to that target."""
+    id: str
+    operator_id: str
+    source_job_id: str
+    source_reply_comment_id: str
+    target_provider_id: str
+    target_name: str
+    target_public_identifier: str | None
+    message_text: str
+    sent_via_account_id: str
+    status: str  # see DmStatusValue
+    chat_id: str | None        # Unipile's chat id (used for follow-up sends)
+    message_id: str | None     # Unipile's first-message id
+    sent_at: datetime | None
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class SendDmRequest(BaseModel):
+    """Body for `POST /jobs/{job_id}/replies/{reply_comment_id}/dm`.
+
+    Same dry-run-default safety contract as the invite + comment flows:
+    forgetting `dry_run` means we validate inputs + persist intent WITHOUT
+    hitting Unipile. Set `dry_run=False` to actually issue the DM.
+
+    `unipile_account_id` MUST equal the job's `unipile_account_id` —
+    same account-match guard as the invite route. Sending a DM from a
+    different account than the one the recipient connected with breaks
+    the conversation thread + looks like a stranger reaching out."""
+    message_text: str = Field(
+        ...,
+        min_length=1,
+        max_length=LINKEDIN_DM_TEXT_MAX_CHARS,
+        description=(
+            f"Manually-typed DM body. ≤{LINKEDIN_DM_TEXT_MAX_CHARS} chars. "
+            "Empty body is NOT valid (LinkedIn requires text to send a chat)."
+        ),
+    )
+    unipile_account_id: str = Field(..., min_length=1)
+    dry_run: bool = Field(default=True)
+
+
+class SendDmResponse(BaseModel):
+    job_id: str
+    parent_reply_comment_id: str
+    target_provider_id: str
+    status: str  # DmStatusValue value
+    dry_run: bool
+    chat_id: str | None = None
+    message_id: str | None = None
+    sent_at: datetime | None = None
+    error: str | None = None
+
+
+class GetDmResponse(BaseModel):
+    """Returned by `GET /jobs/{job_id}/replies/{reply_comment_id}/dm`.
+
+    `dm` is None when no DM has been sent to this target for this
+    (job, reply) pair yet. UI uses presence + status to decide whether
+    to render the Send-DM button or a status badge."""
+    job_id: str
+    parent_reply_comment_id: str
+    dm: DmPublic | None = None
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────
 
 
@@ -2335,6 +2422,447 @@ async def send_invite_to_replier(
         status=InvitationStatusValue.SENT,
         dry_run=False,
         invitation_id=result.invitation_id,
+        sent_at=sent_at,
+        error=None,
+    )
+
+
+# ─── DM routes ────────────────────────────────────────────────────────────
+#
+# First-touch DM to a (typically just-accepted) 1st-degree connection.
+# Mirrors the invite flow exactly so the operator gets the same safety
+# stack:
+#   • dry_run defaults True (server-side default; route-level guarantee)
+#   • account-match: invite + DM must come from the same Unipile account
+#     that posted the original comment the recipient replied to
+#   • per-target dedup: one OPEN DM per (operator, target) at a time
+#   • atomic claim: prevents double-fire on rapid clicks / retries
+#   • text length validated by Pydantic against
+#     LINKEDIN_DM_TEXT_MAX_CHARS
+#   • Per-account 3-6 min throttle in services/unipile.send_dm
+#   • Pool aggregate gate when called via _pool_acquire("dm", ...)
+#
+
+
+def _dm_to_public(d: dict[str, Any]) -> DmPublic:
+    """Convert a `linkedin_dms` Mongo doc to the API shape."""
+    return DmPublic(
+        id=str(d["_id"]),
+        operator_id=str(d["operator_id"]),
+        source_job_id=str(d["source_job_id"]),
+        source_reply_comment_id=str(d["source_reply_comment_id"]),
+        target_provider_id=str(d["target_provider_id"]),
+        target_name=str(d.get("target_name") or ""),
+        target_public_identifier=d.get("target_public_identifier"),
+        message_text=str(d.get("message_text") or ""),
+        sent_via_account_id=str(d.get("sent_via_account_id") or ""),
+        status=str(d.get("status") or "queued"),
+        chat_id=d.get("chat_id"),
+        message_id=d.get("message_id"),
+        sent_at=d.get("sent_at"),
+        error=d.get("error"),
+        created_at=d.get("created_at") or utcnow(),
+        updated_at=d.get("updated_at") or utcnow(),
+    )
+
+
+async def _ensure_dm_indexes(db: AsyncIOMotorDatabase) -> None:
+    """Idempotent index creation for the `linkedin_dms` collection.
+
+    Same pattern as `_ensure_invitation_indexes` — Motor caches the
+    create-index plan so the repeat cost is negligible. Putting it in
+    the route module rather than a startup hook keeps the schema
+    contract close to the code that reads/writes it.
+    """
+    coll = db.linkedin_dms
+    # Per-target dedup. Partial filter so 'failed' DMs don't permanently
+    # block a retry (the operator's call) but in-flight or sent DMs DO.
+    await coll.create_index(
+        [("operator_id", 1), ("target_provider_id", 1)],
+        unique=True,
+        partialFilterExpression={
+            "status": {"$in": ["queued", "sent"]},
+        },
+        name="dm_operator_target_open_unique",
+    )
+    # Lookup by source thread (used by GET endpoint).
+    await coll.create_index(
+        [("source_job_id", 1), ("source_reply_comment_id", 1)],
+        name="dm_source_lookup",
+    )
+
+
+@router.get(
+    "/jobs/{job_id}/replies/{reply_comment_id}/dm",
+    response_model=GetDmResponse,
+)
+async def get_dm(
+    job_id: str,
+    reply_comment_id: str,
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> GetDmResponse:
+    """Return the current DM state for this (job, reply) pair.
+
+    Returns `dm=None` when no DM has been sent yet — the UI shows the
+    "Send DM" button. Otherwise returns the DmPublic so the UI can
+    render the appropriate status badge (Sent / Failed / Dry-run)."""
+    try:
+        jid = ObjectId(job_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(400, "Invalid job_id")
+
+    job = await db.manual_comment_jobs.find_one({"_id": jid})
+    if not job:
+        raise HTTPException(404, "Job not found")
+    campaign = await db.manual_comment_campaigns.find_one(
+        {"_id": job["campaign_id"], "operator_id": user["_id"]},
+    )
+    if not campaign:
+        raise HTTPException(404, "Job not found")
+
+    await _ensure_dm_indexes(db)
+
+    dm = await db.linkedin_dms.find_one({
+        "operator_id": user["_id"],
+        "source_job_id": jid,
+        "source_reply_comment_id": reply_comment_id,
+    })
+    return GetDmResponse(
+        job_id=job_id,
+        parent_reply_comment_id=reply_comment_id,
+        dm=_dm_to_public(dm) if dm else None,
+    )
+
+
+@router.post(
+    "/jobs/{job_id}/replies/{reply_comment_id}/dm",
+    response_model=SendDmResponse,
+)
+async def send_dm_to_replier(
+    job_id: str,
+    reply_comment_id: str,
+    payload: SendDmRequest,
+    user: CurrentUser,
+    db: Annotated[AsyncIOMotorDatabase, Depends(get_db)],
+) -> SendDmResponse:
+    """Send a first-touch DM to the person who replied to one of our
+    comments (and presumably accepted our subsequent connection request).
+
+    Threading model: same as invite — operator commented on a LinkedIn
+    post, someone replied, operator sent invite, recipient accepted.
+    Now we send a DM that references the public-comment context to open
+    a 1:1 thread.
+
+    Safety contract (mirrors invite):
+      • dry_run defaults True. Returns the would-be DM record without
+        hitting Unipile.
+      • Account-match: payload.unipile_account_id MUST equal the job's
+        unipile_account_id. 400 on mismatch.
+      • Per-target dedup: if a DM has already been sent to this target
+        from any of this operator's accounts, return that record
+        (idempotent — no double-DM).
+      • Atomic claim: status transitions {<none>|failed|dry_run} →
+        "queued" before the Unipile call. Concurrent clicks lose the
+        claim and get the existing record back.
+      • Text length validated by Pydantic against
+        LINKEDIN_DM_TEXT_MAX_CHARS.
+    """
+    try:
+        jid = ObjectId(job_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(400, "Invalid job_id")
+
+    job = await db.manual_comment_jobs.find_one({"_id": jid})
+    if not job:
+        raise HTTPException(404, "Job not found")
+    campaign = await db.manual_comment_campaigns.find_one(
+        {"_id": job["campaign_id"], "operator_id": user["_id"]},
+    )
+    if not campaign:
+        raise HTTPException(404, "Job not found")
+    if job.get("status") != "posted":
+        raise HTTPException(
+            409,
+            f"Cannot DM from a job in status={job.get('status')!r} — only "
+            "posted jobs have a reply thread to DM into.",
+        )
+
+    # Anti-spoofing: target_provider_id MUST come from a reply we
+    # actually captured. Operator can't be tricked into DMing a
+    # stranger via a crafted reply_comment_id.
+    thread = job.get("latest_my_comment_replies_thread") or []
+    parent_entry = next(
+        (r for r in thread if (r.get("comment_id") or "") == reply_comment_id),
+        None,
+    )
+    if not parent_entry:
+        raise HTTPException(
+            404,
+            "Reply not found in this job's captured thread — refresh "
+            "engagement first to pick up the latest replies.",
+        )
+    target_provider_id = (parent_entry.get("author_provider_id") or "").strip()
+    target_name = (parent_entry.get("author_name") or "").strip()
+    target_public_identifier = (
+        parent_entry.get("author_public_identifier") or ""
+    ).strip() or None
+    if not target_provider_id:
+        raise HTTPException(
+            409,
+            "Reply has no author_provider_id captured — cannot send DM. "
+            "Usually a locked/private profile. Refresh engagement to retry, "
+            "or DM manually from LinkedIn.",
+        )
+
+    # Account-match guard.
+    job_account = (job.get("unipile_account_id") or "").strip()
+    if not job_account:
+        raise HTTPException(
+            409,
+            "Job has no unipile_account_id — cannot determine the correct "
+            "account to send the DM from.",
+        )
+    if payload.unipile_account_id != job_account:
+        raise HTTPException(
+            400,
+            f"Account mismatch: DM must be sent from the same account "
+            f"that posted the comment + sent the invite "
+            f"({job_account[:18]}…), not {payload.unipile_account_id[:18]}…. "
+            "Recipients won't recognise a DM from a different account "
+            "than the one they connected with.",
+        )
+
+    # Verify the account is on the tenant.
+    try:
+        all_accounts = list_accounts()
+    except (UnipileError, UnipileNotConfigured) as err:
+        raise HTTPException(502, f"Could not list Unipile accounts: {err}")
+    by_id = {a.id: a for a in all_accounts}
+    if payload.unipile_account_id not in by_id:
+        raise HTTPException(
+            400,
+            f"unipile_account_id {payload.unipile_account_id!r} is not on the tenant",
+        )
+
+    await _ensure_dm_indexes(db)
+
+    now = utcnow()
+    text = (payload.message_text or "").strip()
+
+    # ── Per-target dedup ───────────────────────────────────────────────
+    existing_open = await db.linkedin_dms.find_one({
+        "operator_id": user["_id"],
+        "target_provider_id": target_provider_id,
+        "status": {"$in": [
+            DmStatusValue.QUEUED,
+            DmStatusValue.SENT,
+        ]},
+    })
+    if existing_open:
+        log.info(
+            "send_dm_to_replier DEDUP: open DM already exists for "
+            "operator=%s target=%s status=%s — returning existing record",
+            user["_id"], target_provider_id[:24], existing_open.get("status"),
+        )
+        return SendDmResponse(
+            job_id=job_id,
+            parent_reply_comment_id=reply_comment_id,
+            target_provider_id=target_provider_id,
+            status=str(existing_open.get("status")),
+            dry_run=False,
+            chat_id=existing_open.get("chat_id"),
+            message_id=existing_open.get("message_id"),
+            sent_at=existing_open.get("sent_at"),
+            error=existing_open.get("error"),
+        )
+
+    # ── Dry-run: persist intent, no Unipile call ──────────────────────
+    if payload.dry_run:
+        dryrun_doc = {
+            "operator_id": user["_id"],
+            "source_job_id": jid,
+            "source_reply_comment_id": reply_comment_id,
+            "target_provider_id": target_provider_id,
+            "target_name": target_name,
+            "target_public_identifier": target_public_identifier,
+            "message_text": text,
+            "sent_via_account_id": payload.unipile_account_id,
+            "status": DmStatusValue.DRY_RUN,
+            "chat_id": None,
+            "message_id": None,
+            "sent_at": None,
+            "error": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        await db.linkedin_dms.update_one(
+            {
+                "operator_id": user["_id"],
+                "source_job_id": jid,
+                "source_reply_comment_id": reply_comment_id,
+            },
+            {"$set": dryrun_doc},
+            upsert=True,
+        )
+        return SendDmResponse(
+            job_id=job_id,
+            parent_reply_comment_id=reply_comment_id,
+            target_provider_id=target_provider_id,
+            status=DmStatusValue.DRY_RUN,
+            dry_run=True,
+        )
+
+    # ── Atomic claim ──────────────────────────────────────────────────
+    claim_now = utcnow()
+    claim_doc = {
+        "operator_id": user["_id"],
+        "source_job_id": jid,
+        "source_reply_comment_id": reply_comment_id,
+        "target_provider_id": target_provider_id,
+        "target_name": target_name,
+        "target_public_identifier": target_public_identifier,
+        "message_text": text,
+        "sent_via_account_id": payload.unipile_account_id,
+        "status": DmStatusValue.QUEUED,
+        "queued_at": claim_now,
+        "updated_at": claim_now,
+    }
+    claim_seed = {
+        "created_at": claim_now,
+        "chat_id": None,
+        "message_id": None,
+        "sent_at": None,
+        "error": None,
+    }
+    try:
+        claim_result = await db.linkedin_dms.find_one_and_update(
+            {
+                "operator_id": user["_id"],
+                "source_job_id": jid,
+                "source_reply_comment_id": reply_comment_id,
+                "$or": [
+                    {"status": {"$exists": False}},
+                    {"status": {"$in": [
+                        DmStatusValue.DRY_RUN,
+                        DmStatusValue.FAILED,
+                    ]}},
+                ],
+            },
+            {"$set": claim_doc, "$setOnInsert": claim_seed},
+            upsert=True,
+            return_document=True,
+        )
+    except Exception as err:  # noqa: BLE001
+        existing = await db.linkedin_dms.find_one({
+            "operator_id": user["_id"],
+            "target_provider_id": target_provider_id,
+            "status": {"$in": [
+                DmStatusValue.QUEUED,
+                DmStatusValue.SENT,
+            ]},
+        })
+        if existing:
+            return SendDmResponse(
+                job_id=job_id,
+                parent_reply_comment_id=reply_comment_id,
+                target_provider_id=target_provider_id,
+                status=str(existing.get("status")),
+                dry_run=False,
+                chat_id=existing.get("chat_id"),
+                message_id=existing.get("message_id"),
+                sent_at=existing.get("sent_at"),
+                error=f"already_dm'd: {str(err)[:120]}",
+            )
+        raise HTTPException(500, f"dm claim failed: {err}")
+
+    # ── Live Unipile call ─────────────────────────────────────────────
+    from app.services.unipile import (
+        send_dm as unipile_send_dm,
+        UnipileError as _UE,
+        UnipileNotConfigured as _UNC,
+    )
+    try:
+        result = unipile_send_dm(
+            account_id=payload.unipile_account_id,
+            provider_id=target_provider_id,
+            text=text,
+        )
+    except _UNC as err:
+        await db.linkedin_dms.update_one(
+            {"_id": claim_result["_id"]},
+            {"$set": {
+                "status": DmStatusValue.FAILED,
+                "error": f"unipile_not_configured: {str(err)[:300]}",
+                "updated_at": utcnow(),
+            }},
+        )
+        raise HTTPException(503, f"Unipile not configured: {err}")
+    except _UE as err:
+        msg = f"unipile: {str(err)[:400]}"
+        await db.linkedin_dms.update_one(
+            {"_id": claim_result["_id"]},
+            {"$set": {
+                "status": DmStatusValue.FAILED,
+                "error": msg,
+                "updated_at": utcnow(),
+            }},
+        )
+        return SendDmResponse(
+            job_id=job_id,
+            parent_reply_comment_id=reply_comment_id,
+            target_provider_id=target_provider_id,
+            status=DmStatusValue.FAILED,
+            dry_run=False,
+            error=msg,
+        )
+    except Exception as err:  # noqa: BLE001 — defensive rollback
+        msg = f"unexpected: {type(err).__name__}: {str(err)[:400]}"
+        log.exception(
+            "send_dm_to_replier UNEXPECTED failure (operator=%s "
+            "target=%s) — rolling back claim", user["_id"], target_provider_id[:24],
+        )
+        try:
+            await db.linkedin_dms.update_one(
+                {"_id": claim_result["_id"]},
+                {"$set": {
+                    "status": DmStatusValue.FAILED,
+                    "error": msg,
+                    "updated_at": utcnow(),
+                }},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return SendDmResponse(
+            job_id=job_id,
+            parent_reply_comment_id=reply_comment_id,
+            target_provider_id=target_provider_id,
+            status=DmStatusValue.FAILED,
+            dry_run=False,
+            error=msg,
+        )
+
+    # ── Success: flip queued → sent ──────────────────────────────────
+    sent_at = result.sent_at or utcnow()
+    await db.linkedin_dms.update_one(
+        {"_id": claim_result["_id"]},
+        {"$set": {
+            "status": DmStatusValue.SENT,
+            "chat_id": result.chat_id,
+            "message_id": result.message_id,
+            "sent_at": sent_at,
+            "error": None,
+            "updated_at": sent_at,
+        }},
+    )
+    return SendDmResponse(
+        job_id=job_id,
+        parent_reply_comment_id=reply_comment_id,
+        target_provider_id=target_provider_id,
+        status=DmStatusValue.SENT,
+        dry_run=False,
+        chat_id=result.chat_id,
+        message_id=result.message_id,
         sent_at=sent_at,
         error=None,
     )

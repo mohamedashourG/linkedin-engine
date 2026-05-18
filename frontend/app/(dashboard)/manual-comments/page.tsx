@@ -25,6 +25,7 @@ import {
   ExternalLink,
   FilePlus2,
   Loader2,
+  MessageCircle,
   RefreshCw,
   Send,
   ShieldAlert,
@@ -42,7 +43,9 @@ import { ApiError } from "@/lib/api";
 import {
   manualCommentsApi,
   LINKEDIN_INVITE_NOTE_MAX_CHARS,
+  LINKEDIN_DM_TEXT_MAX_CHARS,
   type CampaignDetail,
+  type DmPublic,
   type InvitationPublic,
   type ManualCommentJob,
 } from "@/lib/manual-comments";
@@ -111,6 +114,26 @@ function InviteStatusBadge({ status }: { status: InvitationPublic["status"] }) {
     declined: { label: "invite declined", variant: "outline" },
     withdrawn: { label: "invite withdrawn", variant: "outline" },
     failed: { label: "invite failed", variant: "destructive" },
+  };
+  const v = map[status] ?? map.queued;
+  return <Badge variant={v.variant}>{v.label}</Badge>;
+}
+
+/**
+ * Small badge for a LinkedIn DM's status. Vocabulary is narrower than
+ * the invite badge — DMs are fire-and-forget; we don't poll for reads
+ * or replies on the DM record itself (operator watches the thread in
+ * LinkedIn directly).
+ */
+function DmStatusBadge({ status }: { status: DmPublic["status"] }) {
+  const map: Record<
+    DmPublic["status"],
+    { label: string; variant: "default" | "secondary" | "outline" | "destructive" }
+  > = {
+    dry_run: { label: "DM dry-run ✓", variant: "outline" },
+    queued: { label: "DM queued", variant: "secondary" },
+    sent: { label: "DM sent ✓", variant: "default" },
+    failed: { label: "DM failed", variant: "destructive" },
   };
   const v = map[status] ?? map.queued;
   return <Badge variant={v.variant}>{v.label}</Badge>;
@@ -230,6 +253,93 @@ function ReplyInviteControls({
   );
 }
 
+/**
+ * Per-reply LinkedIn-DM controls. Mirrors ReplyInviteControls — fetches
+ * the DM state for one (job, reply) pair so each reply renders its own
+ * badge / Send-DM button independently.
+ *
+ * Wiring:
+ *  - Disabled when `replyHasProviderId` is false (no recipient URN).
+ *  - Disabled when no account is selected in the page-level dropdown.
+ *  - Opens the DM composer at the page level via `onOpenComposer`.
+ *  - If a DM already exists, shows the status badge + lets operator
+ *    open the composer pre-filled with the prior text (useful when
+ *    a failed DM needs a retry).
+ */
+function ReplyDmControls({
+  jobId,
+  replyCommentId,
+  replyAuthorName,
+  replyHasProviderId,
+  selectedAccount,
+  livePostingEnabled,
+  onOpenComposer,
+  enabled,
+}: {
+  jobId: string;
+  replyCommentId: string;
+  replyAuthorName: string | null;
+  replyHasProviderId: boolean;
+  selectedAccount: string;
+  livePostingEnabled: boolean;
+  onOpenComposer: (args: {
+    jobId: string;
+    replyCommentId: string;
+    replyAuthorName: string | null;
+    existingMessage: string;
+  }) => void;
+  enabled: boolean;
+}) {
+  const dmQ = useQuery({
+    queryKey: ["mc-dm", jobId, replyCommentId],
+    queryFn: () => manualCommentsApi.getDm(jobId, replyCommentId),
+    enabled: enabled && replyHasProviderId,
+    staleTime: 30_000,
+  });
+  const dm = dmQ.data?.dm ?? null;
+
+  if (!replyHasProviderId) {
+    return (
+      <span
+        className="text-[10px] italic text-muted-foreground"
+        title="Reply has no author URN captured — can't send a DM. Refresh engagement to retry."
+      >
+        DM unavailable
+      </span>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-1">
+      {dm && <DmStatusBadge status={dm.status} />}
+      <button
+        type="button"
+        onClick={() =>
+          onOpenComposer({
+            jobId,
+            replyCommentId,
+            replyAuthorName,
+            existingMessage: dm?.message_text || "",
+          })
+        }
+        className="inline-flex items-center gap-0.5 text-[10px] uppercase tracking-wide text-sky-700 hover:underline"
+        title={
+          !selectedAccount
+            ? "Composer will open — pick an account in the modal to enable Send"
+            : !livePostingEnabled
+              ? "Dry-run available now; live send requires the page-level checkbox"
+              : dm
+                ? "Edit message (will overwrite the prior DM if not yet sent)"
+                : "Send a LinkedIn DM to this person (must be a 1st-degree connection)"
+        }
+      >
+        <MessageCircle className="h-3 w-3" />
+        {dm ? "Edit DM" : "DM"}
+      </button>
+    </div>
+  );
+}
+
 export default function ManualCommentsPage() {
   const qc = useQueryClient();
   const [file, setFile] = useState<File | null>(null);
@@ -268,6 +378,18 @@ export default function ManualCommentsPage() {
   const [inviteNoteDraft, setInviteNoteDraft] = useState("");
   const [liveInviteConfirm, setLiveInviteConfirm] = useState<
     { jobId: string; replyCommentId: string; note_text: string } | null
+  >(null);
+
+  // DM composer state — same shape as invite-composer:
+  //   dmComposer: which reply we're DMing (modal overlay)
+  //   dmTextDraft: the operator-typed message (≤1500 chars)
+  //   liveDmConfirm: pending live-send confirmation (modal-on-modal)
+  const [dmComposer, setDmComposer] = useState<
+    { jobId: string; replyCommentId: string; replyAuthorName: string | null } | null
+  >(null);
+  const [dmTextDraft, setDmTextDraft] = useState("");
+  const [liveDmConfirm, setLiveDmConfirm] = useState<
+    { jobId: string; replyCommentId: string; message_text: string } | null
   >(null);
 
   // Unipile accounts dropdown source
@@ -584,6 +706,46 @@ export default function ManualCommentsPage() {
     onError: (err: ApiError | Error) => {
       toast.error(err?.message || "Invite failed");
       setLiveInviteConfirm(null);
+    },
+  });
+
+  // DM mutation — mirrors sendInviteMut. Server defaults dry_run=true,
+  // live send always passes through the liveDmConfirm modal. onSuccess
+  // invalidates the per-reply DM query so the badge updates inline.
+  const sendDmMut = useMutation({
+    mutationFn: (vars: {
+      jobId: string;
+      replyCommentId: string;
+      message_text: string;
+      dry_run: boolean;
+    }) =>
+      manualCommentsApi.sendDm(vars.jobId, vars.replyCommentId, {
+        message_text: vars.message_text,
+        unipile_account_id: selectedAccount,
+        dry_run: vars.dry_run,
+      }),
+    onSuccess: (res, vars) => {
+      if (res.status === "dry_run") {
+        toast.success(
+          "DM dry-run ✓ — no Unipile call made. Flip live-posting on to actually send the message.",
+        );
+      } else if (res.status === "sent" || res.status === "queued") {
+        toast.success(
+          `DM sent ✓  chat_id=${(res.chat_id || "").slice(0, 24)}…`,
+        );
+      } else if (res.status === "failed") {
+        toast.error(res.error || "Unipile rejected this DM");
+      }
+      setDmComposer(null);
+      setDmTextDraft("");
+      setLiveDmConfirm(null);
+      qc.invalidateQueries({
+        queryKey: ["mc-dm", vars.jobId, vars.replyCommentId],
+      });
+    },
+    onError: (err: ApiError | Error) => {
+      toast.error(err?.message || "DM failed");
+      setLiveDmConfirm(null);
     },
   });
 
@@ -996,6 +1158,19 @@ export default function ManualCommentsPage() {
                                                   onOpenComposer={({ jobId, replyCommentId, replyAuthorName, existingNote }) => {
                                                     setInviteComposer({ jobId, replyCommentId, replyAuthorName });
                                                     setInviteNoteDraft(existingNote);
+                                                  }}
+                                                />
+                                                <ReplyDmControls
+                                                  jobId={j.id}
+                                                  replyCommentId={r.comment_id}
+                                                  replyAuthorName={r.author_name}
+                                                  replyHasProviderId={!!r.author_provider_id}
+                                                  selectedAccount={selectedAccount}
+                                                  livePostingEnabled={livePostingEnabled}
+                                                  enabled={!!activeCampaignId}
+                                                  onOpenComposer={({ jobId, replyCommentId, replyAuthorName, existingMessage }) => {
+                                                    setDmComposer({ jobId, replyCommentId, replyAuthorName });
+                                                    setDmTextDraft(existingMessage);
                                                   }}
                                                 />
                                                 <button
@@ -1749,6 +1924,184 @@ export default function ManualCommentsPage() {
                   <UserPlus className="mr-2 h-4 w-4" />
                 )}
                 Yes, send invite now
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* DM composer — opens when operator clicks "DM" on a reply row.
+          Manual textarea (no LLM suggestion), 1500-char counter
+          (LinkedIn's practical operational ceiling), dry-run default.
+          Live send goes through liveDmConfirm below. */}
+      {dmComposer && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="w-full max-w-lg space-y-3 rounded-lg bg-card p-6 shadow-xl">
+            <div className="flex items-start gap-3">
+              <MessageCircle className="h-6 w-6 shrink-0 text-sky-600" />
+              <div className="flex-1">
+                <h3 className="text-lg font-semibold">
+                  Direct message
+                  {dmComposer.replyAuthorName && (
+                    <span className="ml-1 text-muted-foreground">
+                      to {dmComposer.replyAuthorName}
+                    </span>
+                  )}
+                </h3>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Sends from{" "}
+                  <strong>
+                    {accounts.find((a) => a.id === selectedAccount)?.name || "—"}
+                  </strong>
+                  . Recipient must be a 1st-degree connection for the DM
+                  to land — typically used after the invite is accepted.
+                  Per-account daily cap (25) and 3-6 min throttle enforced
+                  server-side.
+                </p>
+              </div>
+            </div>
+
+            <textarea
+              value={dmTextDraft}
+              onChange={(e) =>
+                setDmTextDraft(
+                  e.target.value.slice(0, LINKEDIN_DM_TEXT_MAX_CHARS),
+                )
+              }
+              placeholder="DM body (≤1500 chars). Reference the comment context — what they replied to, what you said back."
+              className="w-full resize-y rounded border bg-background p-2 text-sm"
+              rows={8}
+              autoFocus
+            />
+            <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+              <span className="tabular-nums">
+                {dmTextDraft.length} / {LINKEDIN_DM_TEXT_MAX_CHARS}
+              </span>
+              {!livePostingEnabled && selectedAccount && (
+                <span className="italic text-amber-700">
+                  Live DM locked — tick &quot;I want to actually post&quot; above to enable
+                </span>
+              )}
+            </div>
+            {!selectedAccount && (
+              <div className="rounded border border-amber-300 bg-amber-50 p-2 text-[11px] text-amber-800">
+                ⚠ No Unipile account is selected. Pick one in the dropdown
+                above the table before clicking Send DM.
+              </div>
+            )}
+
+            <div className="flex flex-wrap justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setDmComposer(null);
+                  setDmTextDraft("");
+                }}
+                disabled={sendDmMut.isPending}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="secondary"
+                disabled={
+                  !selectedAccount ||
+                  !dmTextDraft.trim() ||
+                  sendDmMut.isPending
+                }
+                onClick={() =>
+                  sendDmMut.mutate({
+                    jobId: dmComposer.jobId,
+                    replyCommentId: dmComposer.replyCommentId,
+                    message_text: dmTextDraft,
+                    dry_run: true,
+                  })
+                }
+                title="Validate this DM without calling Unipile"
+              >
+                <CheckCircle2 className="mr-1 h-3.5 w-3.5" />
+                Dry-run
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={
+                  !selectedAccount ||
+                  !livePostingEnabled ||
+                  !dmTextDraft.trim() ||
+                  sendDmMut.isPending
+                }
+                onClick={() =>
+                  setLiveDmConfirm({
+                    jobId: dmComposer.jobId,
+                    replyCommentId: dmComposer.replyCommentId,
+                    message_text: dmTextDraft,
+                  })
+                }
+              >
+                <Send className="mr-1 h-3.5 w-3.5" />
+                Send DM
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Live DM confirmation modal — last gate before a real Unipile
+          /chats call. Mirrors liveInviteConfirm so the operator always
+          sees one final "yes, do it" step after flipping the page-level
+          live-posting switch. */}
+      {liveDmConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="max-w-md rounded-lg bg-card p-6 shadow-xl">
+            <div className="flex items-start gap-3">
+              <ShieldAlert className="h-6 w-6 shrink-0 text-destructive" />
+              <div>
+                <h3 className="text-lg font-semibold">
+                  Confirm: send DM?
+                </h3>
+                <div className="mt-2 space-y-2 text-sm text-muted-foreground">
+                  <p>
+                    Calls Unipile and posts the message in a new (or
+                    existing) chat with this person from{" "}
+                    <strong>
+                      {accounts.find((a) => a.id === selectedAccount)?.name}
+                    </strong>
+                    . Counts against the per-account daily DM cap (25/day).
+                  </p>
+                  <div className="rounded border bg-muted/30 p-2 text-xs">
+                    <div className="font-semibold text-muted-foreground">Message:</div>
+                    <div className="mt-1 whitespace-pre-wrap italic">
+                      {liveDmConfirm.message_text}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={() => setLiveDmConfirm(null)}
+                disabled={sendDmMut.isPending}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={() =>
+                  sendDmMut.mutate({
+                    jobId: liveDmConfirm.jobId,
+                    replyCommentId: liveDmConfirm.replyCommentId,
+                    message_text: liveDmConfirm.message_text,
+                    dry_run: false,
+                  })
+                }
+                disabled={sendDmMut.isPending}
+              >
+                {sendDmMut.isPending ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <MessageCircle className="mr-2 h-4 w-4" />
+                )}
+                Yes, send DM now
               </Button>
             </div>
           </div>
